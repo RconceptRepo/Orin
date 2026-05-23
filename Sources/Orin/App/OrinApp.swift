@@ -1,7 +1,6 @@
 import SwiftData
 import SwiftUI
 
-@main
 struct OrinApp: App {
     private let modelContainer: ModelContainer
     private let rolloverEngine: RolloverEngine

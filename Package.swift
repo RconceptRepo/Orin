@@ -14,6 +14,11 @@ let package = Package(
         .executableTarget(
             name: "Orin",
             path: "Sources/Orin"
+        ),
+        .testTarget(
+            name: "OrinTests",
+            dependencies: ["Orin"],
+            path: "Tests/OrinTests"
         )
     ]
 )

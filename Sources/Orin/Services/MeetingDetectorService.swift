@@ -5,7 +5,7 @@ import Observation
 @Observable
 final class MeetingDetectorService: Service {
 
-    // MARK: - Public State (main-thread)
+    // MARK: - Public State
 
     var detectedMeetingApp: String?
     var shouldShowRecordingPrompt = false
@@ -28,7 +28,7 @@ final class MeetingDetectorService: Service {
         ("company.thebrowser.Browser", "Arc"),
     ]
 
-    private let meetingURLPatterns = [
+    let meetingURLPatterns = [
         "meet.google.com/",
         "zoom.us/j/",
         "zoom.us/s/",
@@ -39,13 +39,21 @@ final class MeetingDetectorService: Service {
     // MARK: - Private State
 
     private var timer: Timer?
-    /// Tracks the current meeting session so repeated polls don't re-fire the callback.
+
+    /// Key of the currently detected meeting session.
     private var activeMeetingKey: String?
-    /// Serial queue keeps NSAppleScript calls off the main thread and prevents concurrent access.
+
+    /// Key of the most recently dismissed meeting session.
+    /// Prevents re-prompting for the same ongoing meeting after the user explicitly dismissed.
+    /// Cleared only when that meeting fully ends (detection returns nil).
+    private var dismissedMeetingKey: String?
+
+    /// Serial queue keeps NSAppleScript calls off the main thread and serialises concurrent access.
     private let scriptQueue = DispatchQueue(label: "com.orin.meeting-detector.applescript", qos: .utility)
 
     // MARK: - Lifecycle
 
+    @MainActor
     func startMonitoring() {
         guard timer == nil else { return }
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
@@ -54,15 +62,23 @@ final class MeetingDetectorService: Service {
         poll()
     }
 
+    @MainActor
     func stopMonitoring() {
         timer?.invalidate()
         timer = nil
-        activeMeetingKey = nil
-    }
-
-    func dismissPrompt() {
+        detectedMeetingApp = nil
         shouldShowRecordingPrompt = false
         activeMeetingKey = nil
+        dismissedMeetingKey = nil
+    }
+
+    @MainActor
+    func dismissPrompt() {
+        shouldShowRecordingPrompt = false
+        // Remember which session the user dismissed so we don't re-prompt
+        // while the same meeting is still running. activeMeetingKey stays set
+        // so the dedup guard in applyDetectionResult continues to suppress it.
+        dismissedMeetingKey = activeMeetingKey
     }
 
     // MARK: - Polling (timer fires on main thread)
@@ -71,7 +87,7 @@ final class MeetingDetectorService: Service {
         Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
             let detection = await self.detectMeeting()
-            self.applyDetectionResult(detection)
+            await self.applyDetectionResult(detection)
         }
     }
 
@@ -86,14 +102,14 @@ final class MeetingDetectorService: Service {
         let running = NSWorkspace.shared.runningApplications
         for config in nativeApps {
             guard let match = running.first(where: { $0.bundleIdentifier == config.bundleID }) else { continue }
-            // For Slack, only surface if a Huddle or call window is actually on-screen.
+            // Slack: only surface when a Huddle or call window is actually on-screen.
             if config.bundleID == "com.tinyspeck.slackmacgap", !slackHasActiveCall() { continue }
             return (app: match.localizedName ?? config.displayName, key: "\(config.bundleID)|active")
         }
         return nil
     }
 
-    /// Best-effort check using CGWindowList; silently fails if Screen Recording permission is absent.
+    /// Best-effort check using CGWindowList; silently returns false if Screen Recording permission is absent.
     private func slackHasActiveCall() -> Bool {
         guard let list = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
@@ -175,7 +191,7 @@ final class MeetingDetectorService: Service {
         """
     }
 
-    private func firstMeetingURL(in urlString: String) -> String? {
+    func firstMeetingURL(in urlString: String) -> String? {
         for url in urlString.components(separatedBy: "\n") {
             for pattern in meetingURLPatterns where url.contains(pattern) {
                 return stableKey(url: url, pattern: pattern)
@@ -185,7 +201,7 @@ final class MeetingDetectorService: Service {
     }
 
     /// Strips query-string and fragment so the same meeting URL deduplicates across polls.
-    private func stableKey(url: String, pattern: String) -> String {
+    func stableKey(url: String, pattern: String) -> String {
         guard let range = url.range(of: pattern) else { return String(url.prefix(80)) }
         let path = String(url[range.lowerBound...])
             .components(separatedBy: CharacterSet(charactersIn: "?#"))
@@ -193,27 +209,28 @@ final class MeetingDetectorService: Service {
         return String(path.prefix(80))
     }
 
-    // MARK: - State update (always dispatched to main thread)
+    // MARK: - State update (main actor only)
 
-    private func applyDetectionResult(_ result: (app: String, key: String)?) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-
-            guard let result else {
-                if self.detectedMeetingApp != nil {
-                    self.detectedMeetingApp = nil
-                    self.activeMeetingKey = nil
-                }
-                return
+    /// Internal so the test target can drive state transitions directly.
+    @MainActor
+    func applyDetectionResult(_ result: (app: String, key: String)?) {
+        guard let result else {
+            // Meeting ended — reset all session state so the next detection starts fresh.
+            if detectedMeetingApp != nil || shouldShowRecordingPrompt {
+                detectedMeetingApp = nil
+                shouldShowRecordingPrompt = false
+                activeMeetingKey = nil
+                dismissedMeetingKey = nil
             }
-
-            // Dedup: skip if this is the same ongoing meeting session
-            guard result.key != self.activeMeetingKey else { return }
-
-            self.activeMeetingKey = result.key
-            self.detectedMeetingApp = result.app
-            self.shouldShowRecordingPrompt = true
-            self.onMeetingDetected?(result.app)
+            return
         }
+
+        // Suppress if this is the same session that is already active OR was dismissed by the user.
+        guard result.key != activeMeetingKey, result.key != dismissedMeetingKey else { return }
+
+        activeMeetingKey = result.key
+        detectedMeetingApp = result.app
+        shouldShowRecordingPrompt = true
+        onMeetingDetected?(result.app)
     }
 }
