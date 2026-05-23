@@ -1,0 +1,20 @@
+# Swift build artifacts
+.build/
+DerivedData/
+*.xcuserdata/
+*.xcworkspace/
+.swiftpm/xcode/
+
+# Compiled binaries and distribution
+dist/Orin.app/Contents/MacOS/
+dist/Orin.app/Contents/_CodeSignature/
+dist/Orin-0.1.0.dmg
+dist/dmg-root/
+Sources.zip
+
+# macOS metadata
+.DS_Store
+**/.DS_Store
+
+# Claude Code local settings
+.claude/
