@@ -1,54 +1,56 @@
 import XCTest
 @testable import Orin
 
+/// All tests run on the main actor because applyDetectionResult, dismissPrompt,
+/// and stopMonitoring are @MainActor. Calling them from a @MainActor context is
+/// synchronous — no async/await needed.
 @MainActor
 final class MeetingDetectorServiceTests: XCTestCase {
 
     // MARK: - Deduplication
 
-    func testSameMeetingDoesNotRetriggerPrompt() async {
+    func testSameMeetingDoesNotRetriggerPrompt() {
         let service = MeetingDetectorService()
-        await service.applyDetectionResult((app: "Zoom", key: "us.zoom.xos|active"))
+        service.applyDetectionResult((app: "Zoom", key: "us.zoom.xos|active"))
 
         XCTAssertTrue(service.shouldShowRecordingPrompt)
         XCTAssertEqual(service.detectedMeetingApp, "Zoom")
 
         // Simulate the next 30-second poll finding the same session still running.
-        await service.applyDetectionResult((app: "Zoom", key: "us.zoom.xos|active"))
+        service.applyDetectionResult((app: "Zoom", key: "us.zoom.xos|active"))
 
-        // Prompt must stay true but the callback must not have fired again.
         XCTAssertTrue(service.shouldShowRecordingPrompt)
     }
 
-    func testCallbackFiresOnlyForNewSession() async {
+    func testCallbackFiresOnlyForNewSession() {
         let service = MeetingDetectorService()
         var callbackCount = 0
         service.onMeetingDetected = { _ in callbackCount += 1 }
 
-        await service.applyDetectionResult((app: "Zoom", key: "us.zoom.xos|active"))
-        await service.applyDetectionResult((app: "Zoom", key: "us.zoom.xos|active"))
-        await service.applyDetectionResult((app: "Zoom", key: "us.zoom.xos|active"))
+        service.applyDetectionResult((app: "Zoom", key: "us.zoom.xos|active"))
+        service.applyDetectionResult((app: "Zoom", key: "us.zoom.xos|active"))
+        service.applyDetectionResult((app: "Zoom", key: "us.zoom.xos|active"))
 
         XCTAssertEqual(callbackCount, 1, "Callback must fire exactly once per unique session")
     }
 
-    func testDifferentMeetingKeyFiresNewCallback() async {
+    func testDifferentMeetingKeyFiresNewCallback() {
         let service = MeetingDetectorService()
         var callbackCount = 0
         service.onMeetingDetected = { _ in callbackCount += 1 }
 
-        await service.applyDetectionResult((app: "Zoom", key: "us.zoom.xos|active"))
-        await service.applyDetectionResult(nil)   // meeting ends, state reset
-        await service.applyDetectionResult((app: "Google Chrome", key: "browser|meet.google.com/abc"))
+        service.applyDetectionResult((app: "Zoom", key: "us.zoom.xos|active"))
+        service.applyDetectionResult(nil)   // meeting ends, state reset
+        service.applyDetectionResult((app: "Google Chrome", key: "browser|meet.google.com/abc"))
 
         XCTAssertEqual(callbackCount, 2)
     }
 
     // MARK: - Dismiss behaviour
 
-    func testDismissHidesPromptWithoutClearingSession() async {
+    func testDismissHidesPromptWithoutClearingSession() {
         let service = MeetingDetectorService()
-        await service.applyDetectionResult((app: "Zoom", key: "us.zoom.xos|active"))
+        service.applyDetectionResult((app: "Zoom", key: "us.zoom.xos|active"))
         XCTAssertTrue(service.shouldShowRecordingPrompt)
 
         service.dismissPrompt()
@@ -57,32 +59,32 @@ final class MeetingDetectorServiceTests: XCTestCase {
         XCTAssertEqual(service.detectedMeetingApp, "Zoom")
     }
 
-    func testDismissedSessionDoesNotRepromptWhileStillRunning() async {
+    func testDismissedSessionDoesNotRepromptWhileStillRunning() {
         let service = MeetingDetectorService()
         var callbackCount = 0
         service.onMeetingDetected = { _ in callbackCount += 1 }
 
-        await service.applyDetectionResult((app: "Zoom", key: "us.zoom.xos|active"))
+        service.applyDetectionResult((app: "Zoom", key: "us.zoom.xos|active"))
         service.dismissPrompt()
 
         // Same meeting still detected on subsequent polls.
-        await service.applyDetectionResult((app: "Zoom", key: "us.zoom.xos|active"))
-        await service.applyDetectionResult((app: "Zoom", key: "us.zoom.xos|active"))
+        service.applyDetectionResult((app: "Zoom", key: "us.zoom.xos|active"))
+        service.applyDetectionResult((app: "Zoom", key: "us.zoom.xos|active"))
 
         XCTAssertFalse(service.shouldShowRecordingPrompt, "Must not re-prompt for dismissed session")
         XCTAssertEqual(callbackCount, 1, "Callback must not fire again for dismissed session")
     }
 
-    func testNewMeetingAfterDismissDoesPrompt() async {
+    func testNewMeetingAfterDismissDoesPrompt() {
         let service = MeetingDetectorService()
         var callbackCount = 0
         service.onMeetingDetected = { _ in callbackCount += 1 }
 
-        await service.applyDetectionResult((app: "Zoom", key: "us.zoom.xos|active"))
+        service.applyDetectionResult((app: "Zoom", key: "us.zoom.xos|active"))
         service.dismissPrompt()
 
         // A new, different meeting starts while the old one is still running.
-        await service.applyDetectionResult((app: "Google Chrome", key: "browser|meet.google.com/xyz"))
+        service.applyDetectionResult((app: "Google Chrome", key: "browser|meet.google.com/xyz"))
 
         XCTAssertTrue(service.shouldShowRecordingPrompt, "A new meeting must trigger the prompt")
         XCTAssertEqual(callbackCount, 2)
@@ -90,48 +92,46 @@ final class MeetingDetectorServiceTests: XCTestCase {
 
     // MARK: - Meeting-end state reset
 
-    func testMeetingEndResetsOverlay() async {
+    func testMeetingEndResetsOverlay() {
         let service = MeetingDetectorService()
-        await service.applyDetectionResult((app: "Zoom", key: "us.zoom.xos|active"))
+        service.applyDetectionResult((app: "Zoom", key: "us.zoom.xos|active"))
         XCTAssertTrue(service.shouldShowRecordingPrompt)
         XCTAssertNotNil(service.detectedMeetingApp)
 
-        // Meeting disappears (no active detection).
-        await service.applyDetectionResult(nil)
+        service.applyDetectionResult(nil)
 
         XCTAssertFalse(service.shouldShowRecordingPrompt, "Overlay must clear when meeting ends")
         XCTAssertNil(service.detectedMeetingApp)
     }
 
-    func testMeetingEndAfterDismissResetsAllState() async {
+    func testMeetingEndAfterDismissResetsAllState() {
         let service = MeetingDetectorService()
-        await service.applyDetectionResult((app: "Zoom", key: "us.zoom.xos|active"))
+        service.applyDetectionResult((app: "Zoom", key: "us.zoom.xos|active"))
         service.dismissPrompt()
-        await service.applyDetectionResult(nil)   // meeting ends
+        service.applyDetectionResult(nil)   // meeting ends
 
-        // Now the same meeting can start fresh and re-prompt.
+        // The same meeting starting again should re-prompt fresh.
         var callbackCount = 0
         service.onMeetingDetected = { _ in callbackCount += 1 }
 
-        await service.applyDetectionResult((app: "Zoom", key: "us.zoom.xos|active"))
+        service.applyDetectionResult((app: "Zoom", key: "us.zoom.xos|active"))
         XCTAssertTrue(service.shouldShowRecordingPrompt)
         XCTAssertEqual(callbackCount, 1, "Session must be re-detectable after the previous instance ended")
     }
 
-    func testNoOpWhenAlreadyCleared() async {
+    func testNoOpWhenAlreadyCleared() {
         let service = MeetingDetectorService()
-        // Calling nil detection on a clean service must not crash or corrupt state.
-        await service.applyDetectionResult(nil)
-        await service.applyDetectionResult(nil)
+        service.applyDetectionResult(nil)
+        service.applyDetectionResult(nil)
         XCTAssertFalse(service.shouldShowRecordingPrompt)
         XCTAssertNil(service.detectedMeetingApp)
     }
 
     // MARK: - Stop monitoring
 
-    func testStopMonitoringClearsState() async {
+    func testStopMonitoringClearsState() {
         let service = MeetingDetectorService()
-        await service.applyDetectionResult((app: "Zoom", key: "us.zoom.xos|active"))
+        service.applyDetectionResult((app: "Zoom", key: "us.zoom.xos|active"))
         service.stopMonitoring()
         XCTAssertFalse(service.shouldShowRecordingPrompt)
         XCTAssertNil(service.detectedMeetingApp)

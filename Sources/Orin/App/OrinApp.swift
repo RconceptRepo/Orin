@@ -34,6 +34,7 @@ struct OrinApp: App {
             services.register(VoiceCommandService(), for: VoiceCommandService.self)
             services.register(OllamaInstallerService(), for: OllamaInstallerService.self)
             services.register(MeetingDetectorService(), for: MeetingDetectorService.self)
+            services.register(LoginItemService(), for: LoginItemService.self)
 
             QuickCaptureWindowManager.shared.configure(modelContainer: modelContainer)
         } catch {

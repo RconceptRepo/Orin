@@ -59,8 +59,10 @@ struct MainContainerView: View {
                         MeetingRecordingPromptView(
                             appName: appName,
                             onStart: {
-                                recordingService.startRecording()
-                                meetingDetector.dismissPrompt()
+                                Task { @MainActor in
+                                    await recordingService.startRecording()
+                                    meetingDetector.dismissPrompt()
+                                }
                             },
                             onDismiss: { meetingDetector.dismissPrompt() }
                         )

@@ -2,36 +2,54 @@ import SwiftUI
 
 struct SettingsView: View {
     @AppStorage("orin.theme.mode") private var themeModeRawValue = OrinThemeMode.system.rawValue
-    @AppStorage("orin.ai.provider") private var provider = "ollama"
+    @AppStorage("orin.ai.provider") private var providerRaw = AIProvider.ollama.rawValue
     @AppStorage("orin.ai.ollamaEndpoint") private var ollamaEndpoint = "http://localhost:11434"
-    @AppStorage("orin.ai.openAIConfigured") private var openAIConfigured = false
-    @AppStorage("orin.ai.anthropicConfigured") private var anthropicConfigured = false
-    @AppStorage("orin.ai.geminiConfigured") private var geminiConfigured = false
     @AppStorage("orin.calendar.backgroundSync") private var calendarBackgroundSync = true
-    @AppStorage("orin.launchAtLogin") private var launchAtLogin = false
-    @State private var ollamaService = ServiceContainer.shared.resolve(OllamaInstallerService.self)
-    @State private var openAIKeyDraft = ""
+
+    @State private var ollamaService     = ServiceContainer.shared.resolve(OllamaInstallerService.self)
+    @State private var loginItemService  = ServiceContainer.shared.resolve(LoginItemService.self)
+
+    // External key drafts — held only long enough to be saved to Keychain, never persisted
+    @State private var openAIKeyDraft    = ""
     @State private var anthropicKeyDraft = ""
-    @State private var geminiKeyDraft = ""
+    @State private var geminiKeyDraft    = ""
+
+    // Keychain presence flags, refreshed in onAppear and after save/delete
+    @State private var openAIConfigured    = AIKeychainService.hasKey(for: AIService.openAIAccount)
+    @State private var anthropicConfigured = AIKeychainService.hasKey(for: AIService.anthropicAccount)
+    @State private var geminiConfigured    = AIKeychainService.hasKey(for: AIService.geminiAccount)
 
     var body: some View {
         Form {
+            // MARK: General
             Section("General") {
                 Picker("Appearance", selection: $themeModeRawValue) {
                     ForEach(OrinThemeMode.allCases) { mode in
                         Text(mode.title).tag(mode.rawValue)
                     }
                 }
-                Toggle("Launch automatically on login", isOn: $launchAtLogin)
+
+                Toggle("Launch automatically on login", isOn: Binding(
+                    get: { loginItemService.isEnabled },
+                    set: { loginItemService.setEnabled($0) }
+                ))
+
+                if let error = loginItemService.errorMessage {
+                    Text(error)
+                        .font(OrinFont.caption)
+                        .foregroundStyle(OrinColor.error)
+                }
+
                 Toggle("Calendar background sync", isOn: $calendarBackgroundSync)
             }
 
+            // MARK: AI
             Section("AI") {
-                Picker("Primary Provider", selection: $provider) {
-                    Text("Ollama Local").tag("ollama")
-                    Text("OpenAI").tag("openAI")
-                    Text("Claude").tag("anthropic")
-                    Text("Gemini").tag("gemini")
+                Picker("Primary Provider", selection: $providerRaw) {
+                    Text("Ollama Local").tag(AIProvider.ollama.rawValue)
+                    Text("OpenAI").tag(AIProvider.openAI.rawValue)
+                    Text("Claude").tag(AIProvider.anthropic.rawValue)
+                    Text("Gemini").tag(AIProvider.gemini.rawValue)
                 }
 
                 TextField("Ollama Endpoint", text: $ollamaEndpoint)
@@ -48,56 +66,98 @@ struct SettingsView: View {
                     .font(OrinFont.caption)
                     .foregroundStyle(.secondary)
 
-                LabeledContent("OpenAI") {
-                    providerStatus(openAIConfigured)
-                }
-                SecureField("OpenAI API Key", text: $openAIKeyDraft)
-                Button("Test & Save OpenAI") {
-                    openAIConfigured = !openAIKeyDraft.isEmpty
-                    openAIKeyDraft = ""
-                }
+                providerRow(
+                    label: "OpenAI",
+                    isConfigured: openAIConfigured,
+                    draft: $openAIKeyDraft,
+                    placeholder: "OpenAI API Key",
+                    account: AIService.openAIAccount,
+                    configured: $openAIConfigured
+                )
 
-                LabeledContent("Claude") {
-                    providerStatus(anthropicConfigured)
-                }
-                SecureField("Claude API Key", text: $anthropicKeyDraft)
-                Button("Test & Save Claude") {
-                    anthropicConfigured = !anthropicKeyDraft.isEmpty
-                    anthropicKeyDraft = ""
-                }
+                providerRow(
+                    label: "Claude",
+                    isConfigured: anthropicConfigured,
+                    draft: $anthropicKeyDraft,
+                    placeholder: "Anthropic API Key",
+                    account: AIService.anthropicAccount,
+                    configured: $anthropicConfigured
+                )
 
-                LabeledContent("Gemini") {
-                    providerStatus(geminiConfigured)
-                }
-                SecureField("Gemini API Key", text: $geminiKeyDraft)
-                Button("Test & Save Gemini") {
-                    geminiConfigured = !geminiKeyDraft.isEmpty
-                    geminiKeyDraft = ""
-                }
+                providerRow(
+                    label: "Gemini",
+                    isConfigured: geminiConfigured,
+                    draft: $geminiKeyDraft,
+                    placeholder: "Gemini API Key",
+                    account: AIService.geminiAccount,
+                    configured: $geminiConfigured
+                )
             }
 
+            // MARK: Privacy
             Section("Privacy") {
-                LabeledContent("Default AI Mode", value: provider == "ollama" ? "Local only" : "External with local failover")
-                LabeledContent("Calendar Source", value: "EventKit")
-                LabeledContent("Vault Storage", value: "Local encrypted")
+                LabeledContent("Default AI Mode", value: providerRaw == AIProvider.ollama.rawValue ? "Local only" : "External with local fallover")
+                LabeledContent("Calendar Source", value: "EventKit (local)")
+                LabeledContent("Vault Storage", value: "On-device AES-256-GCM")
+                LabeledContent("Transcription", value: "On-device via SFSpeechRecognizer")
             }
         }
         .formStyle(.grouped)
         .padding()
         .navigationTitle("Settings")
+        .onAppear {
+            loginItemService.refreshStatus()
+            openAIConfigured    = AIKeychainService.hasKey(for: AIService.openAIAccount)
+            anthropicConfigured = AIKeychainService.hasKey(for: AIService.anthropicAccount)
+            geminiConfigured    = AIKeychainService.hasKey(for: AIService.geminiAccount)
+        }
+    }
+
+    // MARK: - Helpers
+
+    @ViewBuilder
+    private func providerRow(
+        label: String,
+        isConfigured: Bool,
+        draft: Binding<String>,
+        placeholder: String,
+        account: String,
+        configured: Binding<Bool>
+    ) -> some View {
+        LabeledContent(label) { providerStatus(isConfigured) }
+        SecureField(placeholder, text: draft)
+        HStack {
+            Button("Save \(label) Key") {
+                guard !draft.wrappedValue.isEmpty else { return }
+                AIKeychainService.save(draft.wrappedValue, account: account)
+                configured.wrappedValue = true
+                draft.wrappedValue = ""
+            }
+            .disabled(draft.wrappedValue.isEmpty)
+
+            if isConfigured {
+                Button("Remove", role: .destructive) {
+                    AIKeychainService.delete(account: account)
+                    configured.wrappedValue = false
+                }
+            }
+        }
     }
 
     private func providerStatus(_ configured: Bool) -> some View {
-        Label(configured ? "Configured" : "Not configured", systemImage: configured ? "checkmark.circle.fill" : "circle")
-            .foregroundStyle(configured ? .green : .secondary)
+        Label(
+            configured ? "Configured" : "Not configured",
+            systemImage: configured ? "checkmark.circle.fill" : "circle"
+        )
+        .foregroundStyle(configured ? Color.green : .secondary)
     }
 
     private var ollamaStatusColor: Color {
         switch ollamaService.status {
         case .connected: OrinColor.success
-        case .missing: OrinColor.warning
-        case .failed: OrinColor.error
-        case .unknown: .secondary
+        case .missing:   OrinColor.warning
+        case .failed:    OrinColor.error
+        case .unknown:   .secondary
         }
     }
 }

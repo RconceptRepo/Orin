@@ -57,6 +57,7 @@ final class MeetingDetectorService: Service {
     func startMonitoring() {
         guard timer == nil else { return }
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            // Timer fires on the main run loop; poll() dispatches work to a Task.
             self?.poll()
         }
         poll()

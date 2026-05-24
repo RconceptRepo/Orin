@@ -21,7 +21,7 @@ struct OrinMenuBarView: View {
                 if recordingService.isRecording {
                     recordingService.stopRecording()
                 } else {
-                    recordingService.startRecording()
+                    Task { @MainActor in await recordingService.startRecording() }
                 }
             }
             Button("Reflow Day") {

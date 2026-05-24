@@ -5,6 +5,14 @@ struct RecordingWidgetView: View {
     var onStop: () -> Void
 
     var body: some View {
+        if let error = recordingService.errorMessage {
+            errorBanner(error)
+        } else {
+            recordingCapsule
+        }
+    }
+
+    private var recordingCapsule: some View {
         HStack(spacing: 10) {
             Circle()
                 .fill(OrinColor.error)
@@ -30,6 +38,32 @@ struct RecordingWidgetView: View {
         .clipShape(Capsule())
         .shadow(color: .black.opacity(0.18), radius: 14, x: 0, y: 6)
         .accessibilityLabel("Meeting recording widget")
+    }
+
+    private func errorBanner(_ message: String) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: "mic.slash.fill")
+                .foregroundStyle(OrinColor.error)
+            Text(message)
+                .font(OrinFont.caption)
+                .foregroundStyle(OrinColor.error)
+                .lineLimit(3)
+            Spacer()
+            Button {
+                recordingService.clearError()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .bold))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 14)
+        .frame(width: 280)
+        .padding(.vertical, 10)
+        .background(.regularMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .shadow(color: .black.opacity(0.18), radius: 14, x: 0, y: 6)
+        .accessibilityLabel("Recording error: \(message)")
     }
 }
 

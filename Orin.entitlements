@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Orin.entitlements
+  Apply this file to the app target in Xcode (Build Settings → Code Signing Entitlements)
+  or pass it to codesign when building a release package.
+  Not automatically applied by `swift build`.
+-->
+<plist version="1.0">
+<dict>
+    <!-- Required for browser-tab meeting detection via AppleScript -->
+    <key>com.apple.security.automation.apple-events</key>
+    <true/>
+
+    <!-- Enables outbound network calls to Ollama and external AI providers -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+
+    <!-- Microphone access for live meeting transcription -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+
+    <!-- Calendar (EventKit) access -->
+    <key>com.apple.security.personal-information.calendars</key>
+    <true/>
+
+    <!-- Keychain access for vault master key and AI provider keys -->
+    <key>keychain-access-groups</key>
+    <array>
+        <string>$(AppIdentifierPrefix)com.orin.local</string>
+    </array>
+</dict>
+</plist>
