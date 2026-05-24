@@ -61,24 +61,38 @@ struct CalendarView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                List {
-                    Section("Meetings") {
-                        if selectedEvents.isEmpty {
-                            Text("No EventKit meetings for this date.")
-                                .foregroundStyle(.secondary)
-                        } else {
-                            ForEach(selectedEvents, id: \.eventIdentifier) { event in
-                                CalendarEventRow(event: event)
-                            }
+                if isSyncing {
+                    VStack(spacing: 8) {
+                        ForEach(0..<4, id: \.self) { i in
+                            OrinSkeletonRow(height: 44)
+                                .opacity(1 - Double(i) * 0.15)
                         }
                     }
-                    Section("Tasks") {
-                        if selectedTasks.isEmpty {
-                            Text("No tasks scheduled for this date.")
-                                .foregroundStyle(.secondary)
-                        } else {
-                            ForEach(selectedTasks) { task in
-                                TaskRowView(task: task, showsDescription: true)
+                    .padding(.vertical, 8)
+
+                    OrinProgressStep(message: "Syncing calendar events…")
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, 4)
+                } else {
+                    List {
+                        Section("Meetings") {
+                            if selectedEvents.isEmpty {
+                                Text("No EventKit meetings for this date.")
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                ForEach(selectedEvents, id: \.eventIdentifier) { event in
+                                    CalendarEventRow(event: event)
+                                }
+                            }
+                        }
+                        Section("Tasks") {
+                            if selectedTasks.isEmpty {
+                                Text("No tasks scheduled for this date.")
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                ForEach(selectedTasks) { task in
+                                    TaskRowView(task: task, showsDescription: true)
+                                }
                             }
                         }
                     }

@@ -13,6 +13,7 @@ struct VaultView: View {
     @State private var selectedItemID: UUID?
     @State private var revealedSecret = ""
     @State private var isAddingItem = false
+    @State private var isUnlocking = false
 
     // Recovery key onboarding (first unlock)
     @State private var showingRecoveryKey = false
@@ -113,9 +114,18 @@ struct VaultView: View {
                 Button {
                     Task { await unlock() }
                 } label: {
-                    Label(vaultService.canUseBiometrics ? "Unlock with Touch ID" : "Unlock",
-                          systemImage: "touchid")
+                    if isUnlocking {
+                        HStack(spacing: 6) {
+                            ProgressView().scaleEffect(0.7)
+                            Text("Unlocking…")
+                        }
+                        .frame(height: 28)
+                    } else {
+                        Label(vaultService.canUseBiometrics ? "Unlock with Touch ID" : "Unlock",
+                              systemImage: vaultService.canUseBiometrics ? "touchid" : "lock.open")
+                    }
                 }
+                .disabled(isUnlocking)
             } else {
                 Button { isAddingItem = true } label: {
                     Label("New Item", systemImage: "plus")
@@ -210,6 +220,8 @@ struct VaultView: View {
     // MARK: - Actions
 
     private func unlock() async {
+        isUnlocking = true
+        defer { isUnlocking = false }
         switch await vaultService.unlockVault() {
         case .success(let key):
             vaultKey = key

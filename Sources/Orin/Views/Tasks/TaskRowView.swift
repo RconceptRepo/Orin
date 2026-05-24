@@ -4,6 +4,7 @@ import SwiftUI
 struct TaskRowView: View {
     let task: TaskItem
     var showsDescription = false
+    var showsDragHandle: Bool = false
     var onToggleComplete: (() -> Void)?
     var onEdit: (() -> Void)?
     var onDelete: (() -> Void)?
@@ -13,6 +14,7 @@ struct TaskRowView: View {
 
     @State private var isSubtasksExpanded = false
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.colorScheme) private var colorScheme
 
     private var sortedSubtasks: [SubTaskItem] {
         task.subtasks.sorted { $0.sortIndex < $1.sortIndex }
@@ -36,6 +38,7 @@ struct TaskRowView: View {
                 .fill(Color.clear)
         }
         .accessibilityElement(children: .contain)
+        .accessibilityHint(showsDragHandle ? "Drag to reorder" : "")
         .animation(.easeInOut(duration: 0.15), value: isSubtasksExpanded)
     }
 
@@ -43,6 +46,9 @@ struct TaskRowView: View {
 
     private var mainRow: some View {
         HStack(spacing: 12) {
+            if showsDragHandle {
+                DragHandleView()
+            }
             Button {
                 onToggleComplete?()
             } label: {
@@ -147,7 +153,7 @@ struct TaskRowView: View {
         VStack(alignment: .leading, spacing: 4) {
             ForEach(sortedSubtasks) { subtask in
                 SubtaskCompactRow(subtask: subtask) {
-                    try? modelContext.save()
+                    modelContext.safeSave(context: "subtask")
                 }
             }
         }

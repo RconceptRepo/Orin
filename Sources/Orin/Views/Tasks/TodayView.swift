@@ -18,6 +18,9 @@ struct TodayView: View {
     @Query(sort: \FocusPatternItem.updatedAt, order: .reverse)
     private var focusPatterns: [FocusPatternItem]
 
+    @AppStorage("orin.taskDragHintShown") private var dragHintShown = false
+    @FocusState private var focusedTaskIndex: Int?
+
     @State private var isAddingTask = false
     @State private var isShowingReflow = false
     @State private var isReflowing = false
@@ -157,11 +160,19 @@ struct TodayView: View {
                     )
                     .frame(minHeight: 260)
                 } else {
+                    if !dragHintShown, activeTodayTasks.count >= 2 {
+                        DragHintBanner {
+                            withAnimation { dragHintShown = true }
+                        }
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                        .padding(.bottom, 4)
+                    }
                     List {
                         ForEach(activeTodayTasks) { task in
                             TaskRowView(
                                 task: task,
                                 showsDescription: true,
+                                showsDragHandle: true,
                                 onToggleComplete: { complete(task) },
                                 onEdit: { taskToEdit = task },
                                 onDelete: { delete(task) },
@@ -170,6 +181,14 @@ struct TodayView: View {
                             .listRowSeparator(.hidden)
                             .listRowBackground(Color.clear)
                             .listRowInsets(EdgeInsets(top: 2, leading: 0, bottom: 2, trailing: 0))
+                            .accessibilityAction(named: "Move Up") {
+                                guard let idx = activeTodayTasks.firstIndex(where: { $0.id == task.id }), idx > 0 else { return }
+                                moveTasks(from: IndexSet([idx]), to: idx - 1)
+                            }
+                            .accessibilityAction(named: "Move Down") {
+                                guard let idx = activeTodayTasks.firstIndex(where: { $0.id == task.id }), idx < activeTodayTasks.count - 1 else { return }
+                                moveTasks(from: IndexSet([idx]), to: idx + 2)
+                            }
                         }
                         .onMove { from, to in moveTasks(from: from, to: to) }
                     }

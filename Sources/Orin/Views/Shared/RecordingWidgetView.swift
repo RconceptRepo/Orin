@@ -17,9 +17,10 @@ struct RecordingWidgetView: View {
             Circle()
                 .fill(OrinColor.error)
                 .frame(width: 10, height: 10)
-                .opacity(recordingService.isRecording ? 1 : 0.4)
+                .scaleEffect(recordingService.isRecording ? 1 : 0.7)
+                .animation(.easeInOut(duration: 0.6).repeatForever(autoreverses: true), value: recordingService.isRecording)
             VStack(alignment: .leading, spacing: 2) {
-                Text(recordingService.isRecording ? "Listening" : "Stopped")
+                Text(recordingService.isRecording ? "Listening" : "Starting…")
                     .font(OrinFont.body.weight(.semibold))
                 Text(recordingService.durationText)
                     .font(OrinFont.caption)
