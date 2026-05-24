@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		0068E65BB63772EC91AD7DEB /* OnboardingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8DD0072C181C86E6573956E6 /* OnboardingView.swift */; };
 		09D0674313F646D3FBF566E6 /* AssistantServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A25106AFC089E647B528961 /* AssistantServiceTests.swift */; };
 		0D721D1D3550B57F20CA3A2B /* CalendarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 852A1F94F61BA3A76C924024 /* CalendarView.swift */; };
 		0EF4A14A18D8C1807903BFB5 /* OrinModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD7A85A436BEDD4A27D60331 /* OrinModels.swift */; };
@@ -90,6 +91,7 @@
 		852A1F94F61BA3A76C924024 /* CalendarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CalendarView.swift; sourceTree = "<group>"; };
 		872AB7805980C0ECE87011B3 /* DailyBriefService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DailyBriefService.swift; sourceTree = "<group>"; };
 		8B1EBA9F88D8CE1329DF86FE /* QuickCaptureParserTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickCaptureParserTests.swift; sourceTree = "<group>"; };
+		8DD0072C181C86E6573956E6 /* OnboardingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingView.swift; sourceTree = "<group>"; };
 		8E38499508BBC866121E1F80 /* OllamaInstallerService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OllamaInstallerService.swift; sourceTree = "<group>"; };
 		8E3F55E6C9F42F11F080D018 /* MeetingRetentionService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeetingRetentionService.swift; sourceTree = "<group>"; };
 		94B9556EE44C555E2A084F6E /* OrinAppIntents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrinAppIntents.swift; sourceTree = "<group>"; };
@@ -165,6 +167,14 @@
 			path = OrinTests;
 			sourceTree = "<group>";
 		};
+		4280207090B7CF259FBFCB09 /* Onboarding */ = {
+			isa = PBXGroup;
+			children = (
+				8DD0072C181C86E6573956E6 /* OnboardingView.swift */,
+			);
+			path = Onboarding;
+			sourceTree = "<group>";
+		};
 		465A6B13A28285483890FA6F /* Calendar */ = {
 			isa = PBXGroup;
 			children = (
@@ -181,6 +191,7 @@
 				1DF29CCBD2065E2FF16EF9FA /* Backlog */,
 				465A6B13A28285483890FA6F /* Calendar */,
 				0A9D147506017294092048EF /* Meetings */,
+				4280207090B7CF259FBFCB09 /* Onboarding */,
 				9842EB6F6E1837FEE4DE540B /* Settings */,
 				D55025364CBE974F3E8D089A /* Shared */,
 				B5EE7B3FBD97140821E7E0A6 /* Tasks */,
@@ -402,6 +413,7 @@
 				6F4802481BE0C2AF5490B8A2 /* MeetingRetentionService.swift in Sources */,
 				A646A587F6E344260CFA72DA /* MeetingsView.swift in Sources */,
 				8DC903E4C6612D8CE9D875B2 /* OllamaInstallerService.swift in Sources */,
+				0068E65BB63772EC91AD7DEB /* OnboardingView.swift in Sources */,
 				A559F24FF52E990EE76ED46C /* OrinApp.swift in Sources */,
 				C135559B284815EBD5D4C7D8 /* OrinAppIntents.swift in Sources */,
 				B8EE12B885B42CB4932248D2 /* OrinDesignSystem.swift in Sources */,

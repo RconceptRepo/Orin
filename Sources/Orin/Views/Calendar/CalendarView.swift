@@ -12,6 +12,7 @@ struct CalendarView: View {
     @State private var calendarService = ServiceContainer.shared.resolve(CalendarService.self)
     @State private var selectedDate = Date()
     @State private var isSyncing = false
+    @Environment(\.colorScheme) private var colorScheme
 
     private var selectedEvents: [EKEvent] {
         calendarService.events.filter { event in
@@ -35,48 +36,50 @@ struct CalendarView: View {
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
-
                 Spacer()
-
                 CalendarStatusBadge(status: calendarService.status)
-
                 Button {
-                    Task { await requestAndSync() }
+                    Task { await syncNow() }
                 } label: {
-                    Label("Sync", systemImage: "arrow.clockwise")
+                    Label(isSyncing ? "Syncing…" : "Sync", systemImage: "arrow.clockwise")
                 }
-                .disabled(isSyncing)
+                .disabled(isSyncing || calendarService.status == .red)
             }
 
-            DatePicker("Selected Date", selection: $selectedDate, displayedComponents: .date)
-                .datePickerStyle(.compact)
-                .labelsHidden()
+            // Permission gate
+            if calendarService.status == .red {
+                calendarPermissionBanner
+            } else {
+                // Date picker + content
+                DatePicker("Selected Date", selection: $selectedDate, displayedComponents: .date)
+                    .datePickerStyle(.compact)
+                    .labelsHidden()
 
-            if let lastSync = calendarService.lastSyncTimestamp {
-                Text("Last synced \(lastSync.formatted(date: .abbreviated, time: .shortened))")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+                if let lastSync = calendarService.lastSyncTimestamp {
+                    Text("Last synced \(lastSync.formatted(date: .abbreviated, time: .shortened))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
 
-            List {
-                Section("Meetings") {
-                    if selectedEvents.isEmpty {
-                        Text("No EventKit meetings for this date.")
-                            .foregroundStyle(.secondary)
-                    } else {
-                        ForEach(selectedEvents, id: \.eventIdentifier) { event in
-                            CalendarEventRow(event: event)
+                List {
+                    Section("Meetings") {
+                        if selectedEvents.isEmpty {
+                            Text("No EventKit meetings for this date.")
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(selectedEvents, id: \.eventIdentifier) { event in
+                                CalendarEventRow(event: event)
+                            }
                         }
                     }
-                }
-
-                Section("Tasks") {
-                    if selectedTasks.isEmpty {
-                        Text("No tasks scheduled for this date.")
-                            .foregroundStyle(.secondary)
-                    } else {
-                        ForEach(selectedTasks) { task in
-                            TaskRowView(task: task, showsDescription: true)
+                    Section("Tasks") {
+                        if selectedTasks.isEmpty {
+                            Text("No tasks scheduled for this date.")
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(selectedTasks) { task in
+                                TaskRowView(task: task, showsDescription: true)
+                            }
                         }
                     }
                 }
@@ -84,27 +87,103 @@ struct CalendarView: View {
         }
         .padding()
         .task {
-            calendarService.refreshAuthorizationStatus()
-            if calendarService.lastSyncTimestamp == nil {
-                await requestAndSync()
+            await initialSetup()
+        }
+    }
+
+    // MARK: - Permission banner (shown when access is denied)
+
+    private var calendarPermissionBanner: some View {
+        VStack(spacing: 20) {
+            Spacer()
+            Image(systemName: "calendar.badge.exclamationmark")
+                .font(.system(size: 52))
+                .foregroundStyle(OrinColor.error)
+
+            Text("Calendar Access Required")
+                .font(.title2.weight(.semibold))
+
+            Text("Grant access so Orin can show your EventKit meetings alongside tasks.")
+                .font(.body)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 380)
+
+            let authStatus = EKEventStore.authorizationStatus(for: .event)
+            if authStatus == .notDetermined {
+                Button {
+                    Task { await requestAndSync() }
+                } label: {
+                    Label("Grant Calendar Access", systemImage: "calendar")
+                }
+                .buttonStyle(OrinPrimaryButtonStyle())
+            } else {
+                VStack(spacing: 8) {
+                    Text("Access was denied. Open System Settings to enable it.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("Open System Settings") {
+                        NSWorkspace.shared.open(
+                            URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars")!
+                        )
+                    }
+                    .buttonStyle(OrinPrimaryButtonStyle())
+                    Button("Check Again") {
+                        Task { await recheckAndSync() }
+                    }
+                    .buttonStyle(OrinSecondaryButtonStyle())
+                }
             }
+            Spacer()
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    // MARK: - Actions
+
+    private func initialSetup() async {
+        calendarService.refreshAuthorizationStatus()
+        switch EKEventStore.authorizationStatus(for: .event) {
+        case .notDetermined:
+            await requestAndSync()
+        case .fullAccess, .authorized:
+            if calendarService.lastSyncTimestamp == nil {
+                await syncNow()
+            }
+        default:
+            break
         }
     }
 
     private func requestAndSync() async {
         isSyncing = true
+        await calendarService.requestPermission()
         calendarService.refreshAuthorizationStatus()
-        if calendarService.status == .yellow {
-            await calendarService.requestPermission()
+        if calendarService.status != .red {
+            await calendarService.syncEvents()
         }
+        isSyncing = false
+    }
+
+    private func recheckAndSync() async {
+        calendarService.refreshAuthorizationStatus()
+        if calendarService.status != .red {
+            await syncNow()
+        }
+    }
+
+    private func syncNow() async {
+        isSyncing = true
+        calendarService.refreshAuthorizationStatus()
         await calendarService.syncEvents()
         isSyncing = false
     }
 }
 
+// MARK: - Sub-views
+
 private struct CalendarStatusBadge: View {
     let status: CalendarSyncStatus
-
     var body: some View {
         Label(status.title, systemImage: "circle.fill")
             .font(.caption.weight(.medium))
@@ -114,39 +193,31 @@ private struct CalendarStatusBadge: View {
             .background(color.opacity(0.12))
             .clipShape(RoundedRectangle(cornerRadius: 6))
     }
-
     private var color: Color {
         switch status {
-        case .green: .green
+        case .green:  .green
         case .yellow: .yellow
-        case .red: .red
+        case .red:    .red
         }
     }
 }
 
 private struct CalendarEventRow: View {
     let event: EKEvent
-
     var body: some View {
         HStack(spacing: 10) {
             RoundedRectangle(cornerRadius: 3)
                 .fill(Color(cgColor: event.calendar.cgColor))
                 .frame(width: 4)
-
             VStack(alignment: .leading, spacing: 3) {
-                Text(event.title ?? "Untitled Event")
-                    .font(.body)
-                Text(timeRange)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Text(event.title ?? "Untitled Event").font(.body)
+                Text(timeRange).font(.caption).foregroundStyle(.secondary)
             }
-
             Spacer()
         }
         .padding(.vertical, 4)
     }
-
     private var timeRange: String {
-        "\(event.startDate.formatted(date: .omitted, time: .shortened)) - \(event.endDate.formatted(date: .omitted, time: .shortened))"
+        "\(event.startDate.formatted(date: .omitted, time: .shortened)) – \(event.endDate.formatted(date: .omitted, time: .shortened))"
     }
 }

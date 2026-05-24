@@ -2,6 +2,8 @@ import SwiftData
 import SwiftUI
 
 struct OrinApp: App {
+    @AppStorage("orin.hasCompletedOnboarding") private var hasCompletedOnboarding = false
+
     private let modelContainer: ModelContainer
     private let rolloverEngine: RolloverEngine
 
@@ -46,7 +48,7 @@ struct OrinApp: App {
 
             QuickCaptureWindowManager.shared.configure(modelContainer: modelContainer)
 
-            // Prune expired meetings on launch (uses AppStorage default of 30 days)
+            // Prune expired meetings on launch
             let retentionDays = UserDefaults.standard.integer(forKey: "orin.meetings.retentionDays")
             let policy = MeetingRetentionService.RetentionPolicy.from(rawValue: retentionDays == 0
                 ? MeetingRetentionService.RetentionPolicy.thirtyDays.rawValue : retentionDays)
@@ -63,11 +65,21 @@ struct OrinApp: App {
                 .onAppear {
                     rolloverEngine.verifyAndExecuteRollover()
                     ServiceContainer.shared.resolve(AssistantService.self).processPendingIntents()
+                    bringWindowToFront()
                 }
                 .onOpenURL { url in
                     ServiceContainer.shared.resolve(AssistantService.self).handleURL(url)
                 }
+                .sheet(isPresented: Binding(
+                    get: { !hasCompletedOnboarding },
+                    set: { if !$0 { hasCompletedOnboarding = true } }
+                )) {
+                    OnboardingView()
+                        .interactiveDismissDisabled()
+                }
         }
+        .windowStyle(.titleBar)
+        .windowToolbarStyle(.unified)
         .commands {
             CommandGroup(after: .newItem) {
                 Button("Quick Capture") {
@@ -81,5 +93,9 @@ struct OrinApp: App {
             OrinMenuBarView()
         }
         .menuBarExtraStyle(.window)
+    }
+
+    private func bringWindowToFront() {
+        NSApplication.shared.activate(ignoringOtherApps: true)
     }
 }

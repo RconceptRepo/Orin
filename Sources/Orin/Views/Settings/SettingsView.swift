@@ -39,6 +39,9 @@ struct SettingsView: View {
                     Text(error)
                         .font(OrinFont.caption)
                         .foregroundStyle(OrinColor.error)
+                    Text("Login item requires Orin to be installed in /Applications and signed with a Developer ID certificate.")
+                        .font(OrinFont.caption)
+                        .foregroundStyle(.secondary)
                 }
 
                 Toggle("Calendar background sync", isOn: $calendarBackgroundSync)
@@ -107,12 +110,39 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
+            // MARK: Siri & Shortcuts
+            Section("Siri & Shortcuts") {
+                LabeledContent("Status") {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(OrinColor.warning)
+                        Text("Requires App Store or TestFlight distribution")
+                            .font(OrinFont.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Text("Siri phrases and Shortcuts require the app to be signed with a Developer ID and distributed via the App Store or TestFlight. They are unavailable in local/ad-hoc builds.")
+                    .font(OrinFont.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             // MARK: Privacy
             Section("Privacy") {
                 LabeledContent("Default AI Mode", value: providerRaw == AIProvider.ollama.rawValue ? "Local only" : "External with local fallover")
                 LabeledContent("Calendar Source", value: "EventKit (local)")
                 LabeledContent("Vault Storage", value: "On-device AES-256-GCM")
                 LabeledContent("Transcription", value: "On-device via SFSpeechRecognizer")
+            }
+
+            // MARK: Reset onboarding
+            Section("Troubleshooting") {
+                Button("Re-run Setup Wizard") {
+                    UserDefaults.standard.removeObject(forKey: "orin.hasCompletedOnboarding")
+                }
+                .foregroundStyle(OrinColor.accent)
+                Text("Use this to re-grant permissions if the setup wizard was dismissed too early.")
+                    .font(OrinFont.caption)
+                    .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
