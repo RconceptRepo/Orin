@@ -39,7 +39,7 @@ struct AllTasksView: View {
         .padding()
         .sheet(item: $taskToEdit) { task in
             TaskEditSheet(task: task) {
-                try? modelContext.save()
+                modelContext.safeSave(context: "task edits")
                 taskToEdit = nil
             }
         }
@@ -48,18 +48,18 @@ struct AllTasksView: View {
     private func complete(_ task: TaskItem) {
         task.status = .completed
         task.completedAt = Date()
-        try? modelContext.save()
+        modelContext.safeSave(context: "task")
     }
 
     private func reactivate(_ task: TaskItem) {
         task.status = .active
         task.completedAt = nil
-        try? modelContext.save()
+        modelContext.safeSave(context: "task")
     }
 
     private func delete(_ task: TaskItem) {
         modelContext.delete(task)
-        try? modelContext.save()
+        modelContext.safeSave(context: "task")
     }
 }
 
@@ -206,7 +206,7 @@ struct TaskEditSheet: View {
     }
 
     private func saveSubtasks() {
-        try? modelContext.save()
+        modelContext.safeSave(context: "subtask")
     }
 
     // MARK: - Task field helpers

@@ -13,7 +13,6 @@ struct VaultView: View {
     @State private var selectedItemID: UUID?
     @State private var revealedSecret = ""
     @State private var isAddingItem = false
-    @State private var errorMessage: String?
 
     // Recovery key onboarding (first unlock)
     @State private var showingRecoveryKey = false
@@ -38,13 +37,6 @@ struct VaultView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             headerRow
-
-            if let errorMessage {
-                Text(errorMessage)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .padding(.horizontal, 4)
-            }
 
             if unlockedViaRecovery, vaultKey != nil {
                 recoveryBanner
@@ -218,7 +210,6 @@ struct VaultView: View {
     // MARK: - Actions
 
     private func unlock() async {
-        errorMessage = nil
         switch await vaultService.unlockVault() {
         case .success(let key):
             vaultKey = key
@@ -231,11 +222,12 @@ struct VaultView: View {
                 showingRecoveryKey = true
             }
         case .failure(.userCancelled):
-            break
+            break  // Expected — user dismissed the prompt; no error shown
         case .failure(.authenticationFailed):
-            errorMessage = "Authentication failed. Ensure Touch ID or a device password is configured in System Settings."
+            ErrorManager.shared.report(.vaultAuthenticationFailed,
+                                       retryAction: { await unlock() })
         case .failure(.keychainError(let status)):
-            errorMessage = "Keychain error (\(status)). Try restarting the app."
+            ErrorManager.shared.report(.vaultKeychainFailed(status: status))
         }
     }
 
@@ -253,10 +245,10 @@ struct VaultView: View {
             let decrypted = try vaultService.decrypt(item.encryptedSecret, using: vaultKey)
             revealedSecret = String(data: decrypted, encoding: .utf8) ?? ""
             item.lastAccessed = Date()
-            try? modelContext.save()
+            modelContext.safeSave(context: "vault access timestamp")
         } catch {
             revealedSecret = ""
-            errorMessage = "Could not decrypt this item."
+            ErrorManager.shared.report(.vaultEncryptionFailed)
         }
     }
 
@@ -265,9 +257,9 @@ struct VaultView: View {
         do {
             let encrypted = try vaultService.encrypt(Data(draft.secret.utf8), using: vaultKey)
             modelContext.insert(VaultItem(title: draft.title, encryptedSecret: encrypted, itemType: draft.itemType))
-            try modelContext.save()
+            modelContext.safeSave(context: "vault item")
         } catch {
-            errorMessage = "Could not save vault item."
+            ErrorManager.shared.report(.vaultEncryptionFailed)
         }
     }
 
@@ -275,18 +267,17 @@ struct VaultView: View {
         modelContext.delete(item)
         selectedItemID = nil
         revealedSecret = ""
-        try? modelContext.save()
+        modelContext.safeSave(context: "vault item")
     }
 
     private func performVaultReset() {
         for item in vaultItems { modelContext.delete(item) }
-        try? modelContext.save()
+        modelContext.safeSave(context: "vault reset")
         vaultService.resetVault()
         recoveryKeyShown = false
         vaultKey = nil
         selectedItemID = nil
         revealedSecret = ""
-        errorMessage = nil
         unlockedViaRecovery = false
     }
 }

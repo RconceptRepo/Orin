@@ -128,7 +128,7 @@ struct TodayView: View {
         }
         .sheet(item: $taskToEdit) { task in
             TodayTaskEditSheet(task: task) {
-                try? modelContext.save()
+                modelContext.safeSave(context: "task edits")
                 taskToEdit = nil
             }
         }
@@ -195,7 +195,7 @@ struct TodayView: View {
                         Spacer()
                         Button("Fulfill") {
                             commitment.statusValue = "fulfilled"
-                            try? modelContext.save()
+                            modelContext.safeSave(context: "commitment")
                         }
                     }
                 }
@@ -235,7 +235,7 @@ struct TodayView: View {
             )
             modelContext.insert(task)
         }
-        try? modelContext.save()
+        modelContext.safeSave(context: "new tasks")
     }
 
     private func moveTasks(from source: IndexSet, to destination: Int) {
@@ -244,7 +244,7 @@ struct TodayView: View {
         for index in revisedItems.indices {
             revisedItems[index].dragOrderIndex = index
         }
-        try? modelContext.save()
+        modelContext.safeSave(context: "task order")
     }
 
     private func prepareReflow() {
@@ -319,7 +319,7 @@ struct TodayView: View {
             suggestionType: "reflow"
         )
         modelContext.insert(suggestion)
-        try? modelContext.save()
+        modelContext.safeSave(context: "suggestion")
     }
 
     private func acceptSuggestion(_ suggestion: AISuggestionItem) {
@@ -327,30 +327,30 @@ struct TodayView: View {
             prepareReflow()
         }
         suggestion.status = .accepted
-        try? modelContext.save()
+        modelContext.safeSave(context: "suggestion")
     }
 
     private func declineSuggestion(_ suggestion: AISuggestionItem) {
         suggestion.status = .declined
         suggestion.hiddenUntil = Calendar.current.date(byAdding: .day, value: 1, to: Date())
-        try? modelContext.save()
+        modelContext.safeSave(context: "suggestion")
     }
 
     private func complete(_ task: TaskItem) {
         task.status = .completed
         task.completedAt = Date()
-        try? modelContext.save()
+        modelContext.safeSave(context: "task")
     }
 
     private func reactivate(_ task: TaskItem) {
         task.status = .active
         task.completedAt = nil
-        try? modelContext.save()
+        modelContext.safeSave(context: "task")
     }
 
     private func delete(_ task: TaskItem) {
         modelContext.delete(task)
-        try? modelContext.save()
+        modelContext.safeSave(context: "task")
     }
 
 }
@@ -507,7 +507,7 @@ private struct TodayTaskEditSheet: View {
     }
 
     private func saveSubtasks() {
-        try? modelContext.save()
+        modelContext.safeSave(context: "subtask")
     }
 
     private func populate() {

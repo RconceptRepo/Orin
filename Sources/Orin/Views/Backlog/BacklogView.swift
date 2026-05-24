@@ -50,7 +50,7 @@ struct BacklogView: View {
         }
         .sheet(item: $taskToEdit) { item in
             TaskEditSheet(task: item) {
-                try? modelContext.save()
+                modelContext.safeSave(context: "task edits")
                 taskToEdit = nil
             }
         }
@@ -69,19 +69,19 @@ struct BacklogView: View {
             )
             modelContext.insert(task)
         }
-        try? modelContext.save()
+        modelContext.safeSave(context: "backlog items")
     }
 
     private func activate(_ item: TaskItem) {
         item.isBacklog = false
         item.triggerDate = nil
         item.dueDate = Calendar.current.startOfDay(for: Date())
-        try? modelContext.save()
+        modelContext.safeSave(context: "task")
     }
 
     private func delete(_ item: TaskItem) {
         modelContext.delete(item)
-        try? modelContext.save()
+        modelContext.safeSave(context: "task")
     }
 
 }

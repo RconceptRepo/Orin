@@ -73,7 +73,7 @@ struct MainContainerView: View {
                                         date: Date()
                                     )
                                     modelContext.insert(meeting)
-                                    try? modelContext.save()
+                                    modelContext.safeSave(context: "meeting")
                                     activeRecordingMeeting = meeting
                                     selectedModule = .meetings
                                     await recordingService.startRecording(for: meeting.id)
@@ -97,6 +97,7 @@ struct MainContainerView: View {
         .frame(minWidth: 1280, minHeight: 720)
         .background(OrinColor.backgroundPrimary(colorScheme))
         .preferredColorScheme(OrinThemeMode(rawValue: themeModeRawValue)?.colorScheme)
+        .errorHandlingOverlay()
         .onAppear {
             meetingDetector.startMonitoring()
             calendarService.refreshAuthorizationStatus()
@@ -118,7 +119,7 @@ struct MainContainerView: View {
             if let url = recordingService.recordingURL {
                 meeting.audioFilePath = url.path
             }
-            try? modelContext.save()
+            modelContext.safeSave(context: "meeting recording")
             activeRecordingMeeting = nil
         }
     }

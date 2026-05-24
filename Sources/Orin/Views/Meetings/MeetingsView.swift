@@ -60,7 +60,7 @@ struct MeetingsView: View {
                 let meeting = MeetingItem(title: draft.title, date: draft.date)
                 meeting.participants = draft.participantsList
                 modelContext.insert(meeting)
-                try? modelContext.save()
+                modelContext.safeSave(context: "meeting")
                 selectedMeetingID = meeting.id
             }
         }
@@ -73,7 +73,6 @@ private struct MeetingDetailView: View {
 
     @State private var isAnalyzing = false
     @State private var isImportingTranscript = false
-    @State private var errorMessage: String?
     @State private var recordingService = ServiceContainer.shared.resolve(RecordingService.self)
     @State private var wasRecordingThisMeeting = false
 
@@ -104,12 +103,6 @@ private struct MeetingDetailView: View {
                     Label(isAnalyzing ? "Analyzing" : "Analyze", systemImage: "sparkles")
                 }
                 .disabled(isAnalyzing || meeting.transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            }
-
-            if let errorMessage {
-                Text(errorMessage)
-                    .font(.caption)
-                    .foregroundStyle(.red)
             }
 
             ScrollView {
@@ -203,7 +196,7 @@ private struct MeetingDetailView: View {
                                         Spacer()
                                         Button(commitment.statusValue == "fulfilled" ? "Reopen" : "Fulfill") {
                                             commitment.statusValue = commitment.statusValue == "fulfilled" ? "open" : "fulfilled"
-                                            try? modelContext.save()
+                                            modelContext.safeSave(context: "commitment")
                                         }
                                     }
                                 }
@@ -252,7 +245,7 @@ private struct MeetingDetailView: View {
             if let url = recordingService.recordingURL {
                 meeting.audioFilePath = url.path
             }
-            try? modelContext.save()
+            modelContext.safeSave(context: "meeting recording")
         }
         .fileImporter(
             isPresented: $isImportingTranscript,
@@ -283,7 +276,7 @@ private struct MeetingDetailView: View {
         meeting.actionItems = analysis.actionItems
         meeting.suggestedTaskTitles = analysis.suggestedTasks
         meeting.commitments = analysis.commitments.map { CommitmentItem(title: $0) }
-        try? modelContext.save()
+        modelContext.safeSave(context: "meeting analysis")
         isAnalyzing = false
     }
 
@@ -297,22 +290,22 @@ private struct MeetingDetailView: View {
         task.linkedMeeting = meeting
         meeting.acceptedSuggestedTaskTitles.append(title)
         modelContext.insert(task)
-        try? modelContext.save()
+        modelContext.safeSave(context: "task from meeting")
     }
 
     private func importTranscript(_ result: Result<[URL], Error>) {
         do {
             guard let url = try result.get().first else { return }
             guard url.startAccessingSecurityScopedResource() else {
-                errorMessage = "Could not access the selected transcript."
+                ErrorManager.shared.report(.storageLoadFailed(context: "transcript"))
                 return
             }
             defer { url.stopAccessingSecurityScopedResource() }
 
             meeting.transcript = try String(contentsOf: url, encoding: .utf8)
-            try? modelContext.save()
+            modelContext.safeSave(context: "meeting transcript")
         } catch {
-            errorMessage = "Could not import transcript."
+            ErrorManager.shared.report(.storageLoadFailed(context: "transcript"))
         }
     }
 }

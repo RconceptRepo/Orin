@@ -1,4 +1,7 @@
 import Foundation
+import OSLog
+
+private let aiLogger = Logger(subsystem: "com.clavrit.orin", category: "AIService")
 
 enum AIProvider: String {
     case ollama
@@ -107,6 +110,8 @@ final class AIService: Service {
             let (_, response) = try await URLSession.shared.data(for: request)
             return (response as? HTTPURLResponse)?.statusCode == 200
         } catch {
+            // Expected when Ollama is not running — fallback to next provider
+            aiLogger.debug("Ollama availability check failed: \(error)")
             return false
         }
     }
@@ -133,6 +138,7 @@ final class AIService: Service {
             let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
             return (json?["response"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         } catch {
+            aiLogger.warning("Ollama summary request failed: \(error) — trying next provider")
             return nil
         }
     }
@@ -161,6 +167,7 @@ final class AIService: Service {
             let message = choices?.first?["message"] as? [String: Any]
             return (message?["content"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         } catch {
+            aiLogger.warning("OpenAI summary request failed: \(error) — trying next provider")
             return nil
         }
     }
@@ -189,6 +196,7 @@ final class AIService: Service {
             let content = json?["content"] as? [[String: Any]]
             return (content?.first?["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         } catch {
+            aiLogger.warning("Anthropic summary request failed: \(error) — trying next provider")
             return nil
         }
     }
@@ -216,6 +224,7 @@ final class AIService: Service {
             let parts = content?["parts"] as? [[String: Any]]
             return (parts?.first?["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         } catch {
+            aiLogger.warning("Gemini summary request failed: \(error) — all providers exhausted")
             return nil
         }
     }

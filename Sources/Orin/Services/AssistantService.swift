@@ -85,7 +85,7 @@ final class AssistantService: Service {
 
         let task = TaskItem(title: title, priority: priority, dueDate: dueDate)
         context.insert(task)
-        try? context.save()
+        context.safeSave(context: "task from voice command")
     }
 
     // MARK: - Summary Builder (called from App Intents, takes an explicit context)

@@ -1,6 +1,9 @@
 import AppKit
+import OSLog
 import SwiftData
 import SwiftUI
+
+private let captureLogger = Logger(subsystem: "com.clavrit.orin", category: "QuickCapture")
 
 @MainActor
 final class QuickCaptureWindowManager {
@@ -52,7 +55,12 @@ final class QuickCaptureWindowManager {
         let context = modelContainer.mainContext
         let task = TaskItem(title: parsed.title, priority: parsed.priority, dueDate: parsed.dueDate)
         context.insert(task)
-        try? context.save()
+        do {
+            try context.save()
+        } catch {
+            captureLogger.error("Quick capture save failed: \(error)")
+            ErrorManager.shared.report(.storageSaveFailed(context: "quick capture task"))
+        }
     }
 }
 

@@ -1,7 +1,9 @@
 import Foundation
+import OSLog
 import SwiftData
 
 final class RolloverEngine: Service {
+    private let logger = Logger(subsystem: "com.clavrit.orin", category: "RolloverEngine")
     private let modelContainer: ModelContainer
     private let userDefaultsKey = "com.orin.lastRolloverTimestamp"
 
@@ -54,7 +56,7 @@ final class RolloverEngine: Service {
             try context.save()
             UserDefaults.standard.set(currentDate, forKey: userDefaultsKey)
         } catch {
-            print("Rollover failed: \(error.localizedDescription)")
+            logger.error("Rollover failed: \(error)")
         }
     }
 }

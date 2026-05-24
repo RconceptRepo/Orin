@@ -1,5 +1,8 @@
 import Foundation
+import OSLog
 import SwiftData
+
+private let retentionLogger = Logger(subsystem: "com.clavrit.orin", category: "MeetingRetention")
 
 /// Enforces meeting retention policy by deleting records older than the chosen window.
 /// Called on app launch and optionally on a schedule.
@@ -38,9 +41,13 @@ final class MeetingRetentionService: Service {
         )
         let expired = try context.fetch(descriptor)
         for meeting in expired {
-            // Remove associated local audio file if present
+            // Remove associated local audio file if present — best-effort, non-blocking
             if let path = meeting.audioFilePath {
-                try? FileManager.default.removeItem(atPath: path)
+                do {
+                    try FileManager.default.removeItem(atPath: path)
+                } catch {
+                    retentionLogger.warning("Could not remove expired audio file at \(path): \(error)")
+                }
             }
             context.delete(meeting)
         }

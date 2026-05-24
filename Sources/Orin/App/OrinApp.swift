@@ -1,3 +1,4 @@
+import OSLog
 import SwiftData
 import SwiftUI
 
@@ -53,7 +54,13 @@ struct OrinApp: App {
             let retentionDays = UserDefaults.standard.integer(forKey: "orin.meetings.retentionDays")
             let policy = MeetingRetentionService.RetentionPolicy.from(rawValue: retentionDays == 0
                 ? MeetingRetentionService.RetentionPolicy.thirtyDays.rawValue : retentionDays)
-            _ = try? retentionService.pruneExpiredMeetings(in: modelContainer.mainContext, policy: policy)
+            do {
+                try retentionService.pruneExpiredMeetings(in: modelContainer.mainContext, policy: policy)
+            } catch {
+                // Non-fatal on launch — log and continue. ErrorManager is not yet usable here.
+                let logger = Logger(subsystem: "com.clavrit.orin", category: "App")
+                logger.error("Failed to prune expired meetings: \(error)")
+            }
         } catch {
             fatalError("Failed to initialize Orin: \(error.localizedDescription)")
         }
