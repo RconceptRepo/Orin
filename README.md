@@ -6,44 +6,83 @@ Orin is a local-first Personal Execution OS for macOS, built with SwiftUI and Sw
 
 The UI contract lives in [DESIGN_SYSTEM.md](DESIGN_SYSTEM.md). Treat it as immutable unless intentionally revised. Shared SwiftUI tokens and components live in `Sources/Orin/Views/Shared/OrinDesignSystem.swift`.
 
-## Current Build Slice
+## Feature Status
 
-This repository contains the full MVP scaffold plus the unified meeting detection engine:
+| Area | Status |
+|---|---|
+| Tasks / Today / Backlog / Reflow | Complete |
+| Task editing (All Tasks view) | Complete |
+| Calendar — EventKit sync + 15-min background refresh | Complete |
+| Meetings — transcript, intelligence, commitments | Complete |
+| Meeting Detection Engine (native apps + browser tabs) | Complete |
+| Live transcription via `SFSpeechRecognizer` | Complete |
+| Vault — biometric unlock, AES-256-GCM, Keychain | Complete |
+| AI — Ollama local + OpenAI / Claude / Gemini fallover | Complete |
+| AI provider keys secured in Keychain | Complete |
+| Login item (`SMAppService`) | Complete |
+| Quick Capture with NL parser | Complete |
+| Daily Executive Brief | Complete |
+| Voice command parser foundation | Complete |
+| App Intents / Siri Shortcuts foundation | Complete |
+| Entitlements file (`Orin.entitlements`) | Complete |
+| `NSAppleEventsUsageDescription` + `NSSpeechRecognitionUsageDescription` | Complete |
+| Automated test suite (62 tests) | Complete |
+| Production Xcode app target + signing + notarization | **Pending** |
 
-- SwiftUI macOS app entry point
-- SwiftData schema for tasks, subtasks, meetings, commitments, and vault items
-- Today, All Tasks, Backlog, Calendar, Meetings, Vault, and Settings navigation
-- Task creation with multi-task pending preview
-- Today filtering for due and overdue active work
-- Completed task section with reactivate/delete actions
-- Manual drag ordering for Today tasks
-- Backlog activation into Today
-- Startup rollover engine
-- Menu bar extra
-- Quick Capture overlay foundation with simple parsing for `today`, `tomorrow`, and `P0`-`P3`
-- Service container and initial services for calendar, vault, recording, rollover, and local AI
-- Calendar screen with EventKit permission/sync status, selected-date meetings, and scheduled tasks
-- Vault screen with local authentication, encrypted item creation, reveal, and delete
-- Settings screen for launch behavior, calendar sync, AI provider choice, and Ollama endpoint
-- Meetings screen with meeting records, participants, transcript import/paste, summary, decisions, commitments, action items, and suggested tasks
-- Meeting intelligence service with Ollama summary support and deterministic local extraction fallback
-- Daily Executive Brief generated from tasks, meetings, commitments, and overdue work
-- Reflow engine with suggested task ordering, focus blocks, breaks, and apply/reject flow
-- AI suggestion cards with accept/decline behavior and day-level hiding
-- Commitment tracking surfaced on Today with fulfill action
-- **Unified Meeting Detection Engine** — see section below
-- Floating recording widget and menu bar start/stop recording state
-- Voice command parser foundation for task, backlog, reflow, and summary commands
-- Ollama verification status in Settings
-- App Intents foundation for Siri Shortcuts: Add Task, Reflow Day, Summarize Today
+## What's Implemented
+
+### Core app
+- SwiftUI macOS app entry point with `@main` in `main.swift` (SPM-importable for tests)
+- SwiftData schema: `TaskItem`, `SubTaskItem`, `MeetingItem`, `CommitmentItem`, `VaultItem`, `AISuggestionItem`, `DailyBriefItem`, `FocusPatternItem`
+- `ServiceContainer` dependency injection
+- `RolloverEngine` — daily startup rollover of overdue tasks and backlog activation
+
+### Tasks
+- Today view: Daily Brief, active tasks with drag ordering, commitments, AI suggestions, reflow planning
+- All Tasks view: full list with **working Edit sheet** (title, description, priority, effort, due date)
+- Backlog view with trigger-date activation
+- Quick Capture overlay: natural-language parser for `today`, `tomorrow`, `P0`–`P3`
+
+### Calendar
+- EventKit integration with full/restricted/denied permission handling
+- Sync status badge: green (synced) / yellow (pending) / red (unavailable)
+- **15-minute background sync timer** wired in `MainContainerView`, respects the Settings toggle
+- `CalendarService.startBackgroundSync()` / `stopBackgroundSync()` — idempotent, `@MainActor`
+
+### Meetings & Recording
+- Meetings view with transcript import, analysis, decisions, action items, suggested tasks
+- `MeetingIntelligenceService` — Ollama summary with deterministic keyword-extraction fallback
+- `RecordingService` — full `AVFoundation` + `SFSpeechRecognizer` pipeline:
+  - Explicit permission request for microphone and speech recognition
+  - On-device recognition preferred (when model is available)
+  - Near-real-time `transcript` property updated from partial results
+  - `errorMessage` surfaced in `RecordingWidgetView` when permission is denied or engine fails
+
+### Meeting Detection Engine
+See detailed section below.
+
+### Vault
+- `VaultService`: Touch ID / Face ID unlock → Keychain master key → AES-256-GCM encrypt/decrypt
+- `VaultView`: create, reveal, delete items; locked-state placeholder
+
+### AI
+- `AIService` with provider routing: Ollama → OpenAI → Claude → Gemini
+- Automatic fallover: external call fails → retries Ollama, surfaces "External AI unavailable. Using Local AI."
+- `AIKeychainService`: save / load / delete API keys under `com.orin.ai-provider-keys` — never stored in `UserDefaults` or SwiftData
+- Settings UI: per-provider `SecureField` + Save/Remove, Keychain presence badge
+
+### Login item
+- `LoginItemService` wraps `SMAppService.mainApp` with graceful error messaging
+- Wired to the "Launch automatically on login" toggle in Settings
+- Fails cleanly in unsigned / non-`/Applications` dev builds with an inline error message
+
+---
 
 ## Unified Meeting Detection Engine
 
-`Sources/Orin/Services/MeetingDetectorService.swift` was fully implemented in this slice. It replaces the previous stub that only checked whether a handful of apps were running.
+`Sources/Orin/Services/MeetingDetectorService.swift` polls every 30 seconds.
 
-### Native App Tracking
-
-The service polls every 30 seconds for these running applications:
+### Native app tracking
 
 | App | Bundle ID |
 |-----|-----------|
@@ -53,16 +92,11 @@ The service polls every 30 seconds for these running applications:
 | Slack | `com.tinyspeck.slackmacgap` |
 | Webex | `com.cisco.webex.meetings` |
 
-Slack is only surfaced when a Huddle or call window is actually on-screen. The check uses `CGWindowListCopyWindowInfo` and matches window titles containing "huddle", "call", or "meeting". It fails silently if Screen Recording permission has not been granted.
+Slack only surfaces when a Huddle or call window is on-screen (`CGWindowListCopyWindowInfo` — silently fails without Screen Recording permission).
 
-### Browser Tab Inspection
+### Browser tab inspection
 
-When no native meeting app is detected, the engine inspects the active tab URL in all running browsers via `NSAppleScript`:
-
-- **Chromium family:** Google Chrome, Microsoft Edge, Arc
-- **Safari**
-
-URLs are matched against these patterns:
+Inspects active tab URLs via `NSAppleScript` in **Chromium** (Chrome, Edge, Arc) and **Safari**. Matched against:
 
 ```
 meet.google.com/
@@ -72,66 +106,80 @@ teams.live.com
 teams.microsoft.com/v2/
 ```
 
-AppleScript calls are dispatched to a dedicated serial `DispatchQueue` via `withCheckedContinuation`, keeping them entirely off the main thread. Errors (browser closed, automation permission denied) are swallowed silently.
+Scripts run on a serial `DispatchQueue` via `withCheckedContinuation`. Permission errors and closed-browser states are swallowed silently.
 
-### Deduplication
+### Deduplication & dismiss behaviour
 
-Each detected meeting is assigned a stable key — `bundleID|active` for native apps, or the trimmed URL path (query string and fragment stripped) for browser meetings. The key is cached in `activeMeetingKey`. Repeated polls of the same ongoing meeting are no-ops; the "Meeting Detected" overlay and `onMeetingDetected` callback only fire when a genuinely new session is discovered.
+- **`activeMeetingKey`** — stable per-session key (`bundleID|active` or trimmed URL path). Repeated polls of the same session are no-ops.
+- **`dismissedMeetingKey`** — set when the user dismisses the overlay. The same ongoing session will not re-prompt even if still detected. Cleared only when the meeting fully ends (detection returns `nil`).
+- Meeting end resets both keys and `shouldShowRecordingPrompt`, so a new instance of the same meeting will re-prompt correctly.
 
-Calling `dismissPrompt()` clears the key, so if the same meeting is still in progress after a user dismissal, it will not re-prompt until the next new session begins.
+### Meeting Detected overlay
 
-### Meeting Detected Overlay
-
-When a new session is found, `shouldShowRecordingPrompt` is set to `true` on the main thread and the overlay in `MainContainerView` surfaces automatically:
-
+Surfaces in `MainContainerView` when a new session is found:
 - **Title:** Meeting Detected
 - **Notice:** Ensure all participants are aware of recording.
-- **Primary action:** Start Listening — hooks into `RecordingService`
-- **Secondary action:** Dismiss
+- **Start Listening** — calls `RecordingService.startRecording()`
+- **Dismiss** — sets `dismissedMeetingKey`, hides overlay without ending detection
 
-### Thread Safety
+### Thread safety
 
-All detection logic runs inside a `Task.detached(priority: .utility)` block. UI state (`detectedMeetingApp`, `shouldShowRecordingPrompt`, `activeMeetingKey`) is only ever mutated via `DispatchQueue.main.async`, preventing races with SwiftUI observation.
+All detection runs in `Task.detached(priority: .utility)`. UI state is only mutated from `@MainActor`-annotated functions. `startMonitoring`, `stopMonitoring`, and `dismissPrompt` are all `@MainActor`.
 
-## Native Integration Notes
+---
 
-Some platform-heavy features still need production entitlements, packaging, or engine integration before release:
+## Automated Tests
 
-- Real microphone/system-audio capture and Whisper transcription
-- Login item registration
-- `com.apple.security.automation.apple-events` entitlement and `NSAppleEventsUsageDescription` in Info.plist for production AppleScript automation
-- External provider API calls and secure keychain-backed provider key storage
-- Notarized app signing and release DMG polishing
+```
+swift test
+```
+
+| Suite | Tests | Coverage |
+|---|---|---|
+| `MeetingDetectorServiceTests` | 16 | Deduplication, dismiss, meeting-end reset, stop-monitoring, URL stable-key, pattern matching |
+| `QuickCaptureParserTests` | 17 | Title, priority P0–P3, today/tomorrow, combined tokens, any order, case, whitespace, edge cases |
+| `AIKeychainServiceTests` | 9 | Save, load, overwrite, delete, cross-account isolation, empty-string rejection |
+| `RolloverEngineTests` | 9 | First-launch guard, same-day idempotency, overdue rollover, future/nil date, backlog, completed exclusion |
+| `CalendarServiceTests` | 11 | Background sync start/stop/idempotency/restart, 900 s interval, initial state, auth refresh |
+| **Total** | **62** | 0 failures |
+
+All tests use in-memory SwiftData containers or real-Keychain with UUID-scoped accounts (cleaned up in `tearDown`). No mocks, no network calls.
+
+---
+
+## Production Packaging (still pending)
+
+To ship a signed, notarized release:
+
+1. Create a macOS app target in Xcode pointing at `Sources/Orin`.
+2. Attach `Orin.entitlements` (already in the repo root) to the target.
+3. Verify the `Info.plist` usage descriptions match what the entitlements request.
+4. Configure a Developer ID certificate and run `notarytool`.
+5. Validate on a clean machine: Apple Events prompt, mic permission, Keychain, Calendar, login item.
+
+---
 
 ## Requirements
 
-- macOS 14 or newer
-- Full Xcode with SwiftData macro support
-
-The Command Line Tools-only environment does not include `SwiftDataMacros`, so `swift build` can fail with:
-
-```text
-plugin for module 'SwiftDataMacros' not found
-```
-
-Open the package in full Xcode, or select a full Xcode toolchain before building.
+- macOS 14 (Sonoma) or later
+- Full Xcode toolchain (SwiftData macros require Xcode — Command Line Tools alone will fail)
 
 ## Build
-
-```bash
-swift build
-```
-
-If the Command Line Tools path cannot resolve SwiftData macros, build through the full Xcode developer directory:
 
 ```bash
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build --jobs 1
 ```
 
+## Test
+
+```bash
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --jobs 1
+```
+
 ## Run
 
 ```bash
-swift run Orin
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift run Orin
 ```
 
-For production packaging, create a native macOS app target in Xcode and include the files under `Sources/Orin`.
+For a release build, create a native macOS app target in Xcode and include `Sources/Orin`.

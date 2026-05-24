@@ -2,10 +2,12 @@ import SwiftUI
 
 struct MainContainerView: View {
     @AppStorage("orin.theme.mode") private var themeModeRawValue = OrinThemeMode.system.rawValue
+    @AppStorage("orin.calendar.backgroundSync") private var calendarBackgroundSync = true
     @Environment(\.colorScheme) private var colorScheme
     @State private var selectedModule: SidebarModule = .today
     @State private var recordingService = ServiceContainer.shared.resolve(RecordingService.self)
     @State private var meetingDetector = ServiceContainer.shared.resolve(MeetingDetectorService.self)
+    @State private var calendarService = ServiceContainer.shared.resolve(CalendarService.self)
 
     enum SidebarModule: Hashable, CaseIterable {
         case today
@@ -82,6 +84,17 @@ struct MainContainerView: View {
         .preferredColorScheme(OrinThemeMode(rawValue: themeModeRawValue)?.colorScheme)
         .onAppear {
             meetingDetector.startMonitoring()
+            calendarService.refreshAuthorizationStatus()
+            if calendarBackgroundSync {
+                calendarService.startBackgroundSync()
+            }
+        }
+        .onChange(of: calendarBackgroundSync) { _, enabled in
+            if enabled {
+                calendarService.startBackgroundSync()
+            } else {
+                calendarService.stopBackgroundSync()
+            }
         }
     }
 

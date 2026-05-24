@@ -10,6 +10,8 @@ struct AllTasksView: View {
     )
     private var tasks: [TaskItem]
 
+    @State private var taskToEdit: TaskItem?
+
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("All Tasks")
@@ -21,7 +23,7 @@ struct AllTasksView: View {
                         .contextMenu {
                             if task.status == .active {
                                 Button("Complete") { complete(task) }
-                                Button("Edit") {}
+                                Button("Edit") { taskToEdit = task }
                                 Button("Break Into Subtasks") { addDefaultSubtasks(to: task) }
                             } else {
                                 Button("Reactivate") { reactivate(task) }
@@ -32,6 +34,12 @@ struct AllTasksView: View {
             }
         }
         .padding()
+        .sheet(item: $taskToEdit) { task in
+            TaskEditSheet(task: task) {
+                try? modelContext.save()
+                taskToEdit = nil
+            }
+        }
     }
 
     private func complete(_ task: TaskItem) {
@@ -59,5 +67,79 @@ struct AllTasksView: View {
             SubTaskItem(title: "Review and send")
         ]
         try? modelContext.save()
+    }
+}
+
+// MARK: - Edit sheet
+
+private struct TaskEditSheet: View {
+    @Bindable var task: TaskItem
+    var onSave: () -> Void
+
+    @State private var title: String = ""
+    @State private var description: String = ""
+    @State private var priority: TaskPriority = .p3Low
+    @State private var effortMinutes: Int = 0
+    @State private var hasDueDate: Bool = false
+    @State private var dueDate: Date = Date()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Edit Task")
+                .font(.title2.weight(.semibold))
+
+            Form {
+                TextField("Task title", text: $title)
+                TextField("Description", text: $description, axis: .vertical)
+                    .lineLimit(2...4)
+
+                Picker("Priority", selection: $priority) {
+                    ForEach(TaskPriority.allCases) { p in
+                        Text(p.displayName).tag(p)
+                    }
+                }
+
+                Stepper("Effort: \(effortMinutes)m", value: $effortMinutes, in: 0...480, step: 15)
+
+                Toggle("Due date", isOn: $hasDueDate)
+                if hasDueDate {
+                    DatePicker("Date", selection: $dueDate, displayedComponents: .date)
+                }
+            }
+            .formStyle(.grouped)
+
+            HStack {
+                Spacer()
+                Button("Cancel") { onSave() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Save") {
+                    commit()
+                    onSave()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(22)
+        .frame(width: 520)
+        .frame(minHeight: 420)
+        .onAppear { populate() }
+    }
+
+    private func populate() {
+        title          = task.title
+        description    = task.taskDescription
+        priority       = task.priority
+        effortMinutes  = task.effortEstimateMinutes
+        hasDueDate     = task.dueDate != nil
+        dueDate        = task.dueDate ?? Date()
+    }
+
+    private func commit() {
+        task.title                  = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        task.taskDescription        = description
+        task.priority               = priority
+        task.effortEstimateMinutes  = effortMinutes
+        task.dueDate                = hasDueDate ? dueDate : nil
     }
 }
