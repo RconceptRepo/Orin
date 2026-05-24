@@ -20,17 +20,20 @@ struct TodayView: View {
 
     @State private var isAddingTask = false
     @State private var isShowingReflow = false
+    @State private var isReflowing = false
     @State private var reflowPlan: ReflowPlan?
+    @State private var reflowOrderedTitles: [String] = []
+    @State private var reflowFeedback: ReflowFeedback?
     @State private var dailyBrief: DailyBriefItem?
     @State private var taskToEdit: TaskItem?
 
     private let reflowEngine = ServiceContainer.shared.resolve(ReflowEngine.self)
     private let dailyBriefService = ServiceContainer.shared.resolve(DailyBriefService.self)
 
+    // All active non-backlog tasks, ordered by dragOrderIndex (from @Query sort).
+    // The @Query filter already excludes isBacklog tasks; we only need to drop completed ones.
     private var activeTodayTasks: [TaskItem] {
-        tasks.filter { task in
-            task.status == .active && task.dueDate.map { Calendar.current.isDateInToday($0) || $0 < Calendar.current.startOfDay(for: Date()) } == true
-        }
+        tasks.filter { $0.status == .active }
     }
 
     private var completedTasks: [TaskItem] {
@@ -55,9 +58,19 @@ struct TodayView: View {
                     Button {
                         prepareReflow()
                     } label: {
-                        Label("Reflow", systemImage: "arrow.triangle.2.circlepath")
+                        if isReflowing {
+                            HStack(spacing: 6) {
+                                ProgressView().scaleEffect(0.65)
+                                Text("Reflowing…")
+                            }
+                            .frame(height: 36)
+                            .padding(.horizontal, 14)
+                        } else {
+                            Label("Reflow", systemImage: "arrow.triangle.2.circlepath")
+                        }
                     }
                     .buttonStyle(OrinSecondaryButtonStyle())
+                    .disabled(isReflowing)
 
                     Button {
                         isAddingTask = true
@@ -66,6 +79,11 @@ struct TodayView: View {
                     }
                     .buttonStyle(OrinPrimaryButtonStyle())
                 }
+            }
+
+            if let feedback = reflowFeedback {
+                reflowBanner(feedback)
+                    .transition(.move(edge: .top).combined(with: .opacity))
             }
 
             ScrollView {
@@ -106,7 +124,7 @@ struct TodayView: View {
             }
         }
         .sheet(isPresented: $isShowingReflow) {
-            ReflowPlanView(plan: reflowPlan, onApply: applyReflow)
+            ReflowPlanView(plan: reflowPlan, orderedTitles: reflowOrderedTitles, onApply: applyReflow)
         }
         .sheet(item: $taskToEdit) { task in
             TodayTaskEditSheet(task: task) {
@@ -230,15 +248,67 @@ struct TodayView: View {
     }
 
     private func prepareReflow() {
-        reflowPlan = reflowEngine.generatePlan(tasks: tasks, meetings: meetings, focusPattern: focusPatterns.first)
+        let activeTasks = tasks.filter { $0.status == .active }
+        guard !activeTasks.isEmpty else {
+            showFeedback(.noTasks)
+            return
+        }
+        isReflowing = true
+        let plan = reflowEngine.generatePlan(tasks: tasks, meetings: meetings, focusPattern: focusPatterns.first)
+        reflowOrderedTitles = plan.orderedTaskIDs.compactMap { id in tasks.first { $0.id == id }?.title }
+        reflowPlan = plan
+        isReflowing = false
         isShowingReflow = true
     }
 
     private func applyReflow() {
         guard let reflowPlan else { return }
         reflowEngine.apply(reflowPlan, to: tasks)
-        try? modelContext.save()
+        do {
+            try modelContext.save()
+            showFeedback(.applied(count: reflowPlan.orderedTaskIDs.count))
+        } catch {
+            showFeedback(.saveFailed(error.localizedDescription))
+        }
         isShowingReflow = false
+    }
+
+    private func showFeedback(_ feedback: ReflowFeedback) {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            reflowFeedback = feedback
+        }
+        Task {
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            withAnimation(.easeInOut(duration: 0.3)) { reflowFeedback = nil }
+        }
+    }
+
+    @ViewBuilder
+    private func reflowBanner(_ feedback: ReflowFeedback) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: feedback.isError ? "exclamationmark.circle.fill" : "checkmark.circle.fill")
+                .foregroundStyle(feedback.isError ? OrinColor.error : OrinColor.success)
+            Text(feedback.message)
+                .font(OrinFont.body)
+                .foregroundStyle(OrinColor.primaryText(colorScheme))
+            Spacer()
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) { reflowFeedback = nil }
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background((feedback.isError ? OrinColor.error : OrinColor.success).opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: OrinRadius.button, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: OrinRadius.button, style: .continuous)
+                .stroke((feedback.isError ? OrinColor.error : OrinColor.success).opacity(0.3), lineWidth: 1)
+        }
     }
 
     private func seedSuggestionIfNeeded() {
@@ -291,6 +361,29 @@ struct TodayView: View {
             SubTaskItem(title: "Review and send")
         ]
         try? modelContext.save()
+    }
+}
+
+// MARK: - Reflow feedback
+
+private enum ReflowFeedback: Equatable {
+    case applied(count: Int)
+    case noTasks
+    case saveFailed(String)
+
+    var message: String {
+        switch self {
+        case .applied(let n): return "Reflow applied — \(n) task\(n == 1 ? "" : "s") reordered."
+        case .noTasks:        return "No active tasks to reflow."
+        case .saveFailed(let e): return "Failed to save reflow: \(e)"
+        }
+    }
+
+    var isError: Bool {
+        switch self {
+        case .applied:    return false
+        case .noTasks, .saveFailed: return true
+        }
     }
 }
 
@@ -453,6 +546,7 @@ private struct AISuggestionsCard: View {
 
 private struct ReflowPlanView: View {
     let plan: ReflowPlan?
+    let orderedTitles: [String]
     var onApply: () -> Void
     @Environment(\.dismiss) private var dismiss
 
@@ -460,19 +554,51 @@ private struct ReflowPlanView: View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Reflow Day")
                 .font(OrinFont.pageTitle)
+
             if let plan {
                 Text(plan.rationale)
                     .font(OrinFont.body)
                     .foregroundStyle(.secondary)
+
+                // New task order
                 OrinCard {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Suggested Focus Blocks")
-                            .font(OrinFont.cardTitle)
-                        ForEach(plan.focusBlocks, id: \.self) { block in
-                            Label(block, systemImage: "calendar.badge.clock")
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            Text("New Task Order")
+                                .font(OrinFont.cardTitle)
+                            Spacer()
+                            Text("\(orderedTitles.count) task\(orderedTitles.count == 1 ? "" : "s")")
+                                .font(OrinFont.caption)
+                                .foregroundStyle(.secondary)
                         }
-                        ForEach(plan.breaks, id: \.self) { breakText in
-                            Label(breakText, systemImage: "cup.and.saucer")
+                        ForEach(Array(orderedTitles.enumerated()), id: \.offset) { index, title in
+                            HStack(spacing: 10) {
+                                Text("\(index + 1)")
+                                    .font(OrinFont.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 18, alignment: .trailing)
+                                Text(title)
+                                    .font(OrinFont.body)
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+                }
+
+                // Focus blocks
+                if !plan.focusBlocks.isEmpty {
+                    OrinCard {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Suggested Focus Blocks")
+                                .font(OrinFont.cardTitle)
+                            ForEach(plan.focusBlocks, id: \.self) { block in
+                                Label(block, systemImage: "calendar.badge.clock")
+                                    .font(OrinFont.body)
+                            }
+                            ForEach(plan.breaks, id: \.self) { breakText in
+                                Label(breakText, systemImage: "cup.and.saucer")
+                                    .font(OrinFont.body)
+                            }
                         }
                     }
                 }
@@ -480,16 +606,18 @@ private struct ReflowPlanView: View {
                 Text("No tasks to reflow.")
                     .foregroundStyle(.secondary)
             }
+
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }
                     .buttonStyle(OrinSecondaryButtonStyle())
-                Button("Apply", action: onApply)
+                Button("Apply \(orderedTitles.count) Task\(orderedTitles.count == 1 ? "" : "s")", action: onApply)
                     .buttonStyle(OrinPrimaryButtonStyle())
-                    .disabled(plan == nil)
+                    .disabled(plan == nil || orderedTitles.isEmpty)
             }
         }
         .padding(24)
         .frame(width: 560)
+        .frame(minHeight: 380)
     }
 }
