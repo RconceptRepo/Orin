@@ -7,6 +7,24 @@ enum AIProvider: String {
     case gemini
 }
 
+enum ProviderConnectionStatus: Equatable {
+    case unknown
+    case testing
+    case connected
+    case failed(reason: String)
+    case notConfigured
+
+    var displayLabel: String {
+        switch self {
+        case .unknown:        "Not tested"
+        case .testing:        "Testing..."
+        case .connected:      "Connected"
+        case .failed:         "Failed"
+        case .notConfigured:  "Not configured"
+        }
+    }
+}
+
 struct AIConfiguration {
     var primaryProvider: AIProvider
     var localOllamaEndpoint = "http://localhost:11434"
@@ -15,7 +33,6 @@ struct AIConfiguration {
 final class AIService: Service {
     private var config: AIConfiguration
 
-    // Keychain account identifiers for external provider keys
     static let openAIAccount    = "openai"
     static let anthropicAccount = "anthropic"
     static let geminiAccount    = "gemini"
@@ -24,61 +41,81 @@ final class AIService: Service {
         self.config = config
     }
 
-    func updateOllamaEndpoint(_ endpoint: String) {
-        config.localOllamaEndpoint = endpoint
+    // MARK: - Provider selection (testable pure function)
+
+    /// Returns the first available provider given the current availability state.
+    /// Priority: Ollama → OpenAI → Claude → Gemini.
+    func selectProvider(
+        ollamaAvailable: Bool,
+        openAIKey: String?,
+        anthropicKey: String?,
+        geminiKey: String?
+    ) -> AIProvider? {
+        if ollamaAvailable        { return .ollama }
+        if openAIKey != nil       { return .openAI }
+        if anthropicKey != nil    { return .anthropic }
+        if geminiKey != nil       { return .gemini }
+        return nil
     }
 
-    // MARK: - Summary generation with fallover
+    // MARK: - Summary generation with priority-ordered fallback chain
 
-    /// Returns (summaryText, fallbackWasUsed).
-    /// Reads the current provider and endpoint from UserDefaults at call time so Settings
-    /// changes take effect immediately without restarting the service.
+    /// Tries providers in fixed priority order: Ollama → OpenAI → Claude → Gemini.
+    /// Returns (text, fallbackUsed: true) when all providers fail so callers can
+    /// substitute local text extraction.
     func generateSummary(for transcript: String) async -> (text: String, fallbackUsed: Bool) {
-        let providerRaw = UserDefaults.standard.string(forKey: "orin.ai.provider") ?? config.primaryProvider.rawValue
-        let provider = AIProvider(rawValue: providerRaw) ?? config.primaryProvider
-        if let endpoint = UserDefaults.standard.string(forKey: "orin.ai.ollamaEndpoint"), !endpoint.isEmpty {
-            config.localOllamaEndpoint = endpoint
+        let endpoint = resolvedOllamaEndpoint()
+
+        // Priority 1: Ollama (local, always preferred)
+        if await isOllamaAvailable(endpoint: endpoint) {
+            if let result = await generateOllamaSummary(transcript: transcript) {
+                return (result, false)
+            }
         }
 
-        switch provider {
-        case .ollama:
-            let result = await generateOllamaSummary(transcript: transcript)
-            return (result ?? "Ollama is unavailable. Verify it is running at \(config.localOllamaEndpoint).", false)
-
-        case .openAI:
-            if let key = AIKeychainService.load(account: Self.openAIAccount),
-               let result = await generateOpenAISummary(transcript: transcript, key: key) {
-                return (result, false)
-            }
-            return await ollamaFallback(transcript: transcript, from: "OpenAI")
-
-        case .anthropic:
-            if let key = AIKeychainService.load(account: Self.anthropicAccount),
-               let result = await generateAnthropicSummary(transcript: transcript, key: key) {
-                return (result, false)
-            }
-            return await ollamaFallback(transcript: transcript, from: "Claude")
-
-        case .gemini:
-            if let key = AIKeychainService.load(account: Self.geminiAccount),
-               let result = await generateGeminiSummary(transcript: transcript, key: key) {
-                return (result, false)
-            }
-            return await ollamaFallback(transcript: transcript, from: "Gemini")
+        // Priority 2: OpenAI
+        if let key = AIKeychainService.load(account: Self.openAIAccount),
+           let result = await generateOpenAISummary(transcript: transcript, key: key) {
+            return (result, false)
         }
+
+        // Priority 3: Claude (Anthropic)
+        if let key = AIKeychainService.load(account: Self.anthropicAccount),
+           let result = await generateAnthropicSummary(transcript: transcript, key: key) {
+            return (result, false)
+        }
+
+        // Priority 4: Gemini
+        if let key = AIKeychainService.load(account: Self.geminiAccount),
+           let result = await generateGeminiSummary(transcript: transcript, key: key) {
+            return (result, false)
+        }
+
+        return (
+            "No AI provider available. Start Ollama locally or add an API key in Settings → AI.",
+            true
+        )
     }
 
-    private func ollamaFallback(transcript: String, from provider: String) async -> (text: String, fallbackUsed: Bool) {
-        if let local = await generateOllamaSummary(transcript: transcript) {
-            return ("External AI (\(provider)) unavailable. Using Local AI.\n\n\(local)", true)
+    // MARK: - Ollama availability check
+
+    func isOllamaAvailable(endpoint: String) async -> Bool {
+        guard let url = URL(string: "\(endpoint)/api/tags") else { return false }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 3
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            return (response as? HTTPURLResponse)?.statusCode == 200
+        } catch {
+            return false
         }
-        return ("External AI (\(provider)) unavailable. Local AI also failed. Verify Ollama is running at \(config.localOllamaEndpoint).", true)
     }
 
     // MARK: - Ollama (local)
 
     private func generateOllamaSummary(transcript: String) async -> String? {
-        guard let url = URL(string: "\(config.localOllamaEndpoint)/api/generate") else { return nil }
+        let endpoint = resolvedOllamaEndpoint()
+        guard let url = URL(string: "\(endpoint)/api/generate") else { return nil }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -89,7 +126,6 @@ final class AIService: Service {
             "prompt": summaryPrompt(for: transcript),
             "stream": false
         ]
-
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: payload)
             let (data, response) = try await URLSession.shared.data(for: request)
@@ -116,7 +152,6 @@ final class AIService: Service {
             "messages": [["role": "user", "content": summaryPrompt(for: transcript)]],
             "max_tokens": 512
         ]
-
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
             let (data, response) = try await URLSession.shared.data(for: request)
@@ -146,7 +181,6 @@ final class AIService: Service {
             "max_tokens": 512,
             "messages": [["role": "user", "content": summaryPrompt(for: transcript)]]
         ]
-
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
             let (data, response) = try await URLSession.shared.data(for: request)
@@ -172,7 +206,6 @@ final class AIService: Service {
         let body: [String: Any] = [
             "contents": [["parts": [["text": summaryPrompt(for: transcript)]]]]
         ]
-
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
             let (data, response) = try await URLSession.shared.data(for: request)
@@ -187,9 +220,14 @@ final class AIService: Service {
         }
     }
 
-    // MARK: - Shared prompt
+    // MARK: - Helpers
 
     private func summaryPrompt(for transcript: String) -> String {
         "Summarize this meeting transcript accurately. Focus on decisions made, commitments given, and next actions required:\n\n\(transcript)"
+    }
+
+    private func resolvedOllamaEndpoint() -> String {
+        let stored = UserDefaults.standard.string(forKey: "orin.ai.ollamaEndpoint") ?? ""
+        return stored.isEmpty ? config.localOllamaEndpoint : stored
     }
 }

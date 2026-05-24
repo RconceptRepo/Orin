@@ -35,6 +35,7 @@ struct OrinApp: App {
             services.register(DailyBriefService(), for: DailyBriefService.self)
             services.register(VoiceCommandService(), for: VoiceCommandService.self)
             services.register(OllamaInstallerService(), for: OllamaInstallerService.self)
+            services.register(AIProviderTestService(), for: AIProviderTestService.self)
             services.register(MeetingDetectorService(), for: MeetingDetectorService.self)
             services.register(LoginItemService(), for: LoginItemService.self)
             services.register(WhisperTranscriptionService(), for: WhisperTranscriptionService.self)

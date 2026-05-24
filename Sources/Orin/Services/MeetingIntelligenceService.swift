@@ -22,7 +22,7 @@ final class MeetingIntelligenceService: Service {
         }
 
         let summaryResult = await aiService.generateSummary(for: trimmedTranscript)
-        let summary = summaryResult.text.hasPrefix("Failed to run local summary") ? fallbackSummary(for: trimmedTranscript) : summaryResult.text
+        let summary = summaryResult.fallbackUsed ? fallbackSummary(for: trimmedTranscript) : summaryResult.text
         let decisions = extractLines(from: trimmedTranscript, matching: ["decided", "decision", "agreed", "approved"])
         let commitments = extractLines(from: trimmedTranscript, matching: ["i will", "i'll", "we will", "follow up", "send", "prepare"])
         let actionItems = extractLines(from: trimmedTranscript, matching: ["action", "todo", "to do", "next step", "follow up", "owner"])

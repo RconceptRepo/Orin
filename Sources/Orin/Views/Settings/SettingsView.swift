@@ -7,15 +7,15 @@ struct SettingsView: View {
     @AppStorage("orin.calendar.backgroundSync") private var calendarBackgroundSync = true
     @AppStorage("orin.meetings.retentionDays") private var retentionDays = MeetingRetentionService.RetentionPolicy.thirtyDays.rawValue
 
-    @State private var ollamaService     = ServiceContainer.shared.resolve(OllamaInstallerService.self)
-    @State private var loginItemService  = ServiceContainer.shared.resolve(LoginItemService.self)
+    @State private var aiTester        = ServiceContainer.shared.resolve(AIProviderTestService.self)
+    @State private var loginItemService = ServiceContainer.shared.resolve(LoginItemService.self)
 
-    // External key drafts — held only long enough to be saved to Keychain, never persisted
+    // Key drafts — held only long enough to be saved to Keychain, never persisted elsewhere
     @State private var openAIKeyDraft    = ""
     @State private var anthropicKeyDraft = ""
     @State private var geminiKeyDraft    = ""
 
-    // Keychain presence flags, refreshed in onAppear and after save/delete
+    // Keychain presence flags — refreshed on appear and after save/delete
     @State private var openAIConfigured    = AIKeychainService.hasKey(for: AIService.openAIAccount)
     @State private var anthropicConfigured = AIKeychainService.hasKey(for: AIService.anthropicAccount)
     @State private var geminiConfigured    = AIKeychainService.hasKey(for: AIService.geminiAccount)
@@ -49,52 +49,72 @@ struct SettingsView: View {
 
             // MARK: AI
             Section("AI") {
-                Picker("Primary Provider", selection: $providerRaw) {
+                Picker("Provider Priority", selection: $providerRaw) {
                     Text("Ollama Local").tag(AIProvider.ollama.rawValue)
                     Text("OpenAI").tag(AIProvider.openAI.rawValue)
                     Text("Claude").tag(AIProvider.anthropic.rawValue)
                     Text("Gemini").tag(AIProvider.gemini.rawValue)
                 }
-
-                TextField("Ollama Endpoint", text: $ollamaEndpoint)
-                LabeledContent("Ollama") {
-                    HStack {
-                        Text(ollamaService.status.rawValue)
-                            .foregroundStyle(ollamaStatusColor)
-                        Button("Verify") {
-                            Task { await ollamaService.verify(endpoint: ollamaEndpoint) }
-                        }
-                    }
-                }
-                Text(ollamaService.message)
+                Text("Inference cascades automatically: Ollama → OpenAI → Claude → Gemini.")
                     .font(OrinFont.caption)
                     .foregroundStyle(.secondary)
 
+                // ── Ollama ──────────────────────────────────────────────────
+                TextField("Ollama Endpoint", text: $ollamaEndpoint)
+                LabeledContent("Ollama") { connectionStatusView(aiTester.ollamaStatus) }
+                if case .failed(let reason) = aiTester.ollamaStatus {
+                    Text(reason)
+                        .font(OrinFont.caption)
+                        .foregroundStyle(OrinColor.error)
+                }
+                Button("Test Connection") {
+                    Task { await aiTester.testOllama(endpoint: ollamaEndpoint) }
+                }
+                .disabled(aiTester.ollamaStatus == .testing)
+
+                // ── OpenAI ──────────────────────────────────────────────────
                 providerRow(
                     label: "OpenAI",
                     isConfigured: openAIConfigured,
                     draft: $openAIKeyDraft,
-                    placeholder: "OpenAI API Key",
+                    placeholder: "sk-...",
                     account: AIService.openAIAccount,
-                    configured: $openAIConfigured
+                    configured: $openAIConfigured,
+                    status: aiTester.openAIStatus,
+                    onTest: {
+                        let draft = openAIKeyDraft
+                        Task { await aiTester.testOpenAI(key: draft.isEmpty ? nil : draft) }
+                    }
                 )
 
+                // ── Claude ──────────────────────────────────────────────────
                 providerRow(
                     label: "Claude",
                     isConfigured: anthropicConfigured,
                     draft: $anthropicKeyDraft,
-                    placeholder: "Anthropic API Key",
+                    placeholder: "sk-ant-...",
                     account: AIService.anthropicAccount,
-                    configured: $anthropicConfigured
+                    configured: $anthropicConfigured,
+                    status: aiTester.anthropicStatus,
+                    onTest: {
+                        let draft = anthropicKeyDraft
+                        Task { await aiTester.testAnthropic(key: draft.isEmpty ? nil : draft) }
+                    }
                 )
 
+                // ── Gemini ──────────────────────────────────────────────────
                 providerRow(
                     label: "Gemini",
                     isConfigured: geminiConfigured,
                     draft: $geminiKeyDraft,
-                    placeholder: "Gemini API Key",
+                    placeholder: "AI...",
                     account: AIService.geminiAccount,
-                    configured: $geminiConfigured
+                    configured: $geminiConfigured,
+                    status: aiTester.geminiStatus,
+                    onTest: {
+                        let draft = geminiKeyDraft
+                        Task { await aiTester.testGemini(key: draft.isEmpty ? nil : draft) }
+                    }
                 )
             }
 
@@ -134,7 +154,7 @@ struct SettingsView: View {
                 LabeledContent("Transcription", value: "On-device via SFSpeechRecognizer")
             }
 
-            // MARK: Reset onboarding
+            // MARK: Troubleshooting
             Section("Troubleshooting") {
                 Button("Re-run Setup Wizard") {
                     UserDefaults.standard.removeObject(forKey: "orin.hasCompletedOnboarding")
@@ -156,7 +176,32 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - Helpers
+    // MARK: - Shared status indicator
+
+    @ViewBuilder
+    private func connectionStatusView(_ status: ProviderConnectionStatus) -> some View {
+        switch status {
+        case .unknown:
+            Label("Not tested", systemImage: "circle")
+                .foregroundStyle(.secondary)
+        case .testing:
+            HStack(spacing: 6) {
+                ProgressView().scaleEffect(0.7)
+                Text("Testing...").foregroundStyle(.secondary)
+            }
+        case .connected:
+            Label("Connected", systemImage: "checkmark.circle.fill")
+                .foregroundStyle(OrinColor.success)
+        case .failed:
+            Label("Failed", systemImage: "xmark.circle.fill")
+                .foregroundStyle(OrinColor.error)
+        case .notConfigured:
+            Label("Not configured", systemImage: "minus.circle")
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - External provider row (key entry + test + save + remove)
 
     @ViewBuilder
     private func providerRow(
@@ -165,12 +210,25 @@ struct SettingsView: View {
         draft: Binding<String>,
         placeholder: String,
         account: String,
-        configured: Binding<Bool>
+        configured: Binding<Bool>,
+        status: ProviderConnectionStatus,
+        onTest: @escaping () -> Void
     ) -> some View {
-        LabeledContent(label) { providerStatus(isConfigured) }
+        LabeledContent(label) { connectionStatusView(status) }
+
+        if case .failed(let reason) = status {
+            Text(reason)
+                .font(OrinFont.caption)
+                .foregroundStyle(OrinColor.error)
+        }
+
         SecureField(placeholder, text: draft)
+
         HStack {
-            Button("Save \(label) Key") {
+            Button("Test") { onTest() }
+                .disabled(status == .testing)
+
+            Button("Save") {
                 guard !draft.wrappedValue.isEmpty else { return }
                 AIKeychainService.save(draft.wrappedValue, account: account)
                 configured.wrappedValue = true
@@ -184,23 +242,6 @@ struct SettingsView: View {
                     configured.wrappedValue = false
                 }
             }
-        }
-    }
-
-    private func providerStatus(_ configured: Bool) -> some View {
-        Label(
-            configured ? "Configured" : "Not configured",
-            systemImage: configured ? "checkmark.circle.fill" : "circle"
-        )
-        .foregroundStyle(configured ? Color.green : .secondary)
-    }
-
-    private var ollamaStatusColor: Color {
-        switch ollamaService.status {
-        case .connected: OrinColor.success
-        case .missing:   OrinColor.warning
-        case .failed:    OrinColor.error
-        case .unknown:   .secondary
         }
     }
 }
