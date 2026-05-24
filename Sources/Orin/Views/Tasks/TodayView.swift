@@ -165,7 +165,7 @@ struct TodayView: View {
                                 onToggleComplete: { complete(task) },
                                 onEdit: { taskToEdit = task },
                                 onDelete: { delete(task) },
-                                onBreakIntoSubtasks: { addDefaultSubtasks(to: task) }
+                                onBreakIntoSubtasks: { taskToEdit = task }
                             )
                             .listRowSeparator(.hidden)
                             .listRowBackground(Color.clear)
@@ -353,15 +353,6 @@ struct TodayView: View {
         try? modelContext.save()
     }
 
-    private func addDefaultSubtasks(to task: TaskItem) {
-        guard task.subtasks.isEmpty else { return }
-        task.subtasks = [
-            SubTaskItem(title: "Clarify outcome"),
-            SubTaskItem(title: "Do first pass"),
-            SubTaskItem(title: "Review and send")
-        ]
-        try? modelContext.save()
-    }
 }
 
 // MARK: - Reflow feedback
@@ -388,10 +379,13 @@ private enum ReflowFeedback: Equatable {
 }
 
 // MARK: - Edit sheet
+// List-based so ForEach.onMove gives drag-to-reorder for subtasks
+// without nesting two scroll views.
 
 private struct TodayTaskEditSheet: View {
     @Bindable var task: TaskItem
     var onSave: () -> Void
+    @Environment(\.modelContext) private var modelContext
 
     @State private var title: String = ""
     @State private var description: String = ""
@@ -399,48 +393,121 @@ private struct TodayTaskEditSheet: View {
     @State private var effortMinutes: Int = 0
     @State private var hasDueDate: Bool = false
     @State private var dueDate: Date = Date()
+    @State private var newSubtaskTitle = ""
+    @FocusState private var isAddSubtaskFocused: Bool
+
+    private var sortedSubtasks: [SubTaskItem] {
+        task.subtasks.sorted { $0.sortIndex < $1.sortIndex }
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
+        VStack(alignment: .leading, spacing: 0) {
             Text("Edit Task")
                 .font(.title2.weight(.semibold))
+                .padding(.bottom, 16)
 
-            Form {
-                TextField("Task title", text: $title)
-                TextField("Description", text: $description, axis: .vertical)
-                    .lineLimit(2...4)
-
-                Picker("Priority", selection: $priority) {
-                    ForEach(TaskPriority.allCases) { p in
-                        Text(p.displayName).tag(p)
+            List {
+                Section("Task") {
+                    TextField("Title", text: $title)
+                        .accessibilityLabel("Task title")
+                    TextField("Description", text: $description, axis: .vertical)
+                        .lineLimit(2...4)
+                    Picker("Priority", selection: $priority) {
+                        ForEach(TaskPriority.allCases) { p in
+                            Text(p.displayName).tag(p)
+                        }
+                    }
+                    Stepper("Effort: \(effortMinutes)m", value: $effortMinutes, in: 0...480, step: 15)
+                    Toggle("Due date", isOn: $hasDueDate)
+                    if hasDueDate {
+                        DatePicker("Date", selection: $dueDate, displayedComponents: .date)
                     }
                 }
 
-                Stepper("Effort: \(effortMinutes)m", value: $effortMinutes, in: 0...480, step: 15)
+                Section {
+                    ForEach(sortedSubtasks) { subtask in
+                        SubtaskEditRow(
+                            subtask: subtask,
+                            onDelete: { deleteSubtask(subtask) },
+                            onChange: { saveSubtasks() }
+                        )
+                        .listRowInsets(EdgeInsets(top: 2, leading: 8, bottom: 2, trailing: 8))
+                    }
+                    .onMove(perform: moveSubtasks)
 
-                Toggle("Due date", isOn: $hasDueDate)
-                if hasDueDate {
-                    DatePicker("Date", selection: $dueDate, displayedComponents: .date)
+                    HStack(spacing: 8) {
+                        Image(systemName: "plus.circle")
+                            .foregroundStyle(OrinColor.accent)
+                        TextField("Add subtask", text: $newSubtaskTitle)
+                            .focused($isAddSubtaskFocused)
+                            .onSubmit { addSubtask() }
+                        if !newSubtaskTitle.isEmpty {
+                            Button("Add") { addSubtask() }
+                                .buttonStyle(.plain)
+                                .foregroundStyle(OrinColor.accent)
+                                .font(OrinFont.caption.weight(.semibold))
+                        }
+                    }
+                    .listRowInsets(EdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8))
+                } header: {
+                    HStack {
+                        Text("Subtasks")
+                        Spacer()
+                        let done = task.subtasks.filter(\.isCompleted).count
+                        let total = task.subtasks.count
+                        if total > 0 {
+                            Text("\(done)/\(total)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        }
+                    }
                 }
             }
-            .formStyle(.grouped)
+            .listStyle(.inset)
 
+            Divider().padding(.top, 4)
             HStack {
                 Spacer()
                 Button("Cancel") { onSave() }
                     .keyboardShortcut(.cancelAction)
-                Button("Save") {
-                    commit()
-                    onSave()
-                }
-                .keyboardShortcut(.defaultAction)
-                .disabled(title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                Button("Save") { commit(); onSave() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
+            .padding(.top, 10)
         }
         .padding(22)
-        .frame(width: 520)
-        .frame(minHeight: 420)
+        .frame(width: 560)
+        .frame(minHeight: 560)
         .onAppear { populate() }
+    }
+
+    private func addSubtask() {
+        let t = newSubtaskTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return }
+        let nextIndex = (task.subtasks.map(\.sortIndex).max() ?? -1) + 1
+        let sub = SubTaskItem(title: t, sortIndex: nextIndex)
+        task.subtasks.append(sub)
+        newSubtaskTitle = ""
+        saveSubtasks()
+    }
+
+    private func deleteSubtask(_ subtask: SubTaskItem) {
+        task.subtasks.removeAll { $0.id == subtask.id }
+        modelContext.delete(subtask)
+        saveSubtasks()
+    }
+
+    private func moveSubtasks(from source: IndexSet, to destination: Int) {
+        var sorted = sortedSubtasks
+        sorted.move(fromOffsets: source, toOffset: destination)
+        for (idx, sub) in sorted.enumerated() { sub.sortIndex = idx }
+        saveSubtasks()
+    }
+
+    private func saveSubtasks() {
+        try? modelContext.save()
     }
 
     private func populate() {

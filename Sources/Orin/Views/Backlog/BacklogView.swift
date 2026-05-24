@@ -33,7 +33,7 @@ struct BacklogView: View {
                         showsDescription: true,
                         onEdit: { taskToEdit = item },
                         onDelete: { delete(item) },
-                        onBreakIntoSubtasks: { addDefaultSubtasks(to: item) },
+                        onBreakIntoSubtasks: { taskToEdit = item },
                         onActivate: { activate(item) }
                     )
                     .listRowSeparator(.hidden)
@@ -84,13 +84,4 @@ struct BacklogView: View {
         try? modelContext.save()
     }
 
-    private func addDefaultSubtasks(to task: TaskItem) {
-        guard task.subtasks.isEmpty else { return }
-        task.subtasks = [
-            SubTaskItem(title: "Clarify outcome"),
-            SubTaskItem(title: "Do first pass"),
-            SubTaskItem(title: "Review and send")
-        ]
-        try? modelContext.save()
-    }
 }

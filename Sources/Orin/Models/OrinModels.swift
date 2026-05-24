@@ -97,12 +97,14 @@ final class SubTaskItem {
     @Attribute(.unique) var id: UUID
     var title: String
     var isCompleted: Bool
+    var sortIndex: Int
     var parentTask: TaskItem?
 
-    init(title: String, isCompleted: Bool = false) {
+    init(title: String, isCompleted: Bool = false, sortIndex: Int = 0) {
         id = UUID()
         self.title = title
         self.isCompleted = isCompleted
+        self.sortIndex = sortIndex
     }
 }
 

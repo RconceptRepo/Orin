@@ -1,3 +1,4 @@
+import SwiftData
 import SwiftUI
 
 struct TaskRowView: View {
@@ -10,7 +11,37 @@ struct TaskRowView: View {
     var onActivate: (() -> Void)?
     var onReactivate: (() -> Void)?
 
+    @State private var isSubtasksExpanded = false
+    @Environment(\.modelContext) private var modelContext
+
+    private var sortedSubtasks: [SubTaskItem] {
+        task.subtasks.sorted { $0.sortIndex < $1.sortIndex }
+    }
+
     var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            mainRow
+                .padding(.horizontal, 14)
+
+            if isSubtasksExpanded && !task.subtasks.isEmpty {
+                subtaskExpansion
+                    .padding(.horizontal, 14)
+                    .padding(.leading, 26)
+                    .padding(.bottom, 8)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .background {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.clear)
+        }
+        .accessibilityElement(children: .contain)
+        .animation(.easeInOut(duration: 0.15), value: isSubtasksExpanded)
+    }
+
+    // MARK: - Main row
+
+    private var mainRow: some View {
         HStack(spacing: 12) {
             Button {
                 onToggleComplete?()
@@ -20,11 +51,13 @@ struct TaskRowView: View {
                     .foregroundStyle(task.status == .completed ? OrinColor.success : OrinColor.p3)
             }
             .buttonStyle(.plain)
+            .accessibilityLabel(task.status == .completed ? "Mark incomplete" : "Mark complete")
 
             VStack(alignment: .leading, spacing: 3) {
                 Text(task.title)
                     .font(OrinFont.body.weight(.medium))
                     .strikethrough(task.status == .completed)
+                    .accessibilityLabel(task.title)
 
                 if showsDescription, !task.taskDescription.isEmpty {
                     Text(task.taskDescription)
@@ -34,12 +67,23 @@ struct TaskRowView: View {
                 }
 
                 if !task.subtasks.isEmpty {
-                    let done = task.subtasks.filter { $0.isCompleted }.count
-                    HStack(spacing: 4) {
-                        Image(systemName: "list.bullet").font(.system(size: 10))
-                        Text("\(done)/\(task.subtasks.count) subtasks").font(.system(size: 10))
+                    let done = task.subtasks.filter(\.isCompleted).count
+                    let total = task.subtasks.count
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.15)) {
+                            isSubtasksExpanded.toggle()
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: isSubtasksExpanded ? "chevron.up" : "list.bullet")
+                                .font(.system(size: 9))
+                            Text("\(done)/\(total) subtasks")
+                                .font(.system(size: 10))
+                        }
+                        .foregroundStyle(.secondary)
                     }
-                    .foregroundStyle(.secondary)
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("\(done) of \(total) subtasks complete. \(isSubtasksExpanded ? "Collapse" : "Expand")")
                 }
             }
 
@@ -63,10 +107,10 @@ struct TaskRowView: View {
             if hasMenuActions {
                 Menu {
                     if let onEdit {
-                        Button("Edit") { onEdit() }
+                        Button("Edit Task") { onEdit() }
                     }
                     if let onBreakIntoSubtasks {
-                        Button("Break Into Subtasks") { onBreakIntoSubtasks() }
+                        Button("Manage Subtasks") { onBreakIntoSubtasks() }
                     }
                     if let onActivate {
                         Button("Activate Today") { onActivate() }
@@ -94,13 +138,19 @@ struct TaskRowView: View {
                 Color.clear.frame(width: 28, height: 28)
             }
         }
-        .frame(height: 56)
-        .padding(.horizontal, 14)
-        .background {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color.clear)
+        .frame(minHeight: 56)
+    }
+
+    // MARK: - Inline subtask expansion
+
+    private var subtaskExpansion: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(sortedSubtasks) { subtask in
+                SubtaskCompactRow(subtask: subtask) {
+                    try? modelContext.save()
+                }
+            }
         }
-        .accessibilityElement(children: .combine)
     }
 
     private var hasMenuActions: Bool {
