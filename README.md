@@ -15,7 +15,9 @@ The UI contract lives in [DESIGN_SYSTEM.md](DESIGN_SYSTEM.md). Treat it as immut
 | Calendar — EventKit sync + 15-min background refresh | Complete |
 | Meetings — transcript, intelligence, commitments | Complete |
 | Meeting Detection Engine (native apps + browser tabs) | Complete |
-| Live transcription via `SFSpeechRecognizer` | Complete |
+| Live transcription via `SFSpeechRecognizer` + local audio file storage | Complete |
+| Whisper transcription stub (`WhisperTranscriptionService`) | Complete |
+| Meeting retention policies (30 / 90 / 180 days / Forever) | Complete |
 | Vault — biometric unlock, AES-256-GCM, Keychain | Complete |
 | AI — Ollama local + OpenAI / Claude / Gemini fallover | Complete |
 | AI provider keys secured in Keychain | Complete |
@@ -23,11 +25,15 @@ The UI contract lives in [DESIGN_SYSTEM.md](DESIGN_SYSTEM.md). Treat it as immut
 | Quick Capture with NL parser | Complete |
 | Daily Executive Brief | Complete |
 | Voice command parser foundation | Complete |
-| App Intents / Siri Shortcuts foundation | Complete |
-| Entitlements file (`Orin.entitlements`) | Complete |
-| `NSAppleEventsUsageDescription` + `NSSpeechRecognitionUsageDescription` | Complete |
-| Automated test suite (62 tests) | Complete |
-| Production Xcode app target + signing + notarization | **Pending** |
+| App Intents / Siri Shortcuts — `WhatsLeftToday`, `ReflowDay`, `AddTask` | Complete |
+| URL scheme deep links — `orin://whatsLeftToday`, `orin://reflow`, `orin://addTask?title=...` | Complete |
+| `AssistantService` — routes intents + URL commands into live services | Complete |
+| Entitlements + Info.plist (all usage strings + screen recording) | Complete |
+| Xcode app target (`Orin.xcodeproj`, bundle ID `com.rconcept.orin`) | Complete |
+| `project.yml` (XcodeGen reproducible project) | Complete |
+| DMG build script (`scripts/build_dmg.sh`) | Complete |
+| Automated test suite (84 tests) | Complete |
+| Production signing + notarization | **Pending** (requires Developer ID certificate) |
 
 ## What's Implemented
 
@@ -56,7 +62,18 @@ The UI contract lives in [DESIGN_SYSTEM.md](DESIGN_SYSTEM.md). Treat it as immut
   - Explicit permission request for microphone and speech recognition
   - On-device recognition preferred (when model is available)
   - Near-real-time `transcript` property updated from partial results
+  - **Local audio file stored** in `~/Library/Application Support/Orin/Recordings/` as `.caf`
+  - `recordingURL` property exposed after `stopRecording()` for meeting attachment
   - `errorMessage` surfaced in `RecordingWidgetView` when permission is denied or engine fails
+- `WhisperTranscriptionService` — extension point for whisper.cpp server transcription:
+  - Set `serverEndpoint` to `http://localhost:8080/inference` to enable
+  - Falls back to SFSpeechRecognizer transcript when not configured
+
+### Meeting Retention
+- `MeetingRetentionService` with policies: `30 days` (default), `90 days`, `180 days`, `Forever`
+- Policy configured in Settings → Meetings
+- Applied on launch: deletes expired `MeetingItem` records + their local audio files
+- Stored in `UserDefaults` key `orin.meetings.retentionDays`
 
 ### Meeting Detection Engine
 See detailed section below.
@@ -75,6 +92,24 @@ See detailed section below.
 - `LoginItemService` wraps `SMAppService.mainApp` with graceful error messaging
 - Wired to the "Launch automatically on login" toggle in Settings
 - Fails cleanly in unsigned / non-`/Applications` dev builds with an inline error message
+
+### Siri / App Intents
+
+| Intent | Siri phrase examples | Result |
+|--------|---------------------|--------|
+| `WhatsLeftTodayIntent` | "What's left today in Orin" | Reads tasks, returns spoken summary |
+| `ReflowDayIntent` | "Reflow my day in Orin" | Opens Orin, triggers reflow |
+| `AddTaskIntent` | "Add task finish proposal in Orin" | Creates task via NL parser |
+
+### URL Scheme Deep Links
+
+| URL | Action |
+|-----|--------|
+| `orin://whatsLeftToday` | Shows today summary |
+| `orin://reflow` | Triggers reflow |
+| `orin://addTask?title=...&due=...` | Creates task |
+
+`AssistantService.handleURL(_:)` processes these; `processPendingIntents()` flushes the UserDefaults bridge on each foreground pass.
 
 ---
 
@@ -131,7 +166,7 @@ All detection runs in `Task.detached(priority: .utility)`. UI state is only muta
 ## Automated Tests
 
 ```
-swift test
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --jobs 1
 ```
 
 | Suite | Tests | Coverage |
@@ -141,21 +176,55 @@ swift test
 | `AIKeychainServiceTests` | 9 | Save, load, overwrite, delete, cross-account isolation, empty-string rejection |
 | `RolloverEngineTests` | 9 | First-launch guard, same-day idempotency, overdue rollover, future/nil date, backlog, completed exclusion |
 | `CalendarServiceTests` | 11 | Background sync start/stop/idempotency/restart, 900 s interval, initial state, auth refresh |
-| **Total** | **62** | 0 failures |
+| `MeetingRetentionServiceTests` | 9 | All policies, mixed-age data, cutoff accuracy, display names, from-rawValue |
+| `URLSchemeTests` | 7 | All three URL commands, empty title guard, wrong scheme, unknown host |
+| `AssistantServiceTests` | 6 | Empty summary, task listing, backlog/completed exclusion, 5-item cap, priority ordering |
+| **Total** | **84** | 0 failures |
 
 All tests use in-memory SwiftData containers or real-Keychain with UUID-scoped accounts (cleaned up in `tearDown`). No mocks, no network calls.
 
 ---
 
-## Production Packaging (still pending)
+## Xcode Project (app target)
 
-To ship a signed, notarized release:
+The repository includes a generated `Orin.xcodeproj` produced by [XcodeGen](https://github.com/yonaskolb/XcodeGen).
 
-1. Create a macOS app target in Xcode pointing at `Sources/Orin`.
-2. Attach `Orin.entitlements` (already in the repo root) to the target.
-3. Verify the `Info.plist` usage descriptions match what the entitlements request.
-4. Configure a Developer ID certificate and run `notarytool`.
-5. Validate on a clean machine: Apple Events prompt, mic permission, Keychain, Calendar, login item.
+```bash
+brew install xcodegen
+xcodegen generate          # regenerates Orin.xcodeproj from project.yml
+```
+
+**Bundle ID:** `com.rconcept.orin`  
+**Entitlements:** `Orin.entitlements`  
+**Info.plist:** `Orin/Info.plist` (all usage strings + `orin://` URL scheme)
+
+The `OrinTests` target in the Xcode project mirrors the SPM test suite and runs against the app target via `@testable import Orin`.
+
+---
+
+## DMG Packaging
+
+```bash
+# Set required environment variables (see script header for details)
+export DEVELOPER_ID_APP="Developer ID Application: Your Name (TEAMID)"
+export APPLE_TEAM_ID="YOURTEAMID"
+export NOTARY_APPLE_ID="you@example.com"
+export NOTARY_PASSWORD="@keychain:notarytool-password"
+
+./scripts/build_dmg.sh
+# → build/Orin.dmg (signed + notarized)
+
+# Skip notarization for local testing:
+./scripts/build_dmg.sh --skip-notary
+```
+
+The script: archives with Xcode, exports a hardened runtime `.app`, notarizes via `notarytool`, staples the ticket, then packages into a `hdiutil`-created DMG with an Applications symlink.
+
+**Clean-machine install checklist:**
+1. Open `Orin.dmg`, drag to `/Applications`
+2. Launch — Gatekeeper verifies the notarization ticket
+3. Grant Calendar, Microphone, Speech Recognition, and Apple Events permissions when prompted
+4. Enable "Launch at login" in Settings → General
 
 ---
 
@@ -164,22 +233,28 @@ To ship a signed, notarized release:
 - macOS 14 (Sonoma) or later
 - Full Xcode toolchain (SwiftData macros require Xcode — Command Line Tools alone will fail)
 
-## Build
+## Build (SPM)
 
 ```bash
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build --jobs 1
 ```
 
-## Test
+## Test (SPM)
 
 ```bash
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --jobs 1
 ```
 
-## Run
+## Run (SPM)
 
 ```bash
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift run Orin
 ```
 
-For a release build, create a native macOS app target in Xcode and include `Sources/Orin`.
+## Open in Xcode
+
+```bash
+open Orin.xcodeproj
+```
+
+Set the scheme to `Orin`, select "My Mac" as destination, and press ⌘R.

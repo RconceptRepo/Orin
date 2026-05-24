@@ -119,6 +119,8 @@ final class MeetingItem {
     var actionItems: [String]
     var suggestedTaskTitles: [String]
     var acceptedSuggestedTaskTitles: [String]
+    /// Path to the locally-recorded audio file for this meeting, if any.
+    var audioFilePath: String?
 
     @Relationship(deleteRule: .cascade)
     var commitments: [CommitmentItem] = []

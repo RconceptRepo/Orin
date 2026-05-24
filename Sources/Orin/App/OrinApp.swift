@@ -35,8 +35,22 @@ struct OrinApp: App {
             services.register(OllamaInstallerService(), for: OllamaInstallerService.self)
             services.register(MeetingDetectorService(), for: MeetingDetectorService.self)
             services.register(LoginItemService(), for: LoginItemService.self)
+            services.register(WhisperTranscriptionService(), for: WhisperTranscriptionService.self)
+
+            let retentionService = MeetingRetentionService()
+            services.register(retentionService, for: MeetingRetentionService.self)
+
+            let assistantService = AssistantService()
+            assistantService.configure(with: modelContainer)
+            services.register(assistantService, for: AssistantService.self)
 
             QuickCaptureWindowManager.shared.configure(modelContainer: modelContainer)
+
+            // Prune expired meetings on launch (uses AppStorage default of 30 days)
+            let retentionDays = UserDefaults.standard.integer(forKey: "orin.meetings.retentionDays")
+            let policy = MeetingRetentionService.RetentionPolicy.from(rawValue: retentionDays == 0
+                ? MeetingRetentionService.RetentionPolicy.thirtyDays.rawValue : retentionDays)
+            _ = try? retentionService.pruneExpiredMeetings(in: modelContainer.mainContext, policy: policy)
         } catch {
             fatalError("Failed to initialize Orin: \(error.localizedDescription)")
         }
@@ -48,6 +62,10 @@ struct OrinApp: App {
                 .modelContainer(modelContainer)
                 .onAppear {
                     rolloverEngine.verifyAndExecuteRollover()
+                    ServiceContainer.shared.resolve(AssistantService.self).processPendingIntents()
+                }
+                .onOpenURL { url in
+                    ServiceContainer.shared.resolve(AssistantService.self).handleURL(url)
                 }
         }
         .commands {

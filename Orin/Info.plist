@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleDisplayName</key>
+	<string>Orin</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0.0</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.rconcept.orin</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>orin</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.productivity</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Orin reads the active tab URL from your browser to detect whether you are in a video call (Google Meet, Zoom, Microsoft Teams). No browsing history is stored or transmitted.</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>Orin reads your local EventKit calendar to show upcoming events alongside tasks and trigger meeting detection.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Orin may use the camera for future video features. No camera access is used in V1.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Orin uses the microphone only when you explicitly start meeting transcription. Audio is processed on-device and stored locally.</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSRemindersUsageDescription</key>
+	<string>Orin may sync Reminders to surface them alongside tasks in future versions.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Orin transcribes meeting audio on-device using Apple Speech Recognition so your conversations never leave your Mac.</string>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
+</dict>
+</plist>

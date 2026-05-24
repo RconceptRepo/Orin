@@ -5,6 +5,7 @@ struct SettingsView: View {
     @AppStorage("orin.ai.provider") private var providerRaw = AIProvider.ollama.rawValue
     @AppStorage("orin.ai.ollamaEndpoint") private var ollamaEndpoint = "http://localhost:11434"
     @AppStorage("orin.calendar.backgroundSync") private var calendarBackgroundSync = true
+    @AppStorage("orin.meetings.retentionDays") private var retentionDays = MeetingRetentionService.RetentionPolicy.thirtyDays.rawValue
 
     @State private var ollamaService     = ServiceContainer.shared.resolve(OllamaInstallerService.self)
     @State private var loginItemService  = ServiceContainer.shared.resolve(LoginItemService.self)
@@ -92,6 +93,18 @@ struct SettingsView: View {
                     account: AIService.geminiAccount,
                     configured: $geminiConfigured
                 )
+            }
+
+            // MARK: Meetings
+            Section("Meetings") {
+                Picker("Keep meeting records", selection: $retentionDays) {
+                    ForEach(MeetingRetentionService.RetentionPolicy.allCases) { policy in
+                        Text(policy.displayName).tag(policy.rawValue)
+                    }
+                }
+                Text("Older meetings and their local recordings are deleted automatically on launch.")
+                    .font(OrinFont.caption)
+                    .foregroundStyle(.secondary)
             }
 
             // MARK: Privacy
