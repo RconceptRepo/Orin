@@ -35,7 +35,11 @@ struct OnboardingView: View {
                 case .welcome:    WelcomeStep()
                 case .calendar:   CalendarPermissionStep()
                 case .microphone: MicPermissionStep()
-                case .ollama:     OllamaStep()
+                case .ollama:
+                    OllamaSetupView(
+                        onComplete: { withAnimation { step += 1 } },
+                        onBack:    { withAnimation { step -= 1 } }
+                    )
                 case .ready:      ReadyStep()
                 }
             }
@@ -47,24 +51,26 @@ struct OnboardingView: View {
 
             Spacer()
 
-            // Navigation
-            HStack {
-                if step > 0 {
-                    Button("Back") { withAnimation { step -= 1 } }
-                        .buttonStyle(OrinSecondaryButtonStyle())
-                }
-                Spacer()
-                Button(step < steps.count - 1 ? "Continue" : "Get Started") {
-                    if step < steps.count - 1 {
-                        withAnimation { step += 1 }
-                    } else {
-                        hasCompletedOnboarding = true
+            // Navigation — hidden on the ollama step (OllamaSetupView owns its own nav)
+            if steps[step] != .ollama {
+                HStack {
+                    if step > 0 {
+                        Button("Back") { withAnimation { step -= 1 } }
+                            .buttonStyle(OrinSecondaryButtonStyle())
                     }
+                    Spacer()
+                    Button(step < steps.count - 1 ? "Continue" : "Get Started") {
+                        if step < steps.count - 1 {
+                            withAnimation { step += 1 }
+                        } else {
+                            hasCompletedOnboarding = true
+                        }
+                    }
+                    .buttonStyle(OrinPrimaryButtonStyle())
                 }
-                .buttonStyle(OrinPrimaryButtonStyle())
+                .padding(.horizontal, 40)
+                .padding(.bottom, 32)
             }
-            .padding(.horizontal, 40)
-            .padding(.bottom, 32)
         }
         .frame(width: 620, height: 560)
         .background(OrinColor.backgroundPrimary(colorScheme))
@@ -258,84 +264,6 @@ private struct MicPermissionStep: View {
     }
 
     enum PermStatus { case idle, requesting, granted, denied }
-}
-
-// MARK: - Ollama setup
-
-private struct OllamaStep: View {
-    @State private var ollamaService = ServiceContainer.shared.resolve(OllamaInstallerService.self)
-    @AppStorage("orin.ai.ollamaEndpoint") private var endpoint = "http://localhost:11434"
-    @State private var hasChecked = false
-
-    var body: some View {
-        VStack(spacing: 20) {
-            Image(systemName: "cpu")
-                .font(.system(size: 52))
-                .foregroundStyle(OrinColor.accent)
-
-            Text("Local AI (Ollama)")
-                .font(.system(size: 26, weight: .bold))
-
-            Text("Orin uses Ollama for on-device AI — meeting summaries, task suggestions, and reflow — with no data leaving your Mac.")
-                .font(.body)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 20)
-
-            switch ollamaService.status {
-            case .unknown:
-                if hasChecked {
-                    ProgressView("Checking…")
-                } else {
-                    Button("Check for Ollama") {
-                        hasChecked = true
-                        Task { await ollamaService.verify(endpoint: endpoint) }
-                    }
-                    .buttonStyle(OrinPrimaryButtonStyle())
-                }
-
-            case .connected:
-                Label("Ollama is running — AI features are ready.", systemImage: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
-                    .font(.headline)
-                    .multilineTextAlignment(.center)
-
-            case .missing, .failed:
-                VStack(spacing: 12) {
-                    Label("Ollama not found at \(endpoint)", systemImage: "xmark.circle.fill")
-                        .foregroundStyle(OrinColor.error)
-                        .multilineTextAlignment(.center)
-
-                    Text("Install Ollama to enable local AI. You can skip this and add an API key later in Settings.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-
-                    HStack(spacing: 10) {
-                        Button("Download Ollama") {
-                            NSWorkspace.shared.open(URL(string: "https://ollama.com")!)
-                        }
-                        .buttonStyle(OrinPrimaryButtonStyle())
-
-                        Button("Try Again") {
-                            Task { await ollamaService.verify(endpoint: endpoint) }
-                        }
-                        .buttonStyle(OrinSecondaryButtonStyle())
-                    }
-                }
-            }
-
-            Text("You can skip this step — Ollama can be set up anytime in Settings → AI.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .padding(.top, 4)
-        }
-        .padding(.horizontal, 60)
-        .onAppear {
-            hasChecked = true
-            Task { await ollamaService.verify(endpoint: endpoint) }
-        }
-    }
 }
 
 // MARK: - Ready

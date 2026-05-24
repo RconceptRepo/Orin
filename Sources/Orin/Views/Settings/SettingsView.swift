@@ -9,6 +9,8 @@ struct SettingsView: View {
 
     @State private var aiTester        = ServiceContainer.shared.resolve(AIProviderTestService.self)
     @State private var loginItemService = ServiceContainer.shared.resolve(LoginItemService.self)
+    @State private var ollamaInstaller  = ServiceContainer.shared.resolve(OllamaInstallerService.self)
+    @State private var showOllamaSetup  = false
 
     // Key drafts — held only long enough to be saved to Keychain, never persisted elsewhere
     @State private var openAIKeyDraft    = ""
@@ -156,6 +158,15 @@ struct SettingsView: View {
 
             // MARK: Troubleshooting
             Section("Troubleshooting") {
+                Button("Re-run Ollama Setup") {
+                    ollamaInstaller.resetSetup()
+                    showOllamaSetup = true
+                }
+                .foregroundStyle(OrinColor.accent)
+                Text("Re-run the Ollama installation and connection wizard.")
+                    .font(OrinFont.caption)
+                    .foregroundStyle(.secondary)
+
                 Button("Re-run Setup Wizard") {
                     UserDefaults.standard.removeObject(forKey: "orin.hasCompletedOnboarding")
                 }
@@ -168,6 +179,10 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .padding()
         .navigationTitle("Settings")
+        .sheet(isPresented: $showOllamaSetup) {
+            OllamaSetupView(onComplete: { showOllamaSetup = false })
+                .frame(width: 620, height: 560)
+        }
         .onAppear {
             loginItemService.refreshStatus()
             openAIConfigured    = AIKeychainService.hasKey(for: AIService.openAIAccount)
