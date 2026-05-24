@@ -4,6 +4,11 @@ struct TaskRowView: View {
     let task: TaskItem
     var showsDescription = false
     var onToggleComplete: (() -> Void)?
+    var onEdit: (() -> Void)?
+    var onDelete: (() -> Void)?
+    var onBreakIntoSubtasks: (() -> Void)?
+    var onActivate: (() -> Void)?
+    var onReactivate: (() -> Void)?
 
     var body: some View {
         HStack(spacing: 12) {
@@ -27,6 +32,15 @@ struct TaskRowView: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
                 }
+
+                if !task.subtasks.isEmpty {
+                    let done = task.subtasks.filter { $0.isCompleted }.count
+                    HStack(spacing: 4) {
+                        Image(systemName: "list.bullet").font(.system(size: 10))
+                        Text("\(done)/\(task.subtasks.count) subtasks").font(.system(size: 10))
+                    }
+                    .foregroundStyle(.secondary)
+                }
             }
 
             Spacer()
@@ -46,11 +60,39 @@ struct TaskRowView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Image(systemName: "ellipsis")
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .frame(width: 28, height: 28)
-                .contentShape(Rectangle())
+            if hasMenuActions {
+                Menu {
+                    if let onEdit {
+                        Button("Edit") { onEdit() }
+                    }
+                    if let onBreakIntoSubtasks {
+                        Button("Break Into Subtasks") { onBreakIntoSubtasks() }
+                    }
+                    if let onActivate {
+                        Button("Activate Today") { onActivate() }
+                    }
+                    if let onReactivate {
+                        Button("Reactivate") { onReactivate() }
+                    }
+                    if task.status == .active, let onToggleComplete {
+                        Button("Mark Complete") { onToggleComplete() }
+                    }
+                    if let onDelete {
+                        Divider()
+                        Button("Delete", role: .destructive) { onDelete() }
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 28, height: 28)
+                        .contentShape(Rectangle())
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+            } else {
+                Color.clear.frame(width: 28, height: 28)
+            }
         }
         .frame(height: 56)
         .padding(.horizontal, 14)
@@ -59,5 +101,9 @@ struct TaskRowView: View {
                 .fill(Color.clear)
         }
         .accessibilityElement(children: .combine)
+    }
+
+    private var hasMenuActions: Bool {
+        onEdit != nil || onDelete != nil || onBreakIntoSubtasks != nil || onActivate != nil || onReactivate != nil
     }
 }

@@ -5,14 +5,13 @@ import SwiftUI
 
 // MARK: - Entry point
 
-/// Shown once on first launch to request all needed permissions and orient the user.
 struct OnboardingView: View {
     @AppStorage("orin.hasCompletedOnboarding") private var hasCompletedOnboarding = false
     @State private var step = 0
     @Environment(\.colorScheme) private var colorScheme
 
     private let steps: [OnboardingStep] = [
-        .welcome, .calendar, .microphone, .ready
+        .welcome, .calendar, .microphone, .ollama, .ready
     ]
 
     var body: some View {
@@ -36,6 +35,7 @@ struct OnboardingView: View {
                 case .welcome:    WelcomeStep()
                 case .calendar:   CalendarPermissionStep()
                 case .microphone: MicPermissionStep()
+                case .ollama:     OllamaStep()
                 case .ready:      ReadyStep()
                 }
             }
@@ -66,11 +66,11 @@ struct OnboardingView: View {
             .padding(.horizontal, 40)
             .padding(.bottom, 32)
         }
-        .frame(width: 620, height: 520)
+        .frame(width: 620, height: 560)
         .background(OrinColor.backgroundPrimary(colorScheme))
     }
 
-    private enum OnboardingStep { case welcome, calendar, microphone, ready }
+    private enum OnboardingStep { case welcome, calendar, microphone, ollama, ready }
 }
 
 // MARK: - Welcome
@@ -159,7 +159,6 @@ private struct CalendarPermissionStep: View {
         }
         .padding(.horizontal, 60)
         .onAppear {
-            // Auto-request on appearance; skip if already decided
             let current = EKEventStore.authorizationStatus(for: .event)
             switch current {
             case .fullAccess, .authorized:
@@ -259,6 +258,84 @@ private struct MicPermissionStep: View {
     }
 
     enum PermStatus { case idle, requesting, granted, denied }
+}
+
+// MARK: - Ollama setup
+
+private struct OllamaStep: View {
+    @State private var ollamaService = ServiceContainer.shared.resolve(OllamaInstallerService.self)
+    @AppStorage("orin.ai.ollamaEndpoint") private var endpoint = "http://localhost:11434"
+    @State private var hasChecked = false
+
+    var body: some View {
+        VStack(spacing: 20) {
+            Image(systemName: "cpu")
+                .font(.system(size: 52))
+                .foregroundStyle(OrinColor.accent)
+
+            Text("Local AI (Ollama)")
+                .font(.system(size: 26, weight: .bold))
+
+            Text("Orin uses Ollama for on-device AI — meeting summaries, task suggestions, and reflow — with no data leaving your Mac.")
+                .font(.body)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 20)
+
+            switch ollamaService.status {
+            case .unknown:
+                if hasChecked {
+                    ProgressView("Checking…")
+                } else {
+                    Button("Check for Ollama") {
+                        hasChecked = true
+                        Task { await ollamaService.verify(endpoint: endpoint) }
+                    }
+                    .buttonStyle(OrinPrimaryButtonStyle())
+                }
+
+            case .connected:
+                Label("Ollama is running — AI features are ready.", systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+                    .font(.headline)
+                    .multilineTextAlignment(.center)
+
+            case .missing, .failed:
+                VStack(spacing: 12) {
+                    Label("Ollama not found at \(endpoint)", systemImage: "xmark.circle.fill")
+                        .foregroundStyle(OrinColor.error)
+                        .multilineTextAlignment(.center)
+
+                    Text("Install Ollama to enable local AI. You can skip this and add an API key later in Settings.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+
+                    HStack(spacing: 10) {
+                        Button("Download Ollama") {
+                            NSWorkspace.shared.open(URL(string: "https://ollama.com")!)
+                        }
+                        .buttonStyle(OrinPrimaryButtonStyle())
+
+                        Button("Try Again") {
+                            Task { await ollamaService.verify(endpoint: endpoint) }
+                        }
+                        .buttonStyle(OrinSecondaryButtonStyle())
+                    }
+                }
+            }
+
+            Text("You can skip this step — Ollama can be set up anytime in Settings → AI.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.top, 4)
+        }
+        .padding(.horizontal, 60)
+        .onAppear {
+            hasChecked = true
+            Task { await ollamaService.verify(endpoint: endpoint) }
+        }
+    }
 }
 
 // MARK: - Ready

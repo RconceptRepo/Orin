@@ -74,6 +74,7 @@ private struct MeetingDetailView: View {
     @State private var isAnalyzing = false
     @State private var isImportingTranscript = false
     @State private var errorMessage: String?
+    @State private var recordingService = ServiceContainer.shared.resolve(RecordingService.self)
 
     private let intelligence = ServiceContainer.shared.resolve(MeetingIntelligenceService.self)
 
@@ -112,6 +113,62 @@ private struct MeetingDetailView: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
+                    // Recording controls
+                    GroupBox {
+                        if let err = recordingService.errorMessage {
+                            HStack {
+                                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                                Text(err).font(.caption).foregroundStyle(.secondary)
+                                Spacer()
+                                Button("Dismiss") { recordingService.clearError() }.font(.caption)
+                            }
+                        } else if recordingService.isRecording {
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack {
+                                    Circle().fill(.red).frame(width: 8, height: 8)
+                                    Text("Recording • \(recordingService.durationText)")
+                                        .font(.body.weight(.semibold))
+                                    Spacer()
+                                    Button("Stop Recording") {
+                                        recordingService.stopRecording()
+                                        if let url = recordingService.recordingURL {
+                                            meeting.audioFilePath = url.path
+                                            try? modelContext.save()
+                                        }
+                                    }
+                                }
+                                if !recordingService.transcript.isEmpty {
+                                    Text(recordingService.transcript)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(3)
+                                        .onChange(of: recordingService.transcript) { _, newValue in
+                                            meeting.transcript = newValue
+                                        }
+                                }
+                            }
+                        } else {
+                            HStack {
+                                if let path = meeting.audioFilePath {
+                                    Label("Audio saved: \(URL(fileURLWithPath: path).lastPathComponent)", systemImage: "waveform")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                } else {
+                                    Text("Not recording").foregroundStyle(.secondary).font(.body)
+                                }
+                                Spacer()
+                                Button {
+                                    Task { await recordingService.startRecording() }
+                                } label: {
+                                    Label("Start Recording", systemImage: "record.circle")
+                                }
+                            }
+                        }
+                    } label: {
+                        Label("Recording", systemImage: "mic")
+                            .font(.headline)
+                    }
+
                     GroupBox("Participants") {
                         if meeting.participants.isEmpty {
                             Text("No participants added.")

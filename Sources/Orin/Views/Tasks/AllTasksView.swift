@@ -19,19 +19,22 @@ struct AllTasksView: View {
 
             List {
                 ForEach(tasks) { task in
-                    TaskRowView(task: task, showsDescription: true)
-                        .contextMenu {
-                            if task.status == .active {
-                                Button("Complete") { complete(task) }
-                                Button("Edit") { taskToEdit = task }
-                                Button("Break Into Subtasks") { addDefaultSubtasks(to: task) }
-                            } else {
-                                Button("Reactivate") { reactivate(task) }
-                            }
-                            Button("Delete", role: .destructive) { delete(task) }
-                        }
+                    TaskRowView(
+                        task: task,
+                        showsDescription: true,
+                        onToggleComplete: {
+                            if task.status == .active { complete(task) } else { reactivate(task) }
+                        },
+                        onEdit: { taskToEdit = task },
+                        onDelete: { delete(task) },
+                        onBreakIntoSubtasks: task.status == .active ? { addDefaultSubtasks(to: task) } : nil,
+                        onReactivate: task.status == .completed ? { reactivate(task) } : nil
+                    )
+                    .listRowSeparator(.hidden)
+                    .listRowBackground(Color.clear)
                 }
             }
+            .listStyle(.plain)
         }
         .padding()
         .sheet(item: $taskToEdit) { task in
@@ -70,9 +73,9 @@ struct AllTasksView: View {
     }
 }
 
-// MARK: - Edit sheet
+// MARK: - Edit sheet (shared)
 
-private struct TaskEditSheet: View {
+struct TaskEditSheet: View {
     @Bindable var task: TaskItem
     var onSave: () -> Void
 
@@ -127,19 +130,19 @@ private struct TaskEditSheet: View {
     }
 
     private func populate() {
-        title          = task.title
-        description    = task.taskDescription
-        priority       = task.priority
-        effortMinutes  = task.effortEstimateMinutes
-        hasDueDate     = task.dueDate != nil
-        dueDate        = task.dueDate ?? Date()
+        title         = task.title
+        description   = task.taskDescription
+        priority      = task.priority
+        effortMinutes = task.effortEstimateMinutes
+        hasDueDate    = task.dueDate != nil
+        dueDate       = task.dueDate ?? Date()
     }
 
     private func commit() {
-        task.title                  = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        task.taskDescription        = description
-        task.priority               = priority
-        task.effortEstimateMinutes  = effortMinutes
-        task.dueDate                = hasDueDate ? dueDate : nil
+        task.title                 = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        task.taskDescription       = description
+        task.priority              = priority
+        task.effortEstimateMinutes = effortMinutes
+        task.dueDate               = hasDueDate ? dueDate : nil
     }
 }

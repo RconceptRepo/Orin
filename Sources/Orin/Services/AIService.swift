@@ -31,9 +31,16 @@ final class AIService: Service {
     // MARK: - Summary generation with fallover
 
     /// Returns (summaryText, fallbackWasUsed).
-    /// Tries the configured primary provider first; falls back to Ollama on failure.
+    /// Reads the current provider and endpoint from UserDefaults at call time so Settings
+    /// changes take effect immediately without restarting the service.
     func generateSummary(for transcript: String) async -> (text: String, fallbackUsed: Bool) {
-        switch config.primaryProvider {
+        let providerRaw = UserDefaults.standard.string(forKey: "orin.ai.provider") ?? config.primaryProvider.rawValue
+        let provider = AIProvider(rawValue: providerRaw) ?? config.primaryProvider
+        if let endpoint = UserDefaults.standard.string(forKey: "orin.ai.ollamaEndpoint"), !endpoint.isEmpty {
+            config.localOllamaEndpoint = endpoint
+        }
+
+        switch provider {
         case .ollama:
             let result = await generateOllamaSummary(transcript: transcript)
             return (result ?? "Ollama is unavailable. Verify it is running at \(config.localOllamaEndpoint).", false)

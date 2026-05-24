@@ -7,11 +7,15 @@ struct VaultView: View {
     @Query(sort: \VaultItem.lastAccessed, order: .reverse)
     private var vaultItems: [VaultItem]
 
+    @AppStorage("orin.vault.recoveryKeyShown") private var recoveryKeyShown = false
+
     @State private var vaultKey: SymmetricKey?
     @State private var selectedItemID: UUID?
     @State private var revealedSecret = ""
     @State private var isAddingItem = false
     @State private var errorMessage: String?
+    @State private var showingRecoveryKey = false
+    @State private var recoveryKeyString = ""
 
     private let vaultService = ServiceContainer.shared.resolve(VaultService.self)
 
@@ -36,7 +40,7 @@ struct VaultView: View {
                     Button {
                         Task { await unlock() }
                     } label: {
-                        Label("Unlock", systemImage: "touchid")
+                        Label(vaultService.canUseBiometrics ? "Unlock with Touch ID" : "Unlock", systemImage: "touchid")
                     }
                 } else {
                     Button {
@@ -57,10 +61,15 @@ struct VaultView: View {
                 Text(errorMessage)
                     .font(.caption)
                     .foregroundStyle(.red)
+                    .padding(.horizontal, 4)
             }
 
             if vaultKey == nil {
-                ContentUnavailableView("Vault Locked", systemImage: "lock.shield", description: Text("Unlock with Touch ID or your device password to view and manage local secrets."))
+                ContentUnavailableView(
+                    "Vault Locked",
+                    systemImage: "lock.shield",
+                    description: Text("Tap Unlock to authenticate with Touch ID or your device password.")
+                )
             } else {
                 HSplitView {
                     List(vaultItems, selection: $selectedItemID) { item in
@@ -84,9 +93,7 @@ struct VaultView: View {
                         revealedSecret: revealedSecret,
                         onReveal: { reveal(selectedItem) },
                         onDelete: {
-                            if let selectedItem {
-                                delete(selectedItem)
-                            }
+                            if let selectedItem { delete(selectedItem) }
                         }
                     )
                     .frame(minWidth: 360)
@@ -99,15 +106,25 @@ struct VaultView: View {
                 save(draft)
             }
         }
+        .sheet(isPresented: $showingRecoveryKey) {
+            VaultRecoveryKeyView(recoveryKey: recoveryKeyString) {
+                recoveryKeyShown = true
+                showingRecoveryKey = false
+            }
+        }
     }
 
     private func unlock() async {
+        errorMessage = nil
         switch await vaultService.unlockVault() {
         case .success(let key):
             vaultKey = key
-            errorMessage = nil
+            if !recoveryKeyShown {
+                recoveryKeyString = vaultService.recoveryKeyString(from: key)
+                showingRecoveryKey = true
+            }
         case .failure:
-            errorMessage = "Vault unlock failed."
+            errorMessage = "Vault unlock failed. Ensure Touch ID or a device password is configured in System Settings."
         }
     }
 
@@ -155,6 +172,61 @@ struct VaultView: View {
     }
 }
 
+// MARK: - Recovery key sheet
+
+private struct VaultRecoveryKeyView: View {
+    let recoveryKey: String
+    var onDismiss: () -> Void
+
+    @State private var confirmed = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            HStack {
+                Image(systemName: "key.fill")
+                    .font(.system(size: 28))
+                    .foregroundStyle(.orange)
+                Text("Your Recovery Key")
+                    .font(.title2.weight(.semibold))
+            }
+
+            Text("This key can unlock your vault if Touch ID becomes unavailable. Save it somewhere safe — it will not be shown again.")
+                .font(.body)
+                .foregroundStyle(.secondary)
+
+            Text(recoveryKey)
+                .font(.system(.body, design: .monospaced).weight(.semibold))
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(.secondary.opacity(0.1))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(recoveryKey, forType: .string)
+                confirmed = true
+            } label: {
+                Label(confirmed ? "Copied!" : "Copy to Clipboard", systemImage: confirmed ? "checkmark" : "doc.on.doc")
+            }
+
+            Toggle("I have saved my recovery key in a safe place", isOn: $confirmed)
+
+            HStack {
+                Spacer()
+                Button("I've Saved It") {
+                    onDismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!confirmed)
+            }
+        }
+        .padding(28)
+        .frame(width: 520)
+    }
+}
+
+// MARK: - Detail view
+
 private struct VaultDetailView: View {
     let item: VaultItem?
     let revealedSecret: String
@@ -191,12 +263,18 @@ private struct VaultDetailView: View {
                     Label("Reveal Again", systemImage: "eye")
                 }
             } else {
-                ContentUnavailableView("No Vault Item Selected", systemImage: "key", description: Text("Choose an item to reveal its encrypted contents."))
+                ContentUnavailableView(
+                    "No Vault Item Selected",
+                    systemImage: "key",
+                    description: Text("Choose an item to reveal its encrypted contents.")
+                )
             }
         }
         .padding()
     }
 }
+
+// MARK: - Add item
 
 private struct VaultItemDraft {
     var title = ""

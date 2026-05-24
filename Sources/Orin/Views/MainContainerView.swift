@@ -70,7 +70,7 @@ struct MainContainerView: View {
                         )
                     }
 
-                    if recordingService.isRecording {
+                    if recordingService.isRecording || recordingService.errorMessage != nil {
                         RecordingWidgetView(recordingService: recordingService) {
                             recordingService.stopRecording()
                         }

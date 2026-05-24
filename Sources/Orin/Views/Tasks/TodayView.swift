@@ -22,6 +22,7 @@ struct TodayView: View {
     @State private var isShowingReflow = false
     @State private var reflowPlan: ReflowPlan?
     @State private var dailyBrief: DailyBriefItem?
+    @State private var taskToEdit: TaskItem?
 
     private let reflowEngine = ServiceContainer.shared.resolve(ReflowEngine.self)
     private let dailyBriefService = ServiceContainer.shared.resolve(DailyBriefService.self)
@@ -107,6 +108,12 @@ struct TodayView: View {
         .sheet(isPresented: $isShowingReflow) {
             ReflowPlanView(plan: reflowPlan, onApply: applyReflow)
         }
+        .sheet(item: $taskToEdit) { task in
+            TodayTaskEditSheet(task: task) {
+                try? modelContext.save()
+                taskToEdit = nil
+            }
+        }
     }
 
     private var activeTasksCard: some View {
@@ -132,17 +139,25 @@ struct TodayView: View {
                     )
                     .frame(minHeight: 260)
                 } else {
-                    VStack(spacing: 6) {
+                    List {
                         ForEach(activeTodayTasks) { task in
-                            TaskRowView(task: task, showsDescription: true, onToggleComplete: { complete(task) })
-                                .contextMenu {
-                                    Button("Complete") { complete(task) }
-                                    Button("Edit") {}
-                                    Button("Break Into Subtasks") { addDefaultSubtasks(to: task) }
-                                    Button("Delete", role: .destructive) { delete(task) }
-                                }
+                            TaskRowView(
+                                task: task,
+                                showsDescription: true,
+                                onToggleComplete: { complete(task) },
+                                onEdit: { taskToEdit = task },
+                                onDelete: { delete(task) },
+                                onBreakIntoSubtasks: { addDefaultSubtasks(to: task) }
+                            )
+                            .listRowSeparator(.hidden)
+                            .listRowBackground(Color.clear)
+                            .listRowInsets(EdgeInsets(top: 2, leading: 0, bottom: 2, trailing: 0))
                         }
+                        .onMove { from, to in moveTasks(from: from, to: to) }
                     }
+                    .listStyle(.plain)
+                    .scrollDisabled(true)
+                    .frame(height: max(60, CGFloat(activeTodayTasks.count) * 62))
                 }
             }
         }
@@ -175,11 +190,12 @@ struct TodayView: View {
             DisclosureGroup("\(completedTasks.count) completed") {
                 VStack(spacing: 6) {
                     ForEach(completedTasks) { task in
-                        TaskRowView(task: task, onToggleComplete: { reactivate(task) })
-                            .contextMenu {
-                                Button("Reactivate") { reactivate(task) }
-                                Button("Delete", role: .destructive) { delete(task) }
-                            }
+                        TaskRowView(
+                            task: task,
+                            onToggleComplete: { reactivate(task) },
+                            onDelete: { delete(task) },
+                            onReactivate: { reactivate(task) }
+                        )
                     }
                 }
                 .padding(.top, 8)
@@ -277,6 +293,82 @@ struct TodayView: View {
         try? modelContext.save()
     }
 }
+
+// MARK: - Edit sheet
+
+private struct TodayTaskEditSheet: View {
+    @Bindable var task: TaskItem
+    var onSave: () -> Void
+
+    @State private var title: String = ""
+    @State private var description: String = ""
+    @State private var priority: TaskPriority = .p3Low
+    @State private var effortMinutes: Int = 0
+    @State private var hasDueDate: Bool = false
+    @State private var dueDate: Date = Date()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Edit Task")
+                .font(.title2.weight(.semibold))
+
+            Form {
+                TextField("Task title", text: $title)
+                TextField("Description", text: $description, axis: .vertical)
+                    .lineLimit(2...4)
+
+                Picker("Priority", selection: $priority) {
+                    ForEach(TaskPriority.allCases) { p in
+                        Text(p.displayName).tag(p)
+                    }
+                }
+
+                Stepper("Effort: \(effortMinutes)m", value: $effortMinutes, in: 0...480, step: 15)
+
+                Toggle("Due date", isOn: $hasDueDate)
+                if hasDueDate {
+                    DatePicker("Date", selection: $dueDate, displayedComponents: .date)
+                }
+            }
+            .formStyle(.grouped)
+
+            HStack {
+                Spacer()
+                Button("Cancel") { onSave() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Save") {
+                    commit()
+                    onSave()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(22)
+        .frame(width: 520)
+        .frame(minHeight: 420)
+        .onAppear { populate() }
+    }
+
+    private func populate() {
+        title         = task.title
+        description   = task.taskDescription
+        priority      = task.priority
+        effortMinutes = task.effortEstimateMinutes
+        hasDueDate    = task.dueDate != nil
+        dueDate       = task.dueDate ?? Date()
+    }
+
+    private func commit() {
+        task.title                 = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        task.taskDescription       = description
+        task.priority              = priority
+        task.effortEstimateMinutes = effortMinutes
+        task.dueDate               = hasDueDate ? dueDate : nil
+    }
+}
+
+// MARK: - Supporting card views
 
 private struct DailyBriefCard: View {
     let brief: DailyBriefItem
@@ -384,10 +476,13 @@ private struct ReflowPlanView: View {
                         }
                     }
                 }
+            } else {
+                Text("No tasks to reflow.")
+                    .foregroundStyle(.secondary)
             }
             HStack {
                 Spacer()
-                Button("Reject") { dismiss() }
+                Button("Cancel") { dismiss() }
                     .buttonStyle(OrinSecondaryButtonStyle())
                 Button("Apply", action: onApply)
                     .buttonStyle(OrinPrimaryButtonStyle())

@@ -11,6 +11,7 @@ struct BacklogView: View {
     private var backlogItems: [TaskItem]
 
     @State private var isAddingBacklogItem = false
+    @State private var taskToEdit: TaskItem?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -27,18 +28,30 @@ struct BacklogView: View {
 
             List {
                 ForEach(backlogItems) { item in
-                    TaskRowView(task: item, showsDescription: true)
-                        .contextMenu {
-                            Button("Activate Today") { activate(item) }
-                            Button("Delete", role: .destructive) { delete(item) }
-                        }
+                    TaskRowView(
+                        task: item,
+                        showsDescription: true,
+                        onEdit: { taskToEdit = item },
+                        onDelete: { delete(item) },
+                        onBreakIntoSubtasks: { addDefaultSubtasks(to: item) },
+                        onActivate: { activate(item) }
+                    )
+                    .listRowSeparator(.hidden)
+                    .listRowBackground(Color.clear)
                 }
             }
+            .listStyle(.plain)
         }
         .padding()
         .sheet(isPresented: $isAddingBacklogItem) {
             TaskEditorView(title: "Create Backlog Items", defaultDueDate: nil) { drafts in
                 save(drafts)
+            }
+        }
+        .sheet(item: $taskToEdit) { item in
+            TaskEditSheet(task: item) {
+                try? modelContext.save()
+                taskToEdit = nil
             }
         }
     }
@@ -68,6 +81,16 @@ struct BacklogView: View {
 
     private func delete(_ item: TaskItem) {
         modelContext.delete(item)
+        try? modelContext.save()
+    }
+
+    private func addDefaultSubtasks(to task: TaskItem) {
+        guard task.subtasks.isEmpty else { return }
+        task.subtasks = [
+            SubTaskItem(title: "Clarify outcome"),
+            SubTaskItem(title: "Do first pass"),
+            SubTaskItem(title: "Review and send")
+        ]
         try? modelContext.save()
     }
 }

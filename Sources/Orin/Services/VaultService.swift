@@ -19,11 +19,19 @@ final class VaultService: Service {
 
     func unlockVault() async -> Result<SymmetricKey, VaultError> {
         let context = LAContext()
+        var biometricError: NSError?
+        // Prefer biometrics-only to avoid the double-prompt from deviceOwnerAuthentication.
+        // Fall back to password-only if biometrics are unavailable.
+        let policy: LAPolicy = context.canEvaluatePolicy(
+            .deviceOwnerAuthenticationWithBiometrics, error: &biometricError
+        ) ? .deviceOwnerAuthenticationWithBiometrics : .deviceOwnerAuthentication
+
+        let reason = policy == .deviceOwnerAuthenticationWithBiometrics
+            ? "Use Touch ID to unlock your Orin Vault."
+            : "Enter your password to unlock your Orin Vault."
+
         do {
-            let success = try await context.evaluatePolicy(
-                .deviceOwnerAuthentication,
-                localizedReason: "Authenticate to unlock your secure vault."
-            )
+            let success = try await context.evaluatePolicy(policy, localizedReason: reason)
             guard success else { return .failure(.authenticationFailed) }
             return .success(try retrieveOrCreateMasterKey())
         } catch {
@@ -38,6 +46,21 @@ final class VaultService: Service {
     func decrypt(_ cipherText: Data, using key: SymmetricKey) throws -> Data {
         let sealedBox = try AES.GCM.SealedBox(combined: cipherText)
         return try AES.GCM.open(sealedBox, using: key)
+    }
+
+    /// Returns a human-readable recovery key (hex groups) derived from the vault master key.
+    /// Show this to the user once on first setup so they can recover data if biometrics change.
+    func recoveryKeyString(from key: SymmetricKey) -> String {
+        let hex = key.withUnsafeBytes { Data($0) }
+            .map { String(format: "%02X", $0) }
+            .joined()
+        // Format as 8-character groups separated by dashes
+        var result = ""
+        for (i, char) in hex.enumerated() {
+            if i > 0 && i % 8 == 0 { result += "-" }
+            result.append(char)
+        }
+        return result
     }
 
     private func retrieveOrCreateMasterKey() throws -> SymmetricKey {
