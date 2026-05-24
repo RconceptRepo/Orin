@@ -111,9 +111,9 @@ struct OrinShortcutsProvider: AppShortcutsProvider {
         AppShortcut(
             intent: AddTaskIntent(),
             phrases: [
-                "Add task \(\.$task) in \(.applicationName)",
-                "Add \(\.$task) to \(.applicationName)",
-                "Create task \(\.$task) in \(.applicationName)"
+                "Add a task in \(.applicationName)",
+                "Add task in \(.applicationName)",
+                "Create task in \(.applicationName)"
             ],
             shortTitle: "Add Task",
             systemImageName: "plus.circle"
