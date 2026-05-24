@@ -68,7 +68,9 @@ struct VaultView: View {
                 ContentUnavailableView(
                     "Vault Locked",
                     systemImage: "lock.shield",
-                    description: Text("Tap Unlock to authenticate with Touch ID or your device password.")
+                    description: Text(vaultService.canUseBiometrics
+                        ? "Tap Unlock to authenticate with Touch ID. Your password is used as a fallback if Touch ID is unavailable."
+                        : "Tap Unlock and enter your device password to access the vault.")
                 )
             } else {
                 HSplitView {
@@ -123,12 +125,17 @@ struct VaultView: View {
                 recoveryKeyString = vaultService.recoveryKeyString(from: key)
                 showingRecoveryKey = true
             }
-        case .failure:
-            errorMessage = "Vault unlock failed. Ensure Touch ID or a device password is configured in System Settings."
+        case .failure(.userCancelled):
+            break  // User dismissed the prompt — show nothing
+        case .failure(.authenticationFailed):
+            errorMessage = "Authentication failed. Ensure Touch ID or a device password is configured in System Settings."
+        case .failure(.keychainError(let status)):
+            errorMessage = "Keychain error (\(status)). Try restarting the app."
         }
     }
 
     private func lock() {
+        vaultService.clearSession()
         vaultKey = nil
         selectedItemID = nil
         revealedSecret = ""
