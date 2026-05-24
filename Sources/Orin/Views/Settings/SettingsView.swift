@@ -10,6 +10,7 @@ struct SettingsView: View {
     @State private var aiTester        = ServiceContainer.shared.resolve(AIProviderTestService.self)
     @State private var loginItemService = ServiceContainer.shared.resolve(LoginItemService.self)
     @State private var ollamaInstaller  = ServiceContainer.shared.resolve(OllamaInstallerService.self)
+    @State private var vaultService    = ServiceContainer.shared.resolve(VaultService.self)
     @State private var showOllamaSetup  = false
 
     // Key drafts — held only long enough to be saved to Keychain, never persisted elsewhere
@@ -153,6 +154,7 @@ struct SettingsView: View {
                 LabeledContent("Default AI Mode", value: providerRaw == AIProvider.ollama.rawValue ? "Local only" : "External with local fallover")
                 LabeledContent("Calendar Source", value: "EventKit (local)")
                 LabeledContent("Vault Storage", value: "On-device AES-256-GCM")
+                LabeledContent("Vault Recovery Key", value: vaultService.hasVerificationToken ? "Registered" : "Not yet registered")
                 LabeledContent("Transcription", value: "On-device via SFSpeechRecognizer")
             }
 
