@@ -24,6 +24,13 @@ struct RecordingWidgetView: View {
                 Text(recordingService.durationText)
                     .font(OrinFont.caption)
                     .foregroundStyle(.secondary)
+                if !recordingService.transcript.isEmpty {
+                    Text(String(recordingService.transcript.suffix(60)))
+                        .font(OrinFont.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.head)
+                }
             }
             Spacer()
             Button(action: onStop) {
@@ -33,7 +40,8 @@ struct RecordingWidgetView: View {
             .buttonStyle(.plain)
         }
         .padding(.horizontal, 16)
-        .frame(width: 220, height: 52)
+        .padding(.vertical, 10)
+        .frame(width: 260)
         .background(.regularMaterial)
         .clipShape(Capsule())
         .shadow(color: .black.opacity(0.18), radius: 14, x: 0, y: 6)

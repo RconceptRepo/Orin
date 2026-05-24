@@ -1,13 +1,16 @@
+import SwiftData
 import SwiftUI
 
 struct MainContainerView: View {
     @AppStorage("orin.theme.mode") private var themeModeRawValue = OrinThemeMode.system.rawValue
     @AppStorage("orin.calendar.backgroundSync") private var calendarBackgroundSync = true
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.modelContext) private var modelContext
     @State private var selectedModule: SidebarModule = .today
     @State private var recordingService = ServiceContainer.shared.resolve(RecordingService.self)
     @State private var meetingDetector = ServiceContainer.shared.resolve(MeetingDetectorService.self)
     @State private var calendarService = ServiceContainer.shared.resolve(CalendarService.self)
+    @State private var activeRecordingMeeting: MeetingItem?
 
     enum SidebarModule: Hashable, CaseIterable {
         case today
@@ -62,7 +65,18 @@ struct MainContainerView: View {
                             appName: appName,
                             onStart: {
                                 Task { @MainActor in
-                                    await recordingService.startRecording()
+                                    let formatter = DateFormatter()
+                                    formatter.dateStyle = .short
+                                    formatter.timeStyle = .short
+                                    let meeting = MeetingItem(
+                                        title: "Meeting — \(formatter.string(from: Date()))",
+                                        date: Date()
+                                    )
+                                    modelContext.insert(meeting)
+                                    try? modelContext.save()
+                                    activeRecordingMeeting = meeting
+                                    selectedModule = .meetings
+                                    await recordingService.startRecording(for: meeting.id)
                                     meetingDetector.dismissPrompt()
                                 }
                             },
@@ -75,6 +89,7 @@ struct MainContainerView: View {
                             recordingService.stopRecording()
                         }
                     }
+
                 }
                 .padding(24)
             }
@@ -95,6 +110,16 @@ struct MainContainerView: View {
             } else {
                 calendarService.stopBackgroundSync()
             }
+        }
+        .onChange(of: recordingService.isRecording) { _, isNow in
+            guard !isNow, let meeting = activeRecordingMeeting else { return }
+            meeting.transcript = recordingService.transcript
+            meeting.durationSeconds = TimeInterval(recordingService.elapsedSeconds)
+            if let url = recordingService.recordingURL {
+                meeting.audioFilePath = url.path
+            }
+            try? modelContext.save()
+            activeRecordingMeeting = nil
         }
     }
 

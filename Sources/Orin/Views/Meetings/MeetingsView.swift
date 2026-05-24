@@ -75,6 +75,7 @@ private struct MeetingDetailView: View {
     @State private var isImportingTranscript = false
     @State private var errorMessage: String?
     @State private var recordingService = ServiceContainer.shared.resolve(RecordingService.self)
+    @State private var wasRecordingThisMeeting = false
 
     private let intelligence = ServiceContainer.shared.resolve(MeetingIntelligenceService.self)
 
@@ -131,10 +132,6 @@ private struct MeetingDetailView: View {
                                     Spacer()
                                     Button("Stop Recording") {
                                         recordingService.stopRecording()
-                                        if let url = recordingService.recordingURL {
-                                            meeting.audioFilePath = url.path
-                                            try? modelContext.save()
-                                        }
                                     }
                                 }
                                 if !recordingService.transcript.isEmpty {
@@ -142,9 +139,6 @@ private struct MeetingDetailView: View {
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                         .lineLimit(3)
-                                        .onChange(of: recordingService.transcript) { _, newValue in
-                                            meeting.transcript = newValue
-                                        }
                                 }
                             }
                         } else {
@@ -158,7 +152,8 @@ private struct MeetingDetailView: View {
                                 }
                                 Spacer()
                                 Button {
-                                    Task { await recordingService.startRecording() }
+                                    wasRecordingThisMeeting = true
+                                    Task { await recordingService.startRecording(for: meeting.id) }
                                 } label: {
                                     Label("Start Recording", systemImage: "record.circle")
                                 }
@@ -246,6 +241,19 @@ private struct MeetingDetailView: View {
             }
         }
         .padding()
+        .onChange(of: recordingService.transcript) { _, newValue in
+            guard wasRecordingThisMeeting else { return }
+            meeting.transcript = newValue
+        }
+        .onChange(of: recordingService.isRecording) { _, isNow in
+            guard !isNow, wasRecordingThisMeeting else { return }
+            wasRecordingThisMeeting = false
+            meeting.durationSeconds = TimeInterval(recordingService.elapsedSeconds)
+            if let url = recordingService.recordingURL {
+                meeting.audioFilePath = url.path
+            }
+            try? modelContext.save()
+        }
         .fileImporter(
             isPresented: $isImportingTranscript,
             allowedContentTypes: [.plainText, .text],
