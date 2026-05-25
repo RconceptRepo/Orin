@@ -3,12 +3,39 @@ import Foundation
 import Observation
 import Speech
 
+// MARK: - RecordingService
+
 @Observable
 final class RecordingService: Service, @unchecked Sendable {
 
+    // MARK: - Recording phase
+
+    /// Deterministic four-state lifecycle for a recording session.
+    ///
+    /// Allowed transitions:
+    ///   idle → starting  (`startRecording` accepted)
+    ///   starting → recording  (engine running)
+    ///   starting → idle  (permission denied, hardware error)
+    ///   recording → stopping  (`stopRecording` called)
+    ///   stopping → idle  (teardown complete)
+    ///
+    /// Any call to `startRecording` when `phase != .idle` is a no-op.
+    /// Any call to `stopRecording` when `phase` is `.idle` or `.stopping` is a no-op.
+    enum Phase: Equatable {
+        case idle
+        case starting
+        case recording
+        case stopping
+    }
+
     // MARK: - Public state
 
-    private(set) var isRecording = false
+    private(set) var phase: Phase = .idle
+
+    /// Convenience alias; equivalent to `phase == .recording`.
+    /// Computed so it is always consistent with `phase`.
+    var isRecording: Bool { phase == .recording }
+
     private(set) var elapsedSeconds: Int = 0
     private(set) var transcript = ""
     private(set) var recordingURL: URL?
@@ -29,15 +56,39 @@ final class RecordingService: Service, @unchecked Sendable {
         SFSpeechRecognizer.authorizationStatus() == .authorized
     }
 
-    // MARK: - Private
+    // MARK: - Private — main-actor-only state
 
-    private let audioEngine = AVAudioEngine()
-    private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
+    /// Lazy so `AVAudioEngine` does not spin up Core-Audio background threads
+    /// until the first `startRecording` call.  Eager initialisation caused a
+    /// signal-6 crash in the test suite ~9 test-durations after creation, when
+    /// the HAL's background thread fired an assertion.
+    /// `stopRecording` returns early via the phase guard before accessing this
+    /// property, so lazy initialisation is safe for the idle → recording path.
+    @ObservationIgnored
+    private lazy var audioEngine = AVAudioEngine()
+
+    /// Lazy for the same reason: `SFSpeechRecognizer(locale:)` also starts
+    /// background framework work that corrupts the allocator in test environments.
+    /// Only accessed from `@MainActor` paths so the non-thread-safe `lazy` is safe.
+    @ObservationIgnored
+    private lazy var speechRecognizer: SFSpeechRecognizer? = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+
     private var recognitionTask: SFSpeechRecognitionTask?
-    private let speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
-    private var audioFile: AVAudioFile?
     private var durationTimer: Timer?
     private var transcriptPrefix = ""
+
+    // MARK: - Private — cross-thread state
+
+    /// All state shared between the MainActor and the real-time Core-Audio I/O
+    /// thread is funnelled through this lock-protected container.
+    ///
+    /// `@ObservationIgnored` prevents the `@Observable` macro from wrapping
+    /// this constant with observation accessors — it is a `let` and therefore
+    /// never re-assigned, but the annotation makes the intent explicit.
+    @ObservationIgnored
+    private let tapState = TapState()
+
+    // MARK: - Lifecycle
 
     deinit {
         durationTimer?.invalidate()
@@ -56,47 +107,77 @@ final class RecordingService: Service, @unchecked Sendable {
 
     @MainActor
     func startRecording(for meetingID: UUID? = nil) async {
+        // ── Re-entrancy guard ─────────────────────────────────────────────────
+        // Only `.idle` is an accepted entry point.  Any in-progress state
+        // (starting, recording, stopping) causes the call to be silently dropped.
+        // This prevents a second `installTap` on the same bus, which raises an
+        // unrecoverable NSException: "required condition is false: nullptr == Tap()".
+        guard phase == .idle else { return }
+        phase = .starting
+        // ─────────────────────────────────────────────────────────────────────
+
         errorMessage = nil
         recordingURL = nil
 
+        // `requestPermissions()` suspends this function and allows other
+        // @MainActor work to run (e.g. the auto-detection prompt calling
+        // `startRecording` independently).  Re-confirm the phase is still
+        // `.starting` before proceeding with hardware setup.
         if !hasMicPermission || !hasSpeechPermission {
             await requestPermissions()
         }
 
+        guard phase == .starting else { return }
+
         guard hasMicPermission else {
             errorMessage = "Microphone access denied. Enable it in System Settings → Privacy & Security → Microphone."
+            phase = .idle
             return
         }
         guard hasSpeechPermission else {
             errorMessage = "Speech Recognition access denied. Enable it in System Settings → Privacy & Security → Speech Recognition."
+            phase = .idle
             return
         }
         guard let recognizer = speechRecognizer, recognizer.isAvailable else {
             errorMessage = "Speech recognition is unavailable on this device."
+            phase = .idle
             return
         }
 
         activeMeetingID = meetingID
         transcriptPrefix = ""
 
-        // prepare() must be called before querying inputNode format so the hardware
-        // is initialised and outputFormat(forBus:) returns a valid non-zero format.
+        // `prepare()` must precede the format query so the audio hardware
+        // driver initialises and `outputFormat(forBus:)` returns a non-zero rate.
         audioEngine.prepare()
         let inputNode = audioEngine.inputNode
-        let format = inputNode.outputFormat(forBus: 0)
+        let format    = inputNode.outputFormat(forBus: 0)
 
+        // Create the on-disk file before arming the tap state.  If this fails,
+        // no tap is installed and no hardware is left in a partial state.
+        let audioFile: AVAudioFile
         do {
             audioFile = try makeAudioFile(format: format)
         } catch {
             errorMessage = "Could not create audio file: \(error.localizedDescription)"
+            phase = .idle
             return
         }
 
-        startRecognitionSession(with: recognizer)
+        // Arm the tap state **before** calling `installTap`.  The Core-Audio
+        // callback may fire immediately after installation; both `audioFile` and
+        // `recognitionRequest` must already be valid at that moment.
+        let initialRequest = buildRecognitionRequest(recognizer: recognizer)
+        tapState.arm(audioFile: audioFile, recognitionRequest: initialRequest)
 
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-            self?.recognitionRequest?.append(buffer)
-            try? self?.audioFile?.write(from: buffer)
+        startRecognitionTask(with: recognizer, request: initialRequest)
+
+        // The tap closure captures `tapState` by value (strong reference to the
+        // object), not `self`.  This avoids touching any @Observable state from
+        // the audio thread.
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [tapState] buffer, _ in
+            tapState.feed(buffer: buffer)
         }
 
         do {
@@ -104,13 +185,16 @@ final class RecordingService: Service, @unchecked Sendable {
         } catch {
             teardownAudioEngine()
             errorMessage = "Audio engine failed to start: \(error.localizedDescription)"
+            phase = .idle
             return
         }
 
-        isRecording = true
+        phase = .recording
         elapsedSeconds = 0
         transcript = ""
 
+        // The timer is scheduled on the main run loop so its callback fires on
+        // the main thread, keeping @Observable state mutations on MainActor.
         durationTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             self?.elapsedSeconds += 1
         }
@@ -118,21 +202,33 @@ final class RecordingService: Service, @unchecked Sendable {
 
     @MainActor
     func stopRecording() {
+        // Idempotency guard — safe to call from any code path, including error
+        // handlers, without risking a double-teardown or double-removeTap crash.
+        guard phase == .recording || phase == .starting else { return }
+        phase = .stopping
+
         durationTimer?.invalidate()
         durationTimer = nil
 
         audioEngine.stop()
+
+        // `removeTap` must precede `disarm` so that `feed` cannot be executing
+        // on the audio thread while the tap state is being cleared.
         audioEngine.inputNode.removeTap(onBus: 0)
-        recognitionRequest?.endAudio()
+
+        // Cancel the recognition task **before** `disarm` calls `endAudio` so
+        // the final-result callback sees `isRecording == false` and does not
+        // attempt a transparent session restart.
         recognitionTask?.cancel()
-        recognitionRequest = nil
         recognitionTask = nil
 
-        // Set recordingURL before clearing the file reference so callers can persist it.
-        recordingURL = audioFile?.url
-        audioFile = nil
-        isRecording = false
+        // `disarm` signals end-of-audio to the recogniser and releases the file.
+        tapState.disarm()
+
+        // `audioFileURL` is preserved inside TapState after `disarm`; read it now.
+        recordingURL    = tapState.audioFileURL
         activeMeetingID = nil
+        phase = .idle
     }
 
     @MainActor
@@ -142,17 +238,26 @@ final class RecordingService: Service, @unchecked Sendable {
 
     // MARK: - Recognition session management
 
-    // Starts (or restarts after ~60 s network limit) a SFSpeechRecognitionTask.
-    // Called on MainActor so all @Observable state mutations stay on the main thread.
-    @MainActor
-    private func startRecognitionSession(with recognizer: SFSpeechRecognizer) {
+    /// Constructs a new recognition request configured for the given recogniser.
+    private func buildRecognitionRequest(
+        recognizer: SFSpeechRecognizer
+    ) -> SFSpeechAudioBufferRecognitionRequest {
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
         if recognizer.supportsOnDeviceRecognition {
             request.requiresOnDeviceRecognition = true
         }
-        recognitionRequest = request
+        return request
+    }
 
+    /// Starts a `SFSpeechRecognitionTask` for `request` and stores it in
+    /// `recognitionTask`.  The callback transparently restarts the session
+    /// when Apple's ~60-second network limit is reached.
+    @MainActor
+    private func startRecognitionTask(
+        with recognizer: SFSpeechRecognizer,
+        request: SFSpeechAudioBufferRecognitionRequest
+    ) {
         recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -164,20 +269,25 @@ final class RecordingService: Service, @unchecked Sendable {
                         : self.transcriptPrefix + segment
                 }
 
+                // Apple's network recogniser ends sessions at ~60 s.
+                // Accumulate the finalised text and restart transparently.
+                // Guard on `isRecording` so a teardown-triggered final result
+                // does not re-arm a new session.
                 if result?.isFinal == true, self.isRecording {
-                    // Apple's network recognizer ends sessions around 60 s.
-                    // Accumulate the finalised text and restart transparently.
                     if !self.transcript.isEmpty {
                         self.transcriptPrefix = self.transcript + " "
                     }
-                    self.recognitionRequest = nil
+                    let nextRequest = self.buildRecognitionRequest(recognizer: recognizer)
+                    // Swap the live request inside TapState so the audio callback
+                    // feeds the new session from the very next buffer.
+                    self.tapState.updateRequest(nextRequest)
                     self.recognitionTask = nil
-                    self.startRecognitionSession(with: recognizer)
+                    self.startRecognitionTask(with: recognizer, request: nextRequest)
                 }
 
                 if let error, self.isRecording {
                     let nsError = error as NSError
-                    // Code 301 (kAFAssistantErrorDomain) fires when we cancel — not a real error.
+                    // Code 301 (kAFAssistantErrorDomain) fires on cancellation — not a real error.
                     if nsError.code != 301 {
                         self.errorMessage = "Speech recognition error: \(error.localizedDescription)"
                     }
@@ -188,22 +298,42 @@ final class RecordingService: Service, @unchecked Sendable {
 
     // MARK: - Helpers
 
+    /// Tears down the audio engine after a mid-startup failure.
+    /// Safe to call when no tap is installed (removeTap on an untapped bus is a no-op).
     private func teardownAudioEngine() {
         audioEngine.inputNode.removeTap(onBus: 0)
-        recognitionRequest?.endAudio()
         recognitionTask?.cancel()
-        recognitionRequest = nil
         recognitionTask = nil
-        audioFile = nil
+        tapState.disarm()
     }
 
+    /// Creates the CAF file that audio buffers are written to during recording.
+    ///
+    /// - Throws: `RecordingError.noApplicationSupportDirectory` if the standard
+    ///   directory cannot be resolved (e.g. sandbox container not yet provisioned).
+    /// - Throws: Any `AVAudioFile` or `FileManager` error on I/O failure.
     private func makeAudioFile(format: AVAudioFormat) throws -> AVAudioFile {
-        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        guard let support = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+        else {
+            throw RecordingError.noApplicationSupportDirectory
+        }
         let dir = support.appendingPathComponent("Orin/Recordings", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withFullDate, .withTime, .withColonSeparatorInTime]
         let name = "meeting-\(formatter.string(from: Date())).caf"
         return try AVAudioFile(forWriting: dir.appendingPathComponent(name), settings: format.settings)
+    }
+
+    // MARK: - Error type
+
+    enum RecordingError: LocalizedError {
+        case noApplicationSupportDirectory
+
+        var errorDescription: String? {
+            "Unable to locate the Application Support directory. "
+            + "Ensure the app is signed and running in its expected sandbox container."
+        }
     }
 }
