@@ -223,11 +223,27 @@ final class RecordingService: Service, @unchecked Sendable {
         recognitionTask = nil
 
         // `disarm` signals end-of-audio to the recogniser and releases the file.
+        // Releasing `AVAudioFile` here closes and flushes all pending writes to disk,
+        // so the file-size validation below reflects the final committed state.
         tapState.disarm()
 
         // `audioFileURL` is preserved inside TapState after `disarm`; read it now.
         recordingURL    = tapState.audioFileURL
         activeMeetingID = nil
+
+        // Surface any audio-file write failures that were recorded during the session.
+        // Checked here (after disarm) because disarm flushes the file — only after
+        // the file handle is closed can the on-disk size reflect reality.
+        if tapState.hadWriteFailure {
+            errorMessage = "Recording saved, but some audio data could not be written. "
+                         + "The file may be incomplete — check available disk space."
+        } else if let url = recordingURL,
+                  let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+                  let size  = attrs[.size] as? Int, size == 0 {
+            errorMessage = "Recording completed but the audio file is empty. "
+                         + "Check available disk space and try again."
+        }
+
         phase = .idle
     }
 

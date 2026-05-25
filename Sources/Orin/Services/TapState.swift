@@ -29,21 +29,47 @@ final class TapState {
     /// URL is stored separately so callers can read it after `disarm` closes the file.
     private var _audioFileURL: URL?
 
+    /// Set to `true` inside `feed` if any `AVAudioFile.write(from:)` call throws.
+    /// Reset to `false` in `arm` so each new recording session starts clean.
+    private var _hasWriteFailure = false
+
     // MARK: - Public interface
 
     /// The URL written to during the active recording.
     /// Safe to read from any thread; returns `nil` until `arm` is first called.
     var audioFileURL: URL? { lock.withLock { _audioFileURL } }
 
+    /// `true` if at least one `AVAudioFile.write(from:)` call failed during the session.
+    /// Thread-safe; read after `disarm` returns to determine whether the recording
+    /// is likely incomplete or corrupt before saving the file path to the model.
+    var hadWriteFailure: Bool { lock.withLock { _hasWriteFailure } }
+
+#if DEBUG
+    // MARK: - Testing support
+
+    /// Marks the current session as having a write failure.
+    ///
+    /// **For testing only.** Reliably triggering `AVAudioFile.write(from:)` to
+    /// throw in a unit-test environment requires hardware I/O conditions (full
+    /// disk, revoked permissions) that are impractical to reproduce.  This method
+    /// sets the flag directly under the lock so tests can verify that callers
+    /// (`stopRecording`) correctly act on it — without simulating real I/O.
+    func testOnly_recordWriteFailure() {
+        lock.withLock { _hasWriteFailure = true }
+    }
+#endif
+
     /// Arm both resources. Call on MainActor **before** `installTap`.
+    /// Resets the write-failure flag so a new session always starts clean.
     func arm(
         audioFile: AVAudioFile,
         recognitionRequest: SFSpeechAudioBufferRecognitionRequest
     ) {
         lock.withLock {
-            self.audioFile        = audioFile
-            self._audioFileURL    = audioFile.url
+            self.audioFile          = audioFile
+            self._audioFileURL      = audioFile.url
             self.recognitionRequest = recognitionRequest
+            self._hasWriteFailure   = false
         }
     }
 
@@ -66,10 +92,17 @@ final class TapState {
     }
 
     /// Deliver a captured audio buffer. Called on the Core-Audio I/O thread.
+    ///
+    /// Write errors are recorded in `hadWriteFailure` so `stopRecording` can surface
+    /// them to the user instead of silently producing an incomplete or empty file.
     func feed(buffer: AVAudioPCMBuffer) {
         lock.withLock {
             recognitionRequest?.append(buffer)
-            try? audioFile?.write(from: buffer)
+            do {
+                try audioFile?.write(from: buffer)
+            } catch {
+                _hasWriteFailure = true
+            }
         }
     }
 }

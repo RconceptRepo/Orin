@@ -234,6 +234,23 @@ private struct MeetingDetailView: View {
             }
         }
         .padding()
+        .onAppear {
+            // If the user navigates here while an auto-detected recording is already
+            // in progress for this meeting (started from MainContainerView's prompt),
+            // `wasRecordingThisMeeting` must be set now so the live-transcript and
+            // stop-recording handlers below receive the flag they expect.
+            if recordingService.activeMeetingID == meeting.id {
+                wasRecordingThisMeeting = true
+            }
+        }
+        .onChange(of: recordingService.activeMeetingID) { _, newID in
+            // Handles the case where the recording starts *after* MeetingDetailView
+            // is already on screen — e.g. auto-detection fires while the user has
+            // already navigated to this meeting before the prompt is accepted.
+            if newID == meeting.id {
+                wasRecordingThisMeeting = true
+            }
+        }
         .onChange(of: recordingService.transcript) { _, newValue in
             guard wasRecordingThisMeeting else { return }
             meeting.transcript = newValue

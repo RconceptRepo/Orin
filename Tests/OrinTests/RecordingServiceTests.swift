@@ -163,6 +163,27 @@ final class RecordingServiceTests: XCTestCase {
     func testStartRecordingWhileAlreadyStartingIsNoop() async throws {
         throw XCTSkip("Integration test: requires signed app entitlements — run via the app target")
     }
+
+    // MARK: - activeMeetingID lifecycle (Defect #2 regression — auto-detect live transcript)
+    //
+    // `MeetingDetailView` uses `recordingService.activeMeetingID` in `.onAppear`
+    // and `.onChange(of: activeMeetingID)` to set `wasRecordingThisMeeting = true`
+    // when a recording is started via MainContainerView's auto-detection prompt
+    // rather than the in-view "Start Recording" button.
+    //
+    // The service-level contract: `activeMeetingID` must match the `meetingID`
+    // passed to `startRecording(for:)` for the duration of the session, and
+    // must be `nil` before and after.  The view tests that depend on this
+    // (navigating to a meeting during an active auto-detected recording) require
+    // a running signed app and cannot be exercised in `swift test`.
+
+    func testActiveMeetingIDMatchesIDPassedToStartRecording() async throws {
+        throw XCTSkip("Integration test: requires signed app entitlements — run via the app target")
+    }
+
+    func testActiveMeetingIDIsNilAfterStopRecording() async throws {
+        throw XCTSkip("Integration test: requires signed app entitlements — run via the app target")
+    }
 }
 
 // MARK: - TapState unit tests
@@ -321,6 +342,77 @@ final class TapStateTests: XCTestCase {
     func testDisarmWithoutArmDoesNotCrash() {
         let state = TapState()
         state.disarm()
+    }
+
+    // MARK: - Write failure detection (Defect #1 regression tests)
+    //
+    // `TapState.feed` now propagates `AVAudioFile.write(from:)` errors to a
+    // thread-safe `hadWriteFailure` flag instead of silently discarding them
+    // via `try?`.  These tests confirm the flag is correctly initialised,
+    // set on error, and cleared on re-arm.
+
+    func testHadWriteFailureIsFalseBeforeArm() {
+        XCTAssertFalse(TapState().hadWriteFailure)
+    }
+
+    func testHadWriteFailureIsFalseAfterSuccessfulWrite() throws {
+        let state  = TapState()
+        let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1)!
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 512)!
+
+        let (file, url) = try makeTempAudioFile()
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        state.arm(audioFile: file, recognitionRequest: SFSpeechAudioBufferRecognitionRequest())
+        state.feed(buffer: buffer)
+        XCTAssertFalse(state.hadWriteFailure)
+    }
+
+    /// Confirms that the write-failure flag is observable after being set.
+    ///
+    /// `AVAudioFile.write(from:)` will silently perform sample-rate conversion
+    /// rather than throw on common format mismatches, making it impractical to
+    /// trigger a real I/O error in a unit test.  `testOnly_recordWriteFailure()`
+    /// sets the flag directly (under the same lock used by `feed`) so we can
+    /// verify that the flag is readable and correctly reflected by `hadWriteFailure`.
+    func testHadWriteFailureIsTrueAfterRecordedFailure() {
+        let state = TapState()
+        state.testOnly_recordWriteFailure()
+        XCTAssertTrue(state.hadWriteFailure,
+                      "hadWriteFailure must be true after testOnly_recordWriteFailure()")
+    }
+
+    /// Re-arming for a new session must clear the failure flag so a previously
+    /// failed recording does not poison the next session's error reporting.
+    func testHadWriteFailureIsResetOnRearm() throws {
+        let state = TapState()
+
+        // Session 1 — mark a failure via the test hook.
+        state.testOnly_recordWriteFailure()
+        XCTAssertTrue(state.hadWriteFailure, "Pre-condition: failure flag must be set")
+
+        // Session 2 — re-arm must clear the failure flag.
+        let (file, url) = try makeTempAudioFile()
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        state.arm(audioFile: file, recognitionRequest: SFSpeechAudioBufferRecognitionRequest())
+        XCTAssertFalse(state.hadWriteFailure,
+                       "Re-arm must reset hadWriteFailure for the new session")
+    }
+
+    func testHadWriteFailureIsFalseAfterDisarm() throws {
+        let state  = TapState()
+        let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1)!
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 512)!
+
+        let (file, url) = try makeTempAudioFile()
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        state.arm(audioFile: file, recognitionRequest: SFSpeechAudioBufferRecognitionRequest())
+        state.feed(buffer: buffer)
+        state.disarm()
+        // A successful session must leave hadWriteFailure false even after disarm.
+        XCTAssertFalse(state.hadWriteFailure)
     }
 
     // MARK: - Helpers
