@@ -28,6 +28,11 @@ final class VaultService: Service {
 
     private var sessionKey: SymmetricKey?
     private var sessionExpiry: Date = .distantPast
+    /// The `LAContext` that was evaluated when the vault was last unlocked.
+    /// Retained so that `resetVault()` can include it in the `SecItemDelete`
+    /// query, allowing the Keychain daemon to authorise deletion of an item
+    /// protected by `.userPresence` access control without a new prompt.
+    private var sessionContext: LAContext?
 
     // MARK: - Public API
 
@@ -41,6 +46,7 @@ final class VaultService: Service {
     func clearSession() {
         sessionKey = nil
         sessionExpiry = .distantPast
+        sessionContext = nil
     }
 
     /// Authenticates the user and returns the vault master key.
@@ -168,21 +174,58 @@ final class VaultService: Service {
 
         sessionKey = key
         sessionExpiry = Date().addingTimeInterval(sessionDuration)
+        sessionContext = context   // re-link also establishes a valid session context
         return .success(())
     }
 
-    /// Removes the master key from keychain and resets all vault state.
-    /// Encrypted items in SwiftData must be deleted by the caller —
-    /// they cannot be decrypted after this call.
-    func resetVault() {
-        let deleteQuery: [String: Any] = [
-            kSecClass as String:   kSecClassGenericPassword,
+    /// Removes the master key from the Keychain and resets all vault state.
+    ///
+    /// Encrypted items in SwiftData must be deleted by the caller — they cannot
+    /// be decrypted after this call returns `.success`.
+    ///
+    /// - Parameter context: An already-evaluated `LAContext` from the active
+    ///   session. When provided it is included in the `SecItemDelete` query so
+    ///   the Keychain daemon can authorise deletion of a `.userPresence`-protected
+    ///   item without raising a new authentication prompt.  Pass `nil` (or omit)
+    ///   to use the internally cached session context; if no cached context exists
+    ///   the query runs without one, which succeeds when no item is present.
+    ///
+    /// - Returns: `.success(())` when the item was deleted or was already absent.
+    ///   `.failure(.keychainError(status))` for any other Keychain status, including
+    ///   `errSecInteractionNotAllowed` (context cannot silently authorise deletion)
+    ///   and `errSecAuthFailed` (provided context was rejected). On failure the
+    ///   verification token and brute-force state are **not** cleared so the caller
+    ///   can surface the error and let the user retry without data loss.
+    @discardableResult
+    func resetVault(context: LAContext? = nil) -> Result<Void, VaultError> {
+        let effectiveContext = context ?? sessionContext
+
+        var deleteQuery: [String: Any] = [
+            kSecClass as String:       kSecClassGenericPassword,
             kSecAttrService as String: keychainServiceKey
         ]
-        SecItemDelete(deleteQuery as CFDictionary)
+        if let ctx = effectiveContext {
+            // Supplying the already-evaluated context lets the Keychain daemon
+            // skip its own authentication prompt and complete the delete silently.
+            deleteQuery[kSecUseAuthenticationContext as String] = ctx
+        }
+
+        let deleteStatus = SecItemDelete(deleteQuery as CFDictionary)
+
+        // errSecSuccess (-0):      Item found and deleted.
+        // errSecItemNotFound (-25300): Nothing to delete — treat as success.
+        // errSecInteractionNotAllowed (-25308): Context cannot authorise silently.
+        // errSecAuthFailed (-25293): Context authentication was rejected.
+        // Any other status: surface to the caller unchanged.
+        guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
+            return .failure(.keychainError(deleteStatus))
+        }
+
+        // Keychain item is gone (or was never there); wipe all associated state.
         UserDefaults.standard.removeObject(forKey: verificationTokenUDKey)
         resetFailCount()
         clearSession()
+        return .success(())
     }
 
     // MARK: - Encryption (AES-GCM, 256-bit)
@@ -233,7 +276,9 @@ final class VaultService: Service {
                 .deviceOwnerAuthenticationWithBiometrics,
                 localizedReason: "Use Touch ID to unlock your Orin Vault."
             )
-            return .success(try masterKey(context: context))
+            let key = try masterKey(context: context)
+            sessionContext = context   // cache for later use by resetVault()
+            return .success(key)
         } catch let laError as LAError {
             switch laError.code {
             case .userCancel, .appCancel, .systemCancel:
@@ -256,7 +301,9 @@ final class VaultService: Service {
             : "Enter your password to unlock your Orin Vault."
         do {
             try await context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason)
-            return .success(try masterKey(context: context))
+            let key = try masterKey(context: context)
+            sessionContext = context   // cache for later use by resetVault()
+            return .success(key)
         } catch let laError as LAError {
             switch laError.code {
             case .userCancel, .appCancel, .systemCancel:

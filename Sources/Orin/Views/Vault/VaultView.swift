@@ -283,14 +283,26 @@ struct VaultView: View {
     }
 
     private func performVaultReset() {
-        for item in vaultItems { modelContext.delete(item) }
-        modelContext.safeSave(context: "vault reset")
-        vaultService.resetVault()
-        recoveryKeyShown = false
-        vaultKey = nil
-        selectedItemID = nil
-        revealedSecret = ""
-        unlockedViaRecovery = false
+        // Attempt the keychain delete first, using the cached session context so the
+        // Keychain daemon does not re-prompt for authentication. SwiftData items are
+        // only removed after the key is confirmed gone — keeping them encrypted but
+        // intact if the keychain operation fails, so the user can retry or recover.
+        switch vaultService.resetVault() {
+        case .success:
+            for item in vaultItems { modelContext.delete(item) }
+            modelContext.safeSave(context: "vault reset")
+            recoveryKeyShown = false
+            vaultKey = nil
+            selectedItemID = nil
+            revealedSecret = ""
+            unlockedViaRecovery = false
+        case .failure(let error):
+            if case .keychainError(let status) = error {
+                ErrorManager.shared.report(.vaultKeychainFailed(status: status))
+            }
+            // SwiftData items are intentionally NOT deleted — the encrypted content
+            // remains recoverable as long as the key is still in the Keychain.
+        }
     }
 }
 

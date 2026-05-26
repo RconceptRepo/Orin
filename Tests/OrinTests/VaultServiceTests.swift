@@ -285,6 +285,88 @@ final class VaultServiceTests: XCTestCase {
         XCTAssertFalse(vault.isRecoveryLocked)
     }
 
+    // MARK: - Vault reset lifecycle (Issue #5: stale Keychain item after reset)
+    //
+    // These tests exercise the observable state machine around resetVault().
+    // Full keychain-level verification (item truly removed, recreation succeeds)
+    // requires a signed app and is covered by the manual checklist at the bottom
+    // of this file.
+
+    /// In the test environment no Keychain item is present, so SecItemDelete
+    /// returns errSecItemNotFound which resetVault maps to success (§ "already absent").
+    func testResetVaultWithNilContextSucceedsWhenNoItemPresent() {
+        let result = vault.resetVault(context: nil)
+        if case .failure(let err) = result {
+            XCTFail("resetVault must succeed when no item exists in the Keychain: \(err)")
+        }
+    }
+
+    /// After a successful reset the old recovery key string must be rejected —
+    /// the verification token tied to that key is gone.
+    func testResetVaultOldRecoveryKeyRejectedAfterReset() {
+        let originalKey = SymmetricKey(size: .bits256)
+        vault.storeVerificationToken(for: originalKey)
+        let oldKeyStr = vault.recoveryKeyString(from: originalKey)
+
+        vault.resetVault(context: nil)
+
+        XCTAssertNil(
+            vault.verifyAndParseRecoveryKey(oldKeyStr),
+            "Old recovery key must not validate after vault reset"
+        )
+    }
+
+    /// Simulates the Create → Reset → Recreate cycle at the UserDefaults / token
+    /// layer (the part that can be exercised without OS authentication).
+    /// After reset a fresh vault identity can be established without interference
+    /// from the previous token.
+    func testResetVaultAllowsNewVerificationTokenAfterReset() {
+        let key1 = SymmetricKey(size: .bits256)
+        vault.storeVerificationToken(for: key1)
+        vault.resetVault(context: nil)
+        XCTAssertFalse(vault.hasVerificationToken, "Token must be absent after reset")
+
+        // Re-initialise with a new key — mirrors what createMasterKey does on first unlock.
+        let key2 = SymmetricKey(size: .bits256)
+        vault.storeVerificationToken(for: key2)
+        XCTAssertTrue(vault.hasVerificationToken, "New token must be storable after reset")
+
+        // The new recovery key must round-trip correctly against the new token.
+        let newKeyStr = vault.recoveryKeyString(from: key2)
+        XCTAssertNotNil(
+            vault.verifyAndParseRecoveryKey(newKeyStr),
+            "New recovery key must validate after reset + re-initialisation"
+        )
+    }
+
+    /// After reset + re-init the brute-force counter must be at its full quota.
+    /// This guards against the counter state leaking from one vault identity to
+    /// the next and causing a spurious lockout immediately after a reset.
+    func testResetVaultRestoresBruteForceCounterForNewVault() {
+        vault.storeVerificationToken(for: SymmetricKey(size: .bits256))
+        let badKey = String(repeating: "00", count: 64)
+        for _ in 0..<4 { _ = vault.verifyAndParseRecoveryKey(badKey) }
+        XCTAssertEqual(vault.remainingRecoveryAttempts, 1, "Precondition: one attempt left")
+
+        vault.resetVault(context: nil)
+
+        // Establish the new vault identity.
+        vault.storeVerificationToken(for: SymmetricKey(size: .bits256))
+        XCTAssertEqual(
+            vault.remainingRecoveryAttempts, 5,
+            "Brute-force counter must be restored to 5 for the new vault"
+        )
+    }
+
+    /// resetVault is @discardableResult — callers that don't need the result (e.g.
+    /// the lost-key reset path which has no session context) must compile without
+    /// a warning, and the side-effects must still apply.
+    func testResetVaultDiscardableResultStillClearsState() {
+        vault.storeVerificationToken(for: SymmetricKey(size: .bits256))
+        vault.resetVault()   // intentionally not capturing Result
+        XCTAssertFalse(vault.hasVerificationToken, "Token must be cleared even when result is discarded")
+    }
+
     // MARK: - Session management
 
     func testClearSessionDoesNotCrash() {
