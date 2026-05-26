@@ -1,4 +1,5 @@
 import AppKit
+import EventKit
 import Foundation
 import Observation
 
@@ -28,12 +29,21 @@ final class MeetingDetectorService: Service {
         ("company.thebrowser.Browser", "Arc"),
     ]
 
-    let meetingURLPatterns = [
+    let meetingURLPatterns: [String] = [
+        // Google Meet
         "meet.google.com/",
+        // Zoom — direct join, session, and web-client variants
         "zoom.us/j/",
         "zoom.us/s/",
+        "zoom.us/wc/",
+        // Microsoft Teams — consumer, new web, modern direct, and classic join-link
         "teams.live.com",
         "teams.microsoft.com/v2/",
+        "teams.microsoft.com/meet/",
+        "teams.microsoft.com/l/meetup-join",
+        // Webex — browser-hosted meetings
+        "web.webex.com/",
+        "webex.com/meet/",
     ]
 
     // MARK: - Private State
@@ -51,7 +61,39 @@ final class MeetingDetectorService: Service {
     /// Serial queue keeps NSAppleScript calls off the main thread and serialises concurrent access.
     private let scriptQueue = DispatchQueue(label: "com.orin.meeting-detector.applescript", qos: .utility)
 
+    // MARK: - Dependencies
+
+    /// Provides EventKit event data for the calendar-based detection path.
+    /// Injected at init so tests can supply a fresh `CalendarService` without
+    /// requiring EventKit authorization.
+    private let calendarService: CalendarService
+
+    // MARK: - Testing support
+
+    /// Overrides the EventKit query performed by `detectFromCalendar()`.
+    ///
+    /// **For testing only.**  Set this closure before calling `startMonitoring()` to
+    /// inject synthetic `EKEvent` objects without requiring real calendar authorization.
+    /// The closure receives the same `(startDate, endDate)` arguments that would
+    /// normally be passed to `CalendarService.events(from:to:)`.
+    ///
+    /// `nil` (the default) causes `detectFromCalendar()` to use the injected
+    /// `CalendarService` directly.
+    @ObservationIgnored
+    var _calendarEventProviderOverride: ((Date, Date) -> [EKEvent])?
+
     // MARK: - Lifecycle
+
+    /// Creates a `MeetingDetectorService`.
+    ///
+    /// - Parameter calendarService: The `CalendarService` used for EventKit queries in the
+    ///   calendar-based detection path.  Defaults to a fresh instance, which is acceptable
+    ///   in tests (the default `CalendarService` starts with `status == .red` and returns
+    ///   empty event arrays, so calendar detection is a no-op until `_calendarEventProviderOverride`
+    ///   is set or real calendar authorization is granted).
+    init(calendarService: CalendarService = .init()) {
+        self.calendarService = calendarService
+    }
 
     @MainActor
     func startMonitoring() {
@@ -95,7 +137,13 @@ final class MeetingDetectorService: Service {
     // MARK: - Detection pipeline (background-safe)
 
     private func detectMeeting() async -> (app: String, key: String)? {
-        if let native = detectNativeApp() { return native }
+        // Priority order: native app > calendar event > browser tab.
+        //
+        // Native apps are the most reliable signal (the meeting software is running).
+        // Calendar events are proactive (a scheduled meeting is about to start or just started).
+        // Browser tabs catch meetings joined without a native client.
+        if let native   = detectNativeApp()    { return native   }
+        if let calendar = detectFromCalendar() { return calendar }
         return await detectBrowserMeeting()
     }
 
@@ -125,6 +173,104 @@ final class MeetingDetectorService: Service {
                 || title.localizedCaseInsensitiveContains("meeting")
         }
     }
+
+    // MARK: - Calendar detection
+
+    /// Scans EventKit events that overlap the [−2 min, +5 min] window around now
+    /// for a known video-conference URL and returns the first match.
+    ///
+    /// The wide window ensures:
+    ///   - Events that started up to 2 minutes ago are still detected (handles late joins).
+    ///   - Events starting in the next 5 minutes trigger an early prompt.
+    ///
+    /// Called on a cooperative-thread-pool thread (inside `Task.detached` in `poll()`).
+    /// Also safe to call directly from the main actor in tests.
+    ///
+    /// Returns `nil` when:
+    ///   - Calendar access has not been granted (`status == .red`)
+    ///   - No events exist in the window
+    ///   - No events contain a recognised meeting URL
+    func detectFromCalendar() -> (app: String, key: String)? {
+        let now         = Date()
+        let windowStart = now.addingTimeInterval(-(2 * 60))   // 2 minutes before now
+        let windowEnd   = now.addingTimeInterval(  5 * 60)    // 5 minutes ahead
+
+        let events: [EKEvent]
+        if let provider = _calendarEventProviderOverride {
+            events = provider(windowStart, windowEnd)
+        } else {
+            events = calendarService.events(from: windowStart, to: windowEnd)
+        }
+
+        for event in events {
+            guard let info = extractMeetingInfo(from: event) else { continue }
+
+            // Build a session key unique to this calendar occurrence.
+            //
+            // For saved recurring events, `EKEvent.eventIdentifier` is distinct for
+            // each recurrence instance — a Monday standup and Tuesday standup will never
+            // share a key, so dismissing one never suppresses the other.
+            //
+            // For unsaved test events, `eventIdentifier` is an empty string; fall back to
+            // title + start-epoch so tests still get deterministic, stable keys.
+            let rawID = event.eventIdentifier ?? ""
+            let eventID: String
+            if rawID.isEmpty {
+                let epoch = Int(event.startDate.timeIntervalSince1970)
+                eventID = "unsaved_\(event.title ?? "unknown")_\(epoch)"
+            } else {
+                eventID = rawID
+            }
+
+            let key     = "calendar|\(eventID)|\(info.stableURL)"
+            let appName = event.title.map { "\(info.platform) — \($0)" } ?? info.platform
+            return (app: appName, key: key)
+        }
+        return nil
+    }
+
+    /// Scans an `EKEvent`'s metadata fields for the first recognisable
+    /// video-conference URL.
+    ///
+    /// Fields are checked in priority order:
+    ///   1. `EKEvent.url`      — explicit URL set by a calendar client (e.g. Google Calendar)
+    ///   2. `EKEvent.notes`    — free-text body; URL may be embedded in a sentence
+    ///   3. `EKEvent.location` — some calendar apps paste join links here
+    ///
+    /// The returned `stableURL` has query-string and fragment stripped (via `stableKey`)
+    /// so repeated polls for the same meeting produce an identical deduplication key.
+    ///
+    /// `internal` access so the test target can exercise it directly without constructing
+    /// a full detection pipeline.
+    func extractMeetingInfo(from event: EKEvent) -> (platform: String, stableURL: String)? {
+        let candidates: [String] = [
+            event.url?.absoluteString,
+            event.notes,
+            event.location
+        ].compactMap { $0 }
+
+        for text in candidates {
+            for pattern in meetingURLPatterns {
+                guard text.contains(pattern) else { continue }
+                return (
+                    platform:  platformName(for: pattern),
+                    stableURL: stableKey(url: text, pattern: pattern)
+                )
+            }
+        }
+        return nil
+    }
+
+    /// Maps a URL pattern to its human-readable platform name.
+    private func platformName(for pattern: String) -> String {
+        if pattern.contains("google") { return "Google Meet"       }
+        if pattern.contains("zoom")   { return "Zoom"              }
+        if pattern.contains("teams")  { return "Microsoft Teams"   }
+        if pattern.contains("webex")  { return "Webex"             }
+        return "Meeting"
+    }
+
+    // MARK: - Browser detection
 
     private func detectBrowserMeeting() async -> (app: String, key: String)? {
         let runningIDs = Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))

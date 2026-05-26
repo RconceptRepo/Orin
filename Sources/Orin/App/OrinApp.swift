@@ -31,7 +31,8 @@ struct OrinApp: App {
 
         let services = ServiceContainer.shared
         services.register(rolloverEngine, for: RolloverEngine.self)
-        services.register(CalendarService(), for: CalendarService.self)
+        let calendarService = CalendarService()
+        services.register(calendarService, for: CalendarService.self)
         services.register(VaultService(), for: VaultService.self)
         services.register(RecordingService(), for: RecordingService.self)
         let aiService = AIService(config: AIConfiguration(primaryProvider: .ollama))
@@ -42,7 +43,7 @@ struct OrinApp: App {
         services.register(VoiceCommandService(), for: VoiceCommandService.self)
         services.register(OllamaInstallerService(), for: OllamaInstallerService.self)
         services.register(AIProviderTestService(), for: AIProviderTestService.self)
-        services.register(MeetingDetectorService(), for: MeetingDetectorService.self)
+        services.register(MeetingDetectorService(calendarService: calendarService), for: MeetingDetectorService.self)
         services.register(LoginItemService(), for: LoginItemService.self)
         services.register(WhisperTranscriptionService(), for: WhisperTranscriptionService.self)
 

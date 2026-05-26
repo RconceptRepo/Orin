@@ -73,6 +73,27 @@ final class CalendarService: Service {
         }
     }
 
+    // MARK: - Direct query for meeting detection
+
+    /// Returns EventKit events whose time range overlaps `[startDate, endDate]`.
+    ///
+    /// Performs a **live query** against the event store — always current, independent
+    /// of the 15-minute background sync timer.  This is the method `MeetingDetectorService`
+    /// uses so the detection window is never stale.
+    ///
+    /// Returns an empty array when calendar access is denied (`status == .red`).
+    ///
+    /// Thread-safe: `EKEventStore.events(matching:)` may be called from any thread.
+    func events(from startDate: Date, to endDate: Date) -> [EKEvent] {
+        guard status != .red else { return [] }
+        let predicate = eventStore.predicateForEvents(
+            withStart: startDate,
+            end:       endDate,
+            calendars: nil
+        )
+        return eventStore.events(matching: predicate)
+    }
+
     // MARK: - Background sync (15-minute timer)
 
     /// Starts a 15-minute repeating timer that calls `syncEvents()` automatically.
