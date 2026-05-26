@@ -93,6 +93,23 @@ final class VaultService: Service {
         UserDefaults.standard.set(computeToken(for: key), forKey: verificationTokenUDKey)
     }
 
+    /// Cryptographically checks whether a user-entered recovery key string is
+    /// valid **without** touching the brute-force counter or the lockout state.
+    ///
+    /// Use this for informational verification (Vault Settings → "Verify Saved Key")
+    /// where the user is confirming a key they have already saved. Because this
+    /// path does not increment `recordFailedAttempt()`, it cannot exhaust the
+    /// allowed recovery attempts and does not need to respect `isRecoveryLocked`.
+    ///
+    /// For an actual vault-recovery operation (unlocking a locked vault), use
+    /// `verifyAndParseRecoveryKey(_:)` which enforces brute-force protections.
+    func verifyRecoveryKey(_ input: String) -> Bool {
+        guard let keyData = parseRecoveryKeyData(input) else { return false }
+        let candidate = SymmetricKey(data: keyData)
+        return computeToken(for: candidate) ==
+               UserDefaults.standard.string(forKey: verificationTokenUDKey)
+    }
+
     /// Validates a user-entered recovery key string.
     /// Returns the SymmetricKey on success, nil on failure.
     /// Increments the brute-force counter on every invalid attempt.

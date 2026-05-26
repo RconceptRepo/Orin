@@ -367,6 +367,114 @@ final class VaultServiceTests: XCTestCase {
         XCTAssertFalse(vault.hasVerificationToken, "Token must be cleared even when result is discarded")
     }
 
+    // MARK: - Recovery key verification — settings path (Issue #2)
+    //
+    // verifyRecoveryKey(_:) is the side-effect-free counterpart to
+    // verifyAndParseRecoveryKey(_:). It performs the same cryptographic check
+    // but never calls recordFailedAttempt(), never checks isRecoveryLocked,
+    // and never returns the SymmetricKey. Use it for informational verification
+    // in Vault Settings where the user is confirming a saved key, not recovering.
+
+    func testVerifyRecoveryKeyReturnsTrueForValidKey() {
+        let key = SymmetricKey(size: .bits256)
+        vault.storeVerificationToken(for: key)
+        let keyStr = vault.recoveryKeyString(from: key)
+        XCTAssertTrue(vault.verifyRecoveryKey(keyStr),
+                      "verifyRecoveryKey must return true for the correct key")
+    }
+
+    func testVerifyRecoveryKeyReturnsFalseForWrongKey() {
+        vault.storeVerificationToken(for: SymmetricKey(size: .bits256))
+        let wrongKeyStr = vault.recoveryKeyString(from: SymmetricKey(size: .bits256))
+        XCTAssertFalse(vault.verifyRecoveryKey(wrongKeyStr),
+                       "verifyRecoveryKey must return false for a different key")
+    }
+
+    func testVerifyRecoveryKeyReturnsFalseForEmptyInput() {
+        vault.storeVerificationToken(for: SymmetricKey(size: .bits256))
+        XCTAssertFalse(vault.verifyRecoveryKey(""))
+    }
+
+    func testVerifyRecoveryKeyReturnsFalseForMalformedInput() {
+        vault.storeVerificationToken(for: SymmetricKey(size: .bits256))
+        XCTAssertFalse(vault.verifyRecoveryKey("not-a-valid-key"))
+    }
+
+    func testVerifyRecoveryKeyAcceptsDashlessInput() {
+        let key = SymmetricKey(size: .bits256)
+        vault.storeVerificationToken(for: key)
+        let noDashes = vault.recoveryKeyString(from: key).replacingOccurrences(of: "-", with: "")
+        XCTAssertTrue(vault.verifyRecoveryKey(noDashes),
+                      "verifyRecoveryKey must accept hex without dash separators")
+    }
+
+    func testVerifyRecoveryKeyAcceptsLowercaseInput() {
+        let key = SymmetricKey(size: .bits256)
+        vault.storeVerificationToken(for: key)
+        let lower = vault.recoveryKeyString(from: key).lowercased()
+        XCTAssertTrue(vault.verifyRecoveryKey(lower),
+                      "verifyRecoveryKey must accept lowercase hex")
+    }
+
+    /// Core guarantee: informational verify must NEVER consume a brute-force attempt.
+    func testVerifyRecoveryKeyDoesNotIncrementFailCountForInvalidKey() {
+        vault.storeVerificationToken(for: SymmetricKey(size: .bits256))
+        let before = vault.remainingRecoveryAttempts
+        let wrongKeyStr = vault.recoveryKeyString(from: SymmetricKey(size: .bits256))
+
+        _ = vault.verifyRecoveryKey(wrongKeyStr)
+
+        XCTAssertEqual(vault.remainingRecoveryAttempts, before,
+                       "verifyRecoveryKey must not decrement the remaining recovery attempts")
+    }
+
+    /// Even many wrong attempts via verifyRecoveryKey must not lock the recovery path.
+    func testVerifyRecoveryKeyDoesNotCauseLockout() {
+        vault.storeVerificationToken(for: SymmetricKey(size: .bits256))
+        let wrongKeyStr = vault.recoveryKeyString(from: SymmetricKey(size: .bits256))
+
+        // More than the lockout threshold (5) — must not lock.
+        for _ in 0..<10 { _ = vault.verifyRecoveryKey(wrongKeyStr) }
+
+        XCTAssertFalse(vault.isRecoveryLocked,
+                       "verifyRecoveryKey must never trigger the brute-force lockout")
+        XCTAssertEqual(vault.remainingRecoveryAttempts, 5,
+                       "Remaining attempts must be untouched after verifyRecoveryKey calls")
+    }
+
+    /// Verify the independence of the two paths: verifyRecoveryKey does not
+    /// interfere with verifyAndParseRecoveryKey's counter.
+    func testVerifyRecoveryKeyAndParseAreCounterIndependent() {
+        let realKey = SymmetricKey(size: .bits256)
+        vault.storeVerificationToken(for: realKey)
+        let wrongKeyStr = vault.recoveryKeyString(from: SymmetricKey(size: .bits256))
+
+        // Exhaust verifyRecoveryKey calls — should not affect the parse counter.
+        for _ in 0..<20 { _ = vault.verifyRecoveryKey(wrongKeyStr) }
+
+        // Use one actual recovery attempt.
+        _ = vault.verifyAndParseRecoveryKey(wrongKeyStr)   // consumes 1 attempt
+        XCTAssertEqual(vault.remainingRecoveryAttempts, 4,
+                       "Only verifyAndParseRecoveryKey may decrement the attempt counter")
+    }
+
+    /// verifyRecoveryKey must work even when the recovery lockout is active —
+    /// it bypasses the lockout because it doesn't touch the counter.
+    func testVerifyRecoveryKeyWorksWhenRecoveryIsLocked() {
+        let realKey = SymmetricKey(size: .bits256)
+        vault.storeVerificationToken(for: realKey)
+        let badKey = String(repeating: "00", count: 64)
+
+        // Trigger lockout via the real recovery path.
+        for _ in 0..<5 { _ = vault.verifyAndParseRecoveryKey(badKey) }
+        XCTAssertTrue(vault.isRecoveryLocked, "Precondition: vault is locked")
+
+        // Settings verify must still work.
+        let correctStr = vault.recoveryKeyString(from: realKey)
+        XCTAssertTrue(vault.verifyRecoveryKey(correctStr),
+                      "verifyRecoveryKey must succeed even when the recovery path is locked")
+    }
+
     // MARK: - Session management
 
     func testClearSessionDoesNotCrash() {
@@ -456,12 +564,34 @@ final class VaultServiceTests: XCTestCase {
  □ Typing DELETE enables red button; confirmation deletes all items and resets vault
  □ After reset, fresh unlock shows new recovery key onboarding
 
- [Vault security settings]
+ [Vault security settings — Verify Saved Key (Issue #2 fix)]
  □ Gear icon visible in both locked and unlocked states
  □ Settings shows "Registered" badge when verification token exists
- □ Verify key section accepts correct key → green "valid" message
- □ Verify key section rejects wrong key → red "incorrect" message
- □ Verify uses the brute-force counter (5 wrong attempts → locked)
+
+ UI feedback visibility (these verify the SwiftUI fix — results must persist):
+ □ Paste correct key → click "Verify Key" → green banner "Recovery key is correct." appears
+ □ Green banner stays visible; input field still shows the submitted key
+ □ Paste wrong key → click "Verify Key" → red banner "That is not the correct recovery key." appears
+ □ Red banner stays visible; input field still shows the submitted key
+ □ Editing the input field clears the result banner immediately
+ □ Clicking the × button on the result banner clears both the banner and the input field
+ □ After dismiss, "Verify Key" button is re-enabled (input is now empty)
+
+ Brute-force isolation (verifyRecoveryKey must not consume attempts):
+ □ Enter wrong key 6× via Verify button → recovery attempts counter stays at 5
+ □ "Can't unlock? Use Recovery Key" entry sheet is NOT locked after settings verify failures
+ □ Entering wrong key in the recovery entry sheet DOES decrement the counter
+ □ 5 wrong attempts in recovery entry sheet triggers lockout banner
+ □ Settings "Verify Key" button remains enabled and functional while recovery is locked
+   (recovery lockout no longer disables the settings verify path)
+
+ Accessibility:
+ □ VoiceOver on result banner reads "Verification passed. Your recovery key is correct."
+   or "Verification failed. The key you entered does not match your vault."
+ □ × dismiss button announces "Dismiss verification result and clear input"
+ □ Paste button announces "Paste recovery key from clipboard"
+
+ Other settings checks:
  □ "Re-export Recovery Key" only enabled when vault is unlocked
  □ Re-export shows full onboarding sheet with export/print options
  □ Reset Vault button only enabled when vault is unlocked

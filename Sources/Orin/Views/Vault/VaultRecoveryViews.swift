@@ -606,7 +606,7 @@ struct VaultSecuritySettingsView: View {
     @State private var showingReexportOnboarding = false
     @State private var showingResetConfirm = false
 
-    enum VerifyResult { case valid, invalid }
+    enum VerifyResult: Equatable { case valid, invalid }
 
     private var recoveryKeyString: String? {
         vaultKey.map { vaultService.recoveryKeyString(from: $0) }
@@ -654,51 +654,74 @@ struct VaultSecuritySettingsView: View {
                             .font(OrinFont.caption)
                             .foregroundStyle(.secondary)
 
+                        // Input row — onChange clears any previous result so the
+                        // feedback stays in sync with what the user has typed.
                         HStack {
                             TextField("Paste or type your recovery key", text: $verifyInput)
                                 .font(.system(.callout, design: .monospaced))
                                 .onChange(of: verifyInput) { _, _ in verifyResult = nil }
+                                .accessibilityLabel("Recovery key input field")
 
                             Button {
                                 if let pasted = NSPasteboard.general.string(forType: .string) {
-                                    verifyInput = pasted.uppercased().filter { "0123456789ABCDEF-".contains($0) }
+                                    verifyInput = pasted.uppercased()
+                                        .filter { "0123456789ABCDEF-".contains($0) }
                                 }
                             } label: {
                                 Image(systemName: "doc.on.clipboard")
                             }
                             .buttonStyle(.plain)
                             .foregroundStyle(.secondary)
+                            .accessibilityLabel("Paste recovery key from clipboard")
+                            .help("Paste from clipboard")
                         }
 
+                        // Verify button — uses verifyRecoveryKey() which is side-effect
+                        // free: no brute-force counter increment, no lockout check.
+                        // The input field is intentionally NOT cleared here; clearing it
+                        // would trigger onChange which would immediately wipe the result
+                        // before SwiftUI can render it. The user dismisses or edits instead.
                         Button("Verify Key") {
-                            // Validate without brute-force side effect (we don't care about the key)
-                            if vaultService.verifyAndParseRecoveryKey(verifyInput) != nil {
-                                verifyResult = .valid
-                            } else {
-                                verifyResult = .invalid
-                            }
-                            verifyInput = ""
+                            verifyResult = vaultService.verifyRecoveryKey(verifyInput)
+                                ? .valid : .invalid
                         }
-                        .disabled(verifyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                  || vaultService.isRecoveryLocked)
+                        .disabled(verifyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .accessibilityLabel("Verify the recovery key you have typed")
+                        .accessibilityHint("Checks whether the key is correct without consuming any recovery attempts")
 
+                        // Result banner — persists until the user edits the input or
+                        // taps the dismiss button. Dismiss clears the input, which
+                        // triggers onChange, which clears the result.
                         if let result = verifyResult {
-                            switch result {
-                            case .valid:
-                                Label("Your recovery key is correct.", systemImage: "checkmark.circle.fill")
-                                    .foregroundStyle(.green)
-                                    .font(.callout)
-                            case .invalid:
-                                Label("That is not the correct recovery key.", systemImage: "xmark.circle.fill")
-                                    .foregroundStyle(.red)
-                                    .font(.callout)
+                            HStack(spacing: 8) {
+                                if result == .valid {
+                                    Label("Recovery key is correct.", systemImage: "checkmark.circle.fill")
+                                        .foregroundStyle(.green)
+                                        .accessibilityLabel("Verification passed. Your recovery key is correct.")
+                                } else {
+                                    Label("That is not the correct recovery key.", systemImage: "xmark.circle.fill")
+                                        .foregroundStyle(.red)
+                                        .accessibilityLabel("Verification failed. The key you entered does not match your vault.")
+                                }
+                                Spacer()
+                                Button {
+                                    verifyInput = ""   // onChange fires → verifyResult = nil
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .foregroundStyle(.secondary)
+                                        .font(.system(size: 14))
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("Dismiss verification result and clear input")
+                                .help("Clear and dismiss")
                             }
-                        }
-
-                        if vaultService.isRecoveryLocked {
-                            Text("Verification is temporarily locked due to too many incorrect attempts.")
-                                .font(OrinFont.caption)
-                                .foregroundStyle(.orange)
+                            .font(.callout)
+                            .padding(10)
+                            .background(result == .valid
+                                        ? Color.green.opacity(0.1)
+                                        : Color.red.opacity(0.1))
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                            .transition(.opacity.combined(with: .scale(scale: 0.97, anchor: .top)))
                         }
                     } header: {
                         Text("Verify Saved Key")
