@@ -18,7 +18,10 @@ import Speech
 ///
 /// `disarm` must be called **after** `removeTap` returns so no `feed` call can
 /// be in-flight while the resources are being released.
-final class TapState {
+/// `@unchecked Sendable` is safe: every stored property is read or written
+/// exclusively under `lock` (NSLock), which serialises access from both the
+/// Core-Audio I/O thread (`feed`) and the MainActor (`arm`/`disarm`/`updateRequest`).
+final class TapState: @unchecked Sendable {
 
     // MARK: - Lock-protected storage
 

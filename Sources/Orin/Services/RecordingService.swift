@@ -5,8 +5,26 @@ import Speech
 
 // MARK: - RecordingService
 
+/// `@MainActor` isolates every property and method to the Swift main actor.
+///
+/// This is the correct model for an `@Observable` service whose state is consumed
+/// exclusively by SwiftUI views.  macOS 26 enforces that `@Query.update()` (called
+/// whenever any `@Observable` mutation triggers a view re-render) executes within a
+/// Swift Concurrency main actor task — not merely on the main *thread* via GCD or a
+/// run-loop callback.  `RecordingService` previously held `@unchecked Sendable` to
+/// silence compiler warnings while using `DispatchQueue.main.async` for mutations;
+/// that combination produced `EXC_BREAKPOINT` / `swift_task_isCurrentExecutorWithFlagsImpl`
+/// crashes on macOS 26 at the `@Query` update point in `MeetingsView`.
+///
+/// With `@MainActor` on the class:
+/// - The compiler prevents off-actor mutations at compile time.
+/// - All `DispatchQueue.main.async` calls are replaced with `Task { @MainActor in }`.
+/// - Timer callbacks use `Task { @MainActor in }` for the same reason.
+/// - `@unchecked Sendable` is removed — `@MainActor`-isolated types are implicitly
+///   `Sendable` because the isolation constraint guarantees single-actor access.
+@MainActor
 @Observable
-final class RecordingService: Service, @unchecked Sendable {
+final class RecordingService: Service {
 
     // MARK: - Recording phase
 
@@ -74,7 +92,18 @@ final class RecordingService: Service, @unchecked Sendable {
     private lazy var speechRecognizer: SFSpeechRecognizer? = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
 
     private var recognitionTask: SFSpeechRecognitionTask?
-    private var durationTimer: Timer?
+
+    /// `nonisolated(unsafe)` allows `deinit` (which is `nonisolated`) to call
+    /// `invalidate()` without a concurrency violation.  This is correct because
+    /// `Timer.invalidate()` is documented thread-safe from any thread, and
+    /// `stopRecording()` always sets this to `nil` before the service is released
+    /// under normal operation — `deinit` is purely a safety net.
+    ///
+    /// `@ObservationIgnored` prevents `@Observable` from generating observation
+    /// accessors for an internal implementation detail that views never observe.
+    @ObservationIgnored
+    private nonisolated(unsafe) var durationTimer: Timer?
+
     private var transcriptPrefix = ""
 
     // MARK: - Private — cross-thread state
@@ -193,10 +222,19 @@ final class RecordingService: Service, @unchecked Sendable {
         elapsedSeconds = 0
         transcript = ""
 
-        // The timer is scheduled on the main run loop so its callback fires on
-        // the main thread, keeping @Observable state mutations on MainActor.
+        // IMPORTANT: use Task { @MainActor in }, NOT a bare run-loop callback.
+        //
+        // The Timer callback fires on the main-thread run loop, which is on the
+        // main *thread* but NOT within a Swift Concurrency actor task.
+        // macOS 26 enforces that @Query.update() is called from a Swift task via
+        // swift_task_isCurrentExecutorWithFlagsImpl; a bare run-loop callback has
+        // no current task, causing the PAC-pointer EXC_BREAKPOINT crash.
+        // Wrapping the mutation in Task { @MainActor in } creates a proper Swift
+        // actor task, satisfying the runtime invariant.
         durationTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            self?.elapsedSeconds += 1
+            Task { @MainActor [weak self] in
+                self?.elapsedSeconds += 1
+            }
         }
     }
 
@@ -275,7 +313,17 @@ final class RecordingService: Service, @unchecked Sendable {
         request: SFSpeechAudioBufferRecognitionRequest
     ) {
         recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
-            DispatchQueue.main.async {
+            // CRITICAL FIX: Task { @MainActor in } replaces DispatchQueue.main.async.
+            //
+            // `DispatchQueue.main.async` dispatches onto the main *thread* but does NOT
+            // create a Swift Concurrency actor task.  On macOS 26, @Query.update() calls
+            // swift_task_isCurrentExecutorWithFlagsImpl to verify it is executing within
+            // a Swift main actor task.  A GCD callback has no current task, so the runtime
+            // dereferences a stale executor pointer → PAC authentication trap → EXC_BREAKPOINT.
+            //
+            // `Task { @MainActor in }` schedules work on the Swift main actor's executor,
+            // creating a proper task context that satisfies the runtime invariant.
+            Task { @MainActor [weak self] in
                 guard let self else { return }
 
                 if let result {
@@ -341,6 +389,48 @@ final class RecordingService: Service, @unchecked Sendable {
         let name = "meeting-\(formatter.string(from: Date())).caf"
         return try AVAudioFile(forWriting: dir.appendingPathComponent(name), settings: format.settings)
     }
+
+    // MARK: - Testing support
+
+#if DEBUG
+    /// Simulates the recognition-task callback applying a transcript update.
+    ///
+    /// In production this is done inside `Task { @MainActor in }` inside
+    /// `startRecognitionTask`.  The test hook exercises the identical state
+    /// mutation path — from `@MainActor` context — so the compiler can verify
+    /// the isolation at build time.
+    func _testApplyTranscript(_ text: String) {
+        transcript = transcriptPrefix.isEmpty ? text : transcriptPrefix + text
+    }
+
+    /// Simulates a 60-second session-boundary accumulation (finalises the current
+    /// transcript segment into `transcriptPrefix` for the next session).
+    func _testFinalizeTranscriptSegment() {
+        if !transcript.isEmpty {
+            transcriptPrefix = transcript + " "
+        }
+    }
+
+    /// Resets transcript and prefix — call in test `setUp`/`tearDown`.
+    func _testResetTranscriptState() {
+        transcript      = ""
+        transcriptPrefix = ""
+    }
+
+    /// Simulates one Timer tick updating `elapsedSeconds`.
+    ///
+    /// In production this is done inside `Task { @MainActor in }` inside the
+    /// Timer callback.  Calling it from `@MainActor` test context proves the
+    /// compiler enforces the isolation invariant.
+    func _testFireTimerTick() {
+        elapsedSeconds += 1
+    }
+
+    /// Resets `elapsedSeconds` to zero — call in test `setUp`/`tearDown`.
+    func _testResetElapsedSeconds() {
+        elapsedSeconds = 0
+    }
+#endif
 
     // MARK: - Error type
 
