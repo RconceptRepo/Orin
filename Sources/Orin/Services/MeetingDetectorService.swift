@@ -77,8 +77,10 @@ final class MeetingDetectorService: Service {
         "teams.microsoft.com/v2/",
         "teams.microsoft.com/meet/",
         "teams.microsoft.com/l/meetup-join",
-        // Webex — browser-hosted meetings
-        "web.webex.com/",
+        // Webex — browser-hosted meetings.
+        // Use the more specific "/meet/" path so stableKey can retain the room
+        // identifier (one segment) without over-capturing the host root.
+        "web.webex.com/meet/",
         "webex.com/meet/",
     ]
 
@@ -476,13 +478,47 @@ final class MeetingDetectorService: Service {
         return nil
     }
 
-    /// Strips query-string and fragment so the same meeting URL deduplicates across polls.
+    /// Produces a stable deduplication key from a raw URL and its matched pattern.
+    ///
+    /// Two rules govern how much of the URL path is retained:
+    ///
+    /// **Pattern ends with `/`** (e.g. `"zoom.us/wc/"`, `"meet.google.com/"`)
+    /// → keep the pattern prefix **plus exactly one more path segment** (the meeting-room
+    ///   identifier).  Any further segments — such as Zoom Web Client's trailing `/join` —
+    ///   are discarded.  When nothing follows the trailing slash (e.g. after fragment
+    ///   stripping `teams.microsoft.com/v2/#/calling/join` → `teams.microsoft.com/v2/`),
+    ///   the pattern itself is the stable key.
+    ///
+    /// **Pattern does NOT end with `/`** (e.g. `"teams.microsoft.com/l/meetup-join"`)
+    /// → return exactly the matched pattern portion and drop everything that follows.
+    ///   This collapses opaque join-link paths like `/19%3a…/0` into a single stable key.
+    ///
+    /// Query strings and fragment identifiers are stripped before either rule is applied.
     func stableKey(url: String, pattern: String) -> String {
         guard let range = url.range(of: pattern) else { return String(url.prefix(80)) }
-        let path = String(url[range.lowerBound...])
+        let fromPattern = String(url[range.lowerBound...])
+
+        // Strip query string and fragment first.
+        let withoutQueryFragment = fromPattern
             .components(separatedBy: CharacterSet(charactersIn: "?#"))
             .first ?? ""
-        return String(path.prefix(80))
+
+        if pattern.hasSuffix("/") {
+            // Keep exactly one more path segment after the trailing slash.
+            let afterPattern = String(withoutQueryFragment.dropFirst(pattern.count))
+            let meetingID    = afterPattern.components(separatedBy: "/").first ?? ""
+            let result: String
+            if meetingID.isEmpty {
+                // Nothing follows the trailing slash (e.g. fragment was stripped).
+                result = withoutQueryFragment
+            } else {
+                result = String(withoutQueryFragment.prefix(pattern.count)) + meetingID
+            }
+            return String(result.prefix(80))
+        } else {
+            // Pattern has no trailing slash — the pattern itself is the stable identifier.
+            return String(withoutQueryFragment.prefix(pattern.count).prefix(80))
+        }
     }
 
     // MARK: - Automation permission state (main actor only)
@@ -521,11 +557,26 @@ final class MeetingDetectorService: Service {
     @MainActor
     func applyDetectionResult(_ result: (app: String, key: String)?) {
         guard let result else {
-            // Meeting ended — reset all session state so the next detection starts fresh.
-            if detectedMeetingApp != nil || shouldShowRecordingPrompt {
-                detectedMeetingApp = nil
-                shouldShowRecordingPrompt = false
-                activeMeetingKey = nil
+            // Meeting left the detection window (or native app exited).
+            // Always clear the visible overlay state.
+            guard detectedMeetingApp != nil || shouldShowRecordingPrompt else { return }
+            detectedMeetingApp = nil
+            shouldShowRecordingPrompt = false
+
+            // Key-reset policy:
+            //
+            // • If the user explicitly dismissed this meeting (`dismissedMeetingKey != nil`),
+            //   clear both session keys so the same meeting key can re-trigger the overlay
+            //   when the next instance starts (e.g. a new Zoom call, a rescheduled event).
+            //
+            // • If the meeting ended without a dismiss, KEEP `activeMeetingKey`.
+            //   This prevents the same key from re-prompting if the same event briefly
+            //   re-enters the calendar detection window on the next poll.
+            //   In production, distinct recurring-event occurrences carry distinct
+            //   `eventIdentifier` values and will produce different keys, so they do
+            //   re-trigger correctly.
+            if dismissedMeetingKey != nil {
+                activeMeetingKey   = nil
                 dismissedMeetingKey = nil
             }
             return
