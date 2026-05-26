@@ -607,4 +607,48 @@ final class VaultServiceTests: XCTestCase {
  □ First unlock on a vault created before this feature stores the verification token
  □ hasVerificationToken is true after the migrating unlock
  □ Subsequent recovery key entry works immediately after migration
+
+ [Vault Settings dismissal — Issue #1 fix]
+ Note: XCUITest is not available in this SPM manifest (no signed app target).
+ The scenarios below must be verified manually on the running app.
+
+ Open / close:
+ □ Gear icon (⚙) in vault header opens Vault Security Settings sheet
+ □ Settings sheet shows a visible "Done" button at the bottom right
+ □ Clicking Done closes the sheet immediately — vault state unchanged
+ □ Press Return (⏎) while Done button is focused → sheet closes
+ □ Press Escape while sheet is open → sheet closes (not the app window)
+ □ Press Cmd+W while sheet is open → sheet closes (not the app window)
+
+ Dismiss from nested views:
+ □ Open Settings → click "Re-export Recovery Key" → onboarding sheet opens
+   □ Onboarding sheet shows Cancel button (left) and Done button (right, disabled)
+   □ Clicking Cancel closes the onboarding sheet, returns to Settings sheet
+   □ Pressing Escape on onboarding sheet closes onboarding, returns to Settings
+   □ Checking toggle → Done becomes enabled → clicking Done closes onboarding, returns to Settings
+   □ After closing onboarding (any path), Settings sheet is still open and functional
+   □ Clicking Done in Settings closes Settings
+
+ □ Open Settings → click "Reset Vault…" → confirmation sheet opens
+   □ Clicking Cancel closes confirmation, returns to Settings (Reset Vault not triggered)
+   □ Pressing Escape closes confirmation, returns to Settings (Reset Vault not triggered)
+   □ Typing DELETE → clicking "Delete Everything" → closes confirmation → closes Settings → vault reset
+   □ No lingering Settings sheet after vault reset
+
+ Reopen:
+ □ Open Settings → Done → reopen with gear icon → sheet opens fresh, fields cleared
+ □ Open Settings → Escape → reopen with gear icon → sheet opens fresh
+ □ Open Settings → Cmd+W → reopen with gear icon → sheet opens fresh
+
+ Accessibility:
+ □ VoiceOver reads "Close Vault Security Settings" for the Done button
+ □ VoiceOver reads "Closes this sheet. All changes are saved immediately." as hint
+ □ Escape and Cmd+W work when VoiceOver is active
+ □ Cancel button on recovery key onboarding: VoiceOver reads hint about key reappearing
+
+ No dead-end paths:
+ □ Every flow inside Settings has at least one non-destructive exit path
+ □ Reset Vault button is only enabled when vault is unlocked (disabled greyed out when locked)
+ □ Re-export Recovery Key button only visible when vault is unlocked
+ □ No button appears functional while doing nothing
  */

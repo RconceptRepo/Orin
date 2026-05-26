@@ -12,6 +12,8 @@ struct VaultRecoveryOnboardingView: View {
     let recoveryKey: String
     var onDismiss: () -> Void
 
+    @Environment(\.dismiss) private var dismiss
+
     @State private var confirmed = false
     @State private var copied = false
     @State private var isExporting = false
@@ -126,14 +128,24 @@ struct VaultRecoveryOnboardingView: View {
             }
             .padding(.bottom, 16)
 
-            // Footer buttons
+            // Footer buttons.
+            // Cancel lets the user exit without checking the confirmation toggle —
+            // the key sheet will reappear on next unlock so no information is lost.
+            // Done requires the toggle and records that the key has been saved.
             HStack {
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)   // Escape key
+                    .controlSize(.large)
+                    .accessibilityHint("Exit without confirming the recovery key has been saved. The sheet will reappear next time you unlock.")
                 Spacer()
                 Button("Done") { onDismiss() }
                     .keyboardShortcut(.defaultAction)
                     .disabled(!confirmed)
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
+                    .accessibilityHint(confirmed
+                        ? "Confirms the key has been saved and closes this sheet."
+                        : "Check the box above to confirm you have saved the key before closing.")
             }
         }
         .padding(28)
@@ -599,6 +611,8 @@ struct VaultSecuritySettingsView: View {
     let vaultKey: SymmetricKey?            // nil when vault is locked
     var onResetVault: () -> Void
 
+    @Environment(\.dismiss) private var dismiss
+
     @AppStorage("orin.vault.recoveryKeyShown") private var recoveryKeyShown = false
 
     @State private var verifyInput = ""
@@ -750,6 +764,39 @@ struct VaultSecuritySettingsView: View {
                 }
             }
             .formStyle(.grouped)
+
+            // ── Footer ─────────────────────────────────────────────────────────
+            // Provides all non-destructive exit paths from the settings sheet.
+            // The two hidden buttons wire keyboard shortcuts so users never need
+            // to hunt for a close path.
+            Divider()
+                .padding(.top, 8)
+
+            HStack {
+                // Escape — semantically "done" not "cancel": settings are not
+                // transactional, so there is nothing to abandon.
+                Button("") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                    .hidden()
+                    .accessibilityHidden(true)
+
+                // Cmd+W — redirects to sheet-level dismissal instead of closing
+                // the parent app window accidentally.
+                Button("") { dismiss() }
+                    .keyboardShortcut("w", modifiers: .command)
+                    .hidden()
+                    .accessibilityHidden(true)
+
+                Spacer()
+
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.regular)
+                    .accessibilityLabel("Close Vault Security Settings")
+                    .accessibilityHint("Closes this sheet. All changes are saved immediately.")
+            }
+            .padding(.top, 4)
         }
         .padding(24)
         .frame(width: 520)
