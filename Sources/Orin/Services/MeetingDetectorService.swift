@@ -2,14 +2,50 @@ import AppKit
 import EventKit
 import Foundation
 import Observation
+import OSLog
 
 @Observable
 final class MeetingDetectorService: Service {
+
+    // MARK: - Nested Types
+
+    /// Typed result of a single NSAppleScript execution.
+    ///
+    /// Having a typed outcome — rather than a bare `String?` — means every failure mode is
+    /// handled explicitly and the browser detection path can never swallow errors silently.
+    enum BrowserScriptOutcome {
+        /// Script executed successfully. Value is the raw newline-separated URL list (may be empty).
+        case urls(String)
+        /// NSAppleScript error -1743 (`errAEEventNotPermitted`): Automation permission denied.
+        case permissionDenied
+        /// NSAppleScript error -600 (`procNotFound`): target app is not running.
+        case appNotRunning
+        /// Any other NSAppleScript error; associated value is the raw error code for logging.
+        case scriptError(Int)
+    }
+
+    /// Current Automation (AppleScript) permission state for browser-based meeting detection.
+    /// Updated after each `detectBrowserMeeting()` call.
+    enum AutomationPermissionStatus: Equatable {
+        /// No browser detection has run yet since monitoring started.
+        case unknown
+        /// AppleScript executed successfully in at least one browser during the last poll.
+        case granted
+        /// All running browsers returned NSAppleScript error -1743 during the last poll.
+        case denied
+        /// No supported browser was running during the last poll.
+        case unavailable
+    }
 
     // MARK: - Public State
 
     var detectedMeetingApp: String?
     var shouldShowRecordingPrompt = false
+
+    /// Current Automation permission state; updated after every browser detection poll.
+    /// Observe this from Settings or diagnostic views to show a permission badge.
+    var automationPermissionStatus: AutomationPermissionStatus = .unknown
+
     /// Fired on the main thread the first time a new meeting session is discovered.
     var onMeetingDetected: ((String) -> Void)?
 
@@ -61,36 +97,50 @@ final class MeetingDetectorService: Service {
     /// Serial queue keeps NSAppleScript calls off the main thread and serialises concurrent access.
     private let scriptQueue = DispatchQueue(label: "com.orin.meeting-detector.applescript", qos: .utility)
 
+    /// Dedicated logger for Automation permission diagnostics.
+    /// Visible in Console.app under subsystem "com.clavrit.orin", category "AutomationPermission".
+    private let scriptLogger = Logger(subsystem: "com.clavrit.orin", category: "AutomationPermission")
+
+    /// `true` once a permission-denied error has been surfaced via `ErrorManager`.
+    /// Resets to `false` when permission is (re-)granted or `retryBrowserDetection()` is called,
+    /// allowing the error to surface again if the situation recurs.
+    @ObservationIgnored
+    private var hasReportedAutomationDenial = false
+
     // MARK: - Dependencies
 
     /// Provides EventKit event data for the calendar-based detection path.
-    /// Injected at init so tests can supply a fresh `CalendarService` without
-    /// requiring EventKit authorization.
     private let calendarService: CalendarService
 
-    // MARK: - Testing support
+    // MARK: - Testing Support
 
     /// Overrides the EventKit query performed by `detectFromCalendar()`.
     ///
-    /// **For testing only.**  Set this closure before calling `startMonitoring()` to
-    /// inject synthetic `EKEvent` objects without requiring real calendar authorization.
-    /// The closure receives the same `(startDate, endDate)` arguments that would
-    /// normally be passed to `CalendarService.events(from:to:)`.
-    ///
-    /// `nil` (the default) causes `detectFromCalendar()` to use the injected
-    /// `CalendarService` directly.
+    /// **For testing only.** Set before calling `startMonitoring()` to inject synthetic
+    /// `EKEvent` objects without requiring real calendar authorization.
     @ObservationIgnored
     var _calendarEventProviderOverride: ((Date, Date) -> [EKEvent])?
+
+    /// Overrides all NSAppleScript execution in the browser detection path.
+    ///
+    /// **For testing only.** The closure receives the raw AppleScript source string and
+    /// returns the desired `BrowserScriptOutcome`. `nil` (default) uses real execution.
+    @ObservationIgnored
+    var _browserScriptExecutorOverride: ((String) async -> BrowserScriptOutcome)?
+
+    /// Overrides the set of running browser bundle IDs checked in `detectBrowserMeeting()`.
+    ///
+    /// **For testing only.** `nil` (default) reads from `NSWorkspace.shared.runningApplications`.
+    @ObservationIgnored
+    var _runningBrowserIDsOverride: Set<String>?
 
     // MARK: - Lifecycle
 
     /// Creates a `MeetingDetectorService`.
     ///
-    /// - Parameter calendarService: The `CalendarService` used for EventKit queries in the
-    ///   calendar-based detection path.  Defaults to a fresh instance, which is acceptable
-    ///   in tests (the default `CalendarService` starts with `status == .red` and returns
-    ///   empty event arrays, so calendar detection is a no-op until `_calendarEventProviderOverride`
-    ///   is set or real calendar authorization is granted).
+    /// - Parameter calendarService: The `CalendarService` used for EventKit queries.
+    ///   Defaults to a fresh instance (starts with `status == .red`, returning empty
+    ///   event arrays until calendar authorization is granted).
     init(calendarService: CalendarService = .init()) {
         self.calendarService = calendarService
     }
@@ -99,7 +149,6 @@ final class MeetingDetectorService: Service {
     func startMonitoring() {
         guard timer == nil else { return }
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-            // Timer fires on the main run loop; poll() dispatches work to a Task.
             self?.poll()
         }
         poll()
@@ -113,15 +162,26 @@ final class MeetingDetectorService: Service {
         shouldShowRecordingPrompt = false
         activeMeetingKey = nil
         dismissedMeetingKey = nil
+        automationPermissionStatus = .unknown
+        hasReportedAutomationDenial = false
     }
 
     @MainActor
     func dismissPrompt() {
         shouldShowRecordingPrompt = false
-        // Remember which session the user dismissed so we don't re-prompt
-        // while the same meeting is still running. activeMeetingKey stays set
-        // so the dedup guard in applyDetectionResult continues to suppress it.
         dismissedMeetingKey = activeMeetingKey
+    }
+
+    /// Re-triggers browser detection immediately after the user grants Automation permission.
+    ///
+    /// Resets `automationPermissionStatus` to `.unknown` and clears the denial-tracking flag
+    /// so `ErrorManager` can surface the error again if Automation is still denied.
+    /// Call this from the "Retry" action on the automation permission error toast.
+    @MainActor
+    func retryBrowserDetection() {
+        hasReportedAutomationDenial = false
+        automationPermissionStatus = .unknown
+        poll()
     }
 
     // MARK: - Polling (timer fires on main thread)
@@ -179,17 +239,8 @@ final class MeetingDetectorService: Service {
     /// Scans EventKit events that overlap the [−2 min, +5 min] window around now
     /// for a known video-conference URL and returns the first match.
     ///
-    /// The wide window ensures:
-    ///   - Events that started up to 2 minutes ago are still detected (handles late joins).
-    ///   - Events starting in the next 5 minutes trigger an early prompt.
-    ///
-    /// Called on a cooperative-thread-pool thread (inside `Task.detached` in `poll()`).
-    /// Also safe to call directly from the main actor in tests.
-    ///
-    /// Returns `nil` when:
-    ///   - Calendar access has not been granted (`status == .red`)
-    ///   - No events exist in the window
-    ///   - No events contain a recognised meeting URL
+    /// Returns `nil` when calendar access is denied, no events exist in the window,
+    /// or no events contain a recognised meeting URL.
     func detectFromCalendar() -> (app: String, key: String)? {
         let now         = Date()
         let windowStart = now.addingTimeInterval(-(2 * 60))   // 2 minutes before now
@@ -205,14 +256,6 @@ final class MeetingDetectorService: Service {
         for event in events {
             guard let info = extractMeetingInfo(from: event) else { continue }
 
-            // Build a session key unique to this calendar occurrence.
-            //
-            // For saved recurring events, `EKEvent.eventIdentifier` is distinct for
-            // each recurrence instance — a Monday standup and Tuesday standup will never
-            // share a key, so dismissing one never suppresses the other.
-            //
-            // For unsaved test events, `eventIdentifier` is an empty string; fall back to
-            // title + start-epoch so tests still get deterministic, stable keys.
             let rawID = event.eventIdentifier ?? ""
             let eventID: String
             if rawID.isEmpty {
@@ -229,19 +272,11 @@ final class MeetingDetectorService: Service {
         return nil
     }
 
-    /// Scans an `EKEvent`'s metadata fields for the first recognisable
-    /// video-conference URL.
+    /// Scans an `EKEvent`'s metadata fields for the first recognisable video-conference URL.
     ///
-    /// Fields are checked in priority order:
-    ///   1. `EKEvent.url`      — explicit URL set by a calendar client (e.g. Google Calendar)
-    ///   2. `EKEvent.notes`    — free-text body; URL may be embedded in a sentence
-    ///   3. `EKEvent.location` — some calendar apps paste join links here
+    /// Fields are checked in priority order: `EKEvent.url` → `notes` → `location`.
     ///
-    /// The returned `stableURL` has query-string and fragment stripped (via `stableKey`)
-    /// so repeated polls for the same meeting produce an identical deduplication key.
-    ///
-    /// `internal` access so the test target can exercise it directly without constructing
-    /// a full detection pipeline.
+    /// `internal` access so the test target can exercise it directly.
     func extractMeetingInfo(from event: EKEvent) -> (platform: String, stableURL: String)? {
         let candidates: [String] = [
             event.url?.absoluteString,
@@ -272,38 +307,130 @@ final class MeetingDetectorService: Service {
 
     // MARK: - Browser detection
 
-    private func detectBrowserMeeting() async -> (app: String, key: String)? {
-        let runningIDs = Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
+    /// Queries each running supported browser via AppleScript for its active tab URLs.
+    ///
+    /// Every script outcome is handled explicitly — this method cannot fail silently:
+    /// - `.urls`: parsed for meeting URLs; `automationPermissionStatus` set to `.granted`
+    /// - `.permissionDenied`: logged at error level; status set to `.denied`; error surfaced once
+    /// - `.appNotRunning`: logged at debug level; browser may have quit mid-poll
+    /// - `.scriptError`: logged at warning level; status left unchanged
+    ///
+    /// `internal` access so tests can call it directly with injected hooks.
+    func detectBrowserMeeting() async -> (app: String, key: String)? {
+        let runningIDs = _runningBrowserIDsOverride
+            ?? Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
 
+        var anyBrowserRunning = false
+        var anyGranted        = false
+        var anyDenied         = false
+        var firstDeniedApp: String?
+
+        // --- Chromium-family browsers ---
         for browser in chromiumBrowsers {
             guard runningIDs.contains(browser.bundleID) else { continue }
-            if let urls = await executeScript(chromiumTabScript(appName: browser.appName)),
-               let meetingURL = firstMeetingURL(in: urls) {
-                return (app: "\(browser.appName) – Meeting", key: "browser|\(meetingURL)")
+            anyBrowserRunning = true
+
+            let outcome = await executeScript(chromiumTabScript(appName: browser.appName))
+            switch outcome {
+            case .urls(let urlString):
+                anyGranted = true
+                if let meetingURL = firstMeetingURL(in: urlString) {
+                    await applyAutomationStatus(.granted, deniedApp: nil)
+                    return (app: "\(browser.appName) – Meeting", key: "browser|\(meetingURL)")
+                }
+
+            case .permissionDenied:
+                anyDenied = true
+                if firstDeniedApp == nil { firstDeniedApp = browser.appName }
+                scriptLogger.error("Automation permission denied for \(browser.appName, privacy: .public) (\(browser.bundleID, privacy: .public)): NSAppleScript error -1743 errAEEventNotPermitted. Fix: System Settings → Privacy & Security → Automation → enable Orin.")
+
+            case .appNotRunning:
+                scriptLogger.debug("\(browser.appName, privacy: .public) visible to NSWorkspace but AppleScript returned -600 (procNotFound). App may have just quit.")
+
+            case .scriptError(let code):
+                scriptLogger.warning("Unexpected AppleScript error \(code, privacy: .public) querying \(browser.appName, privacy: .public) tabs — skipping browser.")
             }
         }
 
+        // --- Safari ---
         if runningIDs.contains("com.apple.Safari") {
-            if let urls = await executeScript(safariTabScript()),
-               let meetingURL = firstMeetingURL(in: urls) {
-                return (app: "Safari – Meeting", key: "browser|\(meetingURL)")
+            anyBrowserRunning = true
+
+            let outcome = await executeScript(safariTabScript())
+            switch outcome {
+            case .urls(let urlString):
+                anyGranted = true
+                if let meetingURL = firstMeetingURL(in: urlString) {
+                    await applyAutomationStatus(.granted, deniedApp: nil)
+                    return (app: "Safari – Meeting", key: "browser|\(meetingURL)")
+                }
+
+            case .permissionDenied:
+                anyDenied = true
+                if firstDeniedApp == nil { firstDeniedApp = "Safari" }
+                scriptLogger.error("Automation permission denied for Safari (com.apple.Safari): NSAppleScript error -1743 errAEEventNotPermitted. Fix: System Settings → Privacy & Security → Automation → enable Orin.")
+
+            case .appNotRunning:
+                scriptLogger.debug("Safari visible to NSWorkspace but AppleScript returned -600 (procNotFound).")
+
+            case .scriptError(let code):
+                scriptLogger.warning("Unexpected AppleScript error \(code, privacy: .public) querying Safari — skipping.")
             }
         }
+
+        // --- Resolve final automation permission status ---
+        if anyGranted {
+            // At least one browser responded — detection is active.
+            if anyDenied {
+                scriptLogger.warning("Automation partially denied: some browsers blocked; meeting detection active via other browsers.")
+            }
+            await applyAutomationStatus(.granted, deniedApp: nil)
+        } else if anyDenied {
+            // Every browser that ran denied access.
+            await applyAutomationStatus(.denied, deniedApp: firstDeniedApp)
+        } else if !anyBrowserRunning {
+            await applyAutomationStatus(.unavailable, deniedApp: nil)
+        }
+        // Browsers were running but all outcomes were .scriptError — leave status unchanged
+        // to avoid a spurious .unavailable flip while the situation is ambiguous.
 
         return nil
     }
 
     // MARK: - AppleScript execution
 
-    /// Dispatches NSAppleScript to the serial scriptQueue via a continuation so the caller
-    /// suspends rather than blocking a cooperative thread. Errors are swallowed silently.
-    private func executeScript(_ source: String) async -> String? {
-        await withCheckedContinuation { continuation in
+    /// Dispatches NSAppleScript on the serial `scriptQueue` and returns a typed outcome.
+    ///
+    /// The test hook `_browserScriptExecutorOverride` bypasses real execution — inject it
+    /// in unit tests to simulate any permission or error scenario without running AppleScript.
+    private func executeScript(_ source: String) async -> BrowserScriptOutcome {
+        if let override = _browserScriptExecutorOverride {
+            return await override(source)
+        }
+
+        return await withCheckedContinuation { continuation in
             scriptQueue.async {
-                var error: NSDictionary?
-                let appleScript = NSAppleScript(source: source)
-                let result = appleScript?.executeAndReturnError(&error)
-                continuation.resume(returning: error == nil ? result?.stringValue : nil)
+                var errorDict: NSDictionary?
+                let script     = NSAppleScript(source: source)
+                let descriptor = script?.executeAndReturnError(&errorDict)
+
+                if let descriptor {
+                    // Successful execution — return the string value (may be empty).
+                    continuation.resume(returning: .urls(descriptor.stringValue ?? ""))
+                    return
+                }
+
+                // Map the error code to a typed outcome.
+                // NSAppleScript.errorNumber is the key for the numeric error code in the dict.
+                let code = (errorDict?[NSAppleScript.errorNumber] as? NSNumber)?.intValue ?? -1
+                switch code {
+                case -1743:
+                    continuation.resume(returning: .permissionDenied)
+                case -600:
+                    continuation.resume(returning: .appNotRunning)
+                default:
+                    continuation.resume(returning: .scriptError(code))
+                }
             }
         }
     }
@@ -338,6 +465,8 @@ final class MeetingDetectorService: Service {
         """
     }
 
+    // MARK: - URL helpers
+
     func firstMeetingURL(in urlString: String) -> String? {
         for url in urlString.components(separatedBy: "\n") {
             for pattern in meetingURLPatterns where url.contains(pattern) {
@@ -354,6 +483,36 @@ final class MeetingDetectorService: Service {
             .components(separatedBy: CharacterSet(charactersIn: "?#"))
             .first ?? ""
         return String(path.prefix(80))
+    }
+
+    // MARK: - Automation permission state (main actor only)
+
+    /// Updates `automationPermissionStatus` and surfaces a user-facing error exactly once
+    /// per denial episode (not on every 30-second poll).
+    ///
+    /// When `status == .granted`, resets `hasReportedAutomationDenial` so future revocations
+    /// can be reported again.
+    @MainActor
+    private func applyAutomationStatus(_ status: AutomationPermissionStatus, deniedApp: String?) {
+        automationPermissionStatus = status
+
+        if status == .granted {
+            // Permission (re-)granted — future denials must be surfaced fresh.
+            hasReportedAutomationDenial = false
+            return
+        }
+
+        guard status == .denied, !hasReportedAutomationDenial else { return }
+        hasReportedAutomationDenial = true
+
+        let appName = deniedApp ?? "a browser"
+        ErrorManager.shared.report(
+            .automationPermissionDenied(app: appName),
+            retryAction: { [weak self] in
+                // Hop explicitly to the main actor — retryBrowserDetection is @MainActor.
+                await MainActor.run { self?.retryBrowserDetection() }
+            }
+        )
     }
 
     // MARK: - State update (main actor only)

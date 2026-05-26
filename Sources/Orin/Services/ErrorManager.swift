@@ -9,12 +9,14 @@ enum OrinPermissionType: String, Sendable {
     case microphone
     case speechRecognition
     case calendar
+    case automation
 
     var displayName: String {
         switch self {
         case .microphone:        "Microphone"
         case .speechRecognition: "Speech Recognition"
         case .calendar:          "Calendar"
+        case .automation:        "Automation"
         }
     }
 }
@@ -36,27 +38,31 @@ enum ErrorSeverity: Sendable {
 // MARK: - Recovery Action
 
 /// Actions available to the user when an error is presented.
-enum ErrorRecoveryAction: Sendable, Identifiable {
+enum ErrorRecoveryAction: Sendable, Identifiable, Equatable {
     case dismiss
     case retry
     case openSystemSettingsPrivacy
     case openSystemSettings
+    /// Opens System Settings → Privacy & Security → Automation.
+    case openSystemSettingsAutomation
 
     var id: String {
         switch self {
-        case .dismiss:                   "dismiss"
-        case .retry:                     "retry"
-        case .openSystemSettingsPrivacy: "privacy"
-        case .openSystemSettings:        "settings"
+        case .dismiss:                      "dismiss"
+        case .retry:                        "retry"
+        case .openSystemSettingsPrivacy:    "privacy"
+        case .openSystemSettings:           "settings"
+        case .openSystemSettingsAutomation: "automation-settings"
         }
     }
 
     var label: String {
         switch self {
-        case .dismiss:                   "Dismiss"
-        case .retry:                     "Try Again"
-        case .openSystemSettingsPrivacy: "Open Privacy Settings"
-        case .openSystemSettings:        "Open System Settings"
+        case .dismiss:                      "Dismiss"
+        case .retry:                        "Try Again"
+        case .openSystemSettingsPrivacy:    "Open Privacy Settings"
+        case .openSystemSettings:           "Open System Settings"
+        case .openSystemSettingsAutomation: "Open Automation Settings"
         }
     }
 
@@ -109,6 +115,10 @@ enum ApplicationError: Error, Sendable {
     case calendarSyncFailed
     case calendarEventCreationFailed
 
+    // MARK: Automation (AppleScript / browser meeting detection)
+    /// NSAppleScript returned -1743 (errAEEventNotPermitted) for the named application.
+    case automationPermissionDenied(app: String)
+
     // MARK: Unknown
     case unknown(underlying: String)
 }
@@ -152,6 +162,8 @@ extension ApplicationError {
         case .calendarAccessDenied:         return "Calendar Access Denied"
         case .calendarSyncFailed:           return "Calendar Sync Failed"
         case .calendarEventCreationFailed:  return "Could Not Create Event"
+
+        case .automationPermissionDenied:   return "Automation Access Denied"
 
         case .unknown:                      return "Something Went Wrong"
         }
@@ -219,6 +231,10 @@ extension ApplicationError {
         case .calendarEventCreationFailed:
             return "The calendar event could not be created. Please try again."
 
+        case .automationPermissionDenied(let app):
+            return "Orin needs Automation access to check \(app) for browser-based meetings. " +
+                   "Open System Settings → Privacy & Security → Automation and enable Orin."
+
         case .unknown:
             return "An unexpected error occurred. If this continues, please restart Orin."
         }
@@ -241,6 +257,9 @@ extension ApplicationError {
              .vaultAuthenticationFailed, .vaultKeychainFailed,
              .vaultEncryptionFailed, .vaultRecoveryFailed,
              .calendarEventCreationFailed,
+             // Automation denial is .high (not .critical) because the app still functions
+             // via native-app and calendar-based meeting detection.
+             .automationPermissionDenied,
              .unknown:
             return .high
 
@@ -257,6 +276,9 @@ extension ApplicationError {
         switch self {
         case .permissionDenied, .permissionRestricted, .calendarAccessDenied:
             return [.openSystemSettingsPrivacy, .dismiss]
+        case .automationPermissionDenied:
+            // Primary: deep-link to Automation pane. Secondary: retry detection immediately.
+            return [.openSystemSettingsAutomation, .retry, .dismiss]
         case .aiNoProvidersConfigured, .vaultNotConfigured:
             return [.dismiss]
         case .vaultUserCancelled:
@@ -302,6 +324,8 @@ extension ApplicationError {
             return "lock.fill"
         case .calendarAccessDenied, .calendarSyncFailed, .calendarEventCreationFailed:
             return "calendar.badge.exclamationmark"
+        case .automationPermissionDenied:
+            return "gearshape.2"
         case .unknown:
             return "exclamationmark.triangle.fill"
         }

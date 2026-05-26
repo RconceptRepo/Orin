@@ -119,6 +119,17 @@ struct ErrorModalView: View {
             }
             .buttonStyle(OrinPrimaryButtonStyle())
             .frame(maxWidth: .infinity)
+
+        case .openSystemSettingsAutomation:
+            Button("Open Automation Settings") {
+                // Deep-link directly to Privacy & Security → Automation.
+                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation") {
+                    NSWorkspace.shared.open(url)
+                }
+                onDismiss()
+            }
+            .buttonStyle(OrinPrimaryButtonStyle())
+            .frame(maxWidth: .infinity)
         }
     }
 }

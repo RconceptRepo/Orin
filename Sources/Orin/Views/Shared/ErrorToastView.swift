@@ -37,6 +37,18 @@ struct ErrorToastView: View {
 
             // Actions
             HStack(spacing: 10) {
+                // Deep-link shortcut: shown when the error includes an Automation Settings action.
+                if item.error.recoveryActions.contains(.openSystemSettingsAutomation) {
+                    Button("Settings") {
+                        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation") {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .font(OrinFont.caption.weight(.semibold))
+                    .foregroundStyle(OrinColor.accent)
+                }
+
                 if item.retryAction != nil, item.error.isRetryable {
                     Button {
                         guard !isRetrying else { return }
