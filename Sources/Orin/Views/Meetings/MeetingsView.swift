@@ -15,12 +15,6 @@ struct MeetingsView: View {
     }
 
     var body: some View {
-        // CRASH-DIAG: MeetingsView body is being evaluated.
-        // This fires when MeetingsView is first shown (selectedModule = .meetings),
-        // when meetings @Query updates, or when selectedMeetingID changes.
-        // If this fires BEFORE "TodayView.onDisappear" is logged, the two views
-        // are briefly co-rendering — a normal transitional state in SwiftUI.
-        let _ = CrashDiag.trace("MeetingsView.body evaluated meetingsCount=\(meetings.count) selectedID=\(String(describing: selectedMeetingID)) inTask=\(CrashDiag.isInSwiftTask)")
         HSplitView {
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
@@ -60,27 +54,6 @@ struct MeetingsView: View {
                 )
                 .frame(minWidth: 560)
             }
-        }
-        .onAppear {
-            // CRASH-DIAG: MeetingsView is now live. Its @Query will receive any
-            // subsequent MeetingItem save notifications.  The meeting inserted in
-            // onStart will already be in 'meetings' if safeSave completed first.
-            CrashDiag.trace("MeetingsView.onAppear meetingsCount=\(meetings.count) ids=\(meetings.map(\.id)) inTask=\(CrashDiag.isInSwiftTask)")
-        }
-        .onDisappear {
-            CrashDiag.trace("MeetingsView.onDisappear meetingsCount=\(meetings.count)")
-        }
-        // CRASH-DIAG: Track @Query updates in MeetingsView.
-        // This view is the DESTINATION of the navigation.  If its @Query fires
-        // BEFORE TodayView.onDisappear, both views are simultaneously receiving
-        // MeetingItem notifications — confirming the race window.
-        .onChange(of: meetings) { old, new in
-            let addedIDs = new.map(\.id).filter { id in !old.map(\.id).contains(id) }
-            CrashDiag.trace("MeetingsView @Query(MeetingItem) changed: \(old.count) → \(new.count) added=\(addedIDs) inTask=\(CrashDiag.isInSwiftTask)")
-        }
-        // CRASH-DIAG: Track selection.
-        .onChange(of: selectedMeetingID) { _, id in
-            CrashDiag.trace("MeetingsView selectedMeetingID = \(String(describing: id))")
         }
         .sheet(isPresented: $isCreatingMeeting) {
             MeetingEditorView { draft in
@@ -262,47 +235,22 @@ private struct MeetingDetailView: View {
         }
         .padding()
         .onAppear {
-            // CRASH-DIAG: MeetingDetailView appeared. Log the @Bindable meeting's address.
-            // CRITICAL: Compare this address to the one logged in MainContainerView's
-            // "activeRecordingMeeting set" line.  If they are DIFFERENT addresses, these
-            // are two separate Swift objects for the same persistent record.  Both
-            // MainContainerView and MeetingDetailView will then write to different objects
-            // and call safeSave, causing conflicting updates on recording stop.
-            CrashDiag.trace("MeetingDetailView.onAppear meetingID=\(meeting.id) addr=\(CrashDiag.addr(meeting)) activeMeetingID=\(String(describing: recordingService.activeMeetingID)) inTask=\(CrashDiag.isInSwiftTask)")
             if recordingService.activeMeetingID == meeting.id {
                 wasRecordingThisMeeting = true
-                CrashDiag.trace("MeetingDetailView.onAppear wasRecordingThisMeeting=true (recording already started)")
             }
         }
-        .onDisappear {
-            // CRASH-DIAG: MeetingDetailView removed. The @Bindable storage for 'meeting'
-            // (a @Model object) will be freed shortly after this point.  If any pending
-            // @Observable observation of meeting fires after this, it's a use-after-free.
-            CrashDiag.trace("MeetingDetailView.onDisappear meetingID=\(meeting.id) addr=\(CrashDiag.addr(meeting)) wasRecording=\(wasRecordingThisMeeting)")
-        }
         .onChange(of: recordingService.activeMeetingID) { _, newID in
-            CrashDiag.trace("MeetingDetailView activeMeetingID changed → \(String(describing: newID)) meeting.id=\(meeting.id) match=\(newID == meeting.id)")
             if newID == meeting.id {
                 wasRecordingThisMeeting = true
             }
         }
         .onChange(of: recordingService.transcript) { _, newValue in
             guard wasRecordingThisMeeting else { return }
-            // CRASH-DIAG: Live transcript write. 'meeting' is a @Bindable @Model.
-            // If 'meeting' has been freed (e.g., context reset), writing here crashes.
-            CrashDiag.trace("MeetingDetailView transcript update len=\(newValue.count) meetingID=\(meeting.id) addr=\(CrashDiag.addr(meeting))")
             meeting.transcript = newValue
         }
         .onChange(of: recordingService.isRecording) { _, isNow in
-            CrashDiag.trace("MeetingDetailView recordingService.isRecording=\(isNow) wasRecordingThisMeeting=\(wasRecordingThisMeeting) meetingID=\(meeting.id) inTask=\(CrashDiag.isInSwiftTask)")
             guard !isNow, wasRecordingThisMeeting else { return }
             wasRecordingThisMeeting = false
-            // CRASH-DIAG: DOUBLE-WRITE RISK.
-            // MainContainerView.onChange(of: isRecording) ALSO fires here and writes to
-            // activeRecordingMeeting (a DIFFERENT Swift object for the same persistent record).
-            // Both will call safeSave.  The @Query in MeetingsView will fire twice from the
-            // same or conflicting saves, potentially crashing on the second notification.
-            CrashDiag.trace("MeetingDetailView recording stopped — writing to meeting id=\(meeting.id) addr=\(CrashDiag.addr(meeting))")
             meeting.durationSeconds = TimeInterval(recordingService.elapsedSeconds)
             if let url = recordingService.recordingURL {
                 meeting.audioFilePath = url.path

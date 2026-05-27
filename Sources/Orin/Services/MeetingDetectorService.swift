@@ -170,8 +170,6 @@ final class MeetingDetectorService: Service {
 
     @MainActor
     func dismissPrompt() {
-        // CRASH-DIAG: prompt dismissed — either by onDismiss or after recording starts.
-        CrashDiag.trace("MeetingDetectorService.dismissPrompt shouldShowRecordingPrompt false activeMeetingKey=\(String(describing: activeMeetingKey)) inTask=\(CrashDiag.isInSwiftTask)")
         shouldShowRecordingPrompt = false
         dismissedMeetingKey = activeMeetingKey
     }
@@ -590,8 +588,6 @@ final class MeetingDetectorService: Service {
         activeMeetingKey = result.key
         detectedMeetingApp = result.app
         shouldShowRecordingPrompt = true
-        // CRASH-DIAG: prompt is now visible. Record the moment and verify task context.
-        CrashDiag.trace("MeetingDetectorService PROMPT SHOWN app='\(result.app)' key='\(result.key)' inTask=\(CrashDiag.isInSwiftTask)")
         onMeetingDetected?(result.app)
     }
 }

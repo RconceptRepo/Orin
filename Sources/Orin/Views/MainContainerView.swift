@@ -64,80 +64,39 @@ struct MainContainerView: View {
                         MeetingRecordingPromptView(
                             appName: appName,
                             onStart: {
-                                // CRASH-DIAG: This closure is the button action. It runs in
-                                // SwiftUI's event-handling context (NOT a Swift task yet).
-                                // The Task {} below creates a proper Swift Concurrency task.
-                                CrashDiag.trace("onStart closure entered — creating Task. inTask=\(CrashDiag.isInSwiftTask)")
                                 Task { @MainActor in
-                                    // CRASH-DIAG: T+0 — we are now inside Task {@MainActor in}.
-                                    // inTask MUST be true here; if false the subsequent @Observable
-                                    // mutations will reach @Query.update() without a task context.
-                                    CrashDiag.trace("onStart TASK BEGIN inTask=\(CrashDiag.isInSwiftTask) ctx=\(CrashDiag.addr(modelContext))")
-
                                     let formatter = DateFormatter()
                                     formatter.dateStyle = .short
                                     formatter.timeStyle = .short
 
-                                    // CRASH-DIAG: T+1 — MeetingItem created (before context assign).
-                                    // MeetingItem.init will also log its address.
                                     let meeting = MeetingItem(
                                         title: "Meeting — \(formatter.string(from: Date()))",
                                         date: Date()
                                     )
-                                    CrashDiag.trace("onStart MeetingItem created id=\(meeting.id) addr=\(CrashDiag.addr(meeting))")
 
-                                    // CRASH-DIAG: T+2 — insert. No context yet; this assigns one.
                                     modelContext.insert(meeting)
-                                    CrashDiag.trace("onStart modelContext.insert done id=\(meeting.id) inTask=\(CrashDiag.isInSwiftTask)")
 
-                                    // CRASH-DIAG: T+3 — THE CRITICAL SAVE.
-                                    // safeSave → save() → SwiftData fires ModelContext change
-                                    // notification synchronously.  TodayView's
-                                    // @Query(sort: \MeetingItem.date) is currently live (the
-                                    // user is on the Today module).  Its @Query.update() fires
-                                    // from inside this save call.
-                                    //
-                                    // If isInSwiftTask is TRUE here AND the crash still occurs,
-                                    // the bug is NOT about task context but about the @Query
-                                    // firing on a TodayView DynamicPropertyStorage that is freed
-                                    // by "selectedModule = .meetings" in the same render cycle.
-                                    CrashDiag.trace("onStart → safeSave BEGIN (selectedModule still=\(selectedModule))")
+                                    // Save first so SwiftData can fire any pending @Query
+                                    // notifications while TodayView is still fully alive.
                                     modelContext.safeSave(context: "meeting")
-                                    CrashDiag.trace("onStart → safeSave END  (app still running — no crash yet)")
 
-                                    // CRASH-DIAG: T+4
                                     activeRecordingMeeting = meeting
-                                    CrashDiag.trace("onStart activeRecordingMeeting set id=\(meeting.id) addr=\(CrashDiag.addr(meeting))")
 
-                                    // CRASH-DIAG: T+5 — THIS QUEUES TodayView TEARDOWN.
-                                    // After this line, SwiftUI will remove TodayView (which owns
-                                    // the @Query that just received a save notification) from the
-                                    // hierarchy.  The teardown and the pending @Query.update()
-                                    // race at the next yield point (the "await" below).
+                                    // Yield before navigating away. This gives SwiftUI one
+                                    // pass to process the @Query update for TodayView while
+                                    // TodayView is still in the hierarchy — guaranteeing the
+                                    // EmbeddedDynamicPropertyBox.update() completes before the
+                                    // view is torn down, which prevents the EXC_BAD_ACCESS 0x1e
+                                    // use-after-free on the freed @Query storage.
+                                    await Task.yield()
+
                                     selectedModule = .meetings
-                                    CrashDiag.trace("onStart selectedModule = .meetings (TodayView teardown queued)")
-
-                                    // CRASH-DIAG: T+6 — FIRST GENUINE SUSPENSION POINT.
-                                    // The main actor yields here.  SwiftUI runs pending renders:
-                                    //   (a) selectedModule change → tears down TodayView,
-                                    //       frees TodayView's DynamicPropertyStorage
-                                    //   (b) pending @Query notification for TodayView's
-                                    //       @Query(MeetingItem) fires → EmbeddedDynamicPropertyBox
-                                    //       .update() → use-after-free → CRASH at 0x1e
-                                    //
-                                    // If the app crashes BEFORE printing the line below, the
-                                    // crash happens at this await boundary.
-                                    CrashDiag.trace("onStart → await startRecording BEGIN meetingID=\(meeting.id)")
-                                    await recordingService.startRecording(for: meeting.id)
-                                    CrashDiag.trace("onStart → await startRecording END phase=\(recordingService.isRecording)")
-
-                                    // CRASH-DIAG: T+7
                                     meetingDetector.dismissPrompt()
-                                    CrashDiag.trace("onStart TASK END dismissPrompt called")
+
+                                    await recordingService.startRecording(for: meeting.id)
                                 }
                             },
                             onDismiss: {
-                                CrashDiag.trace("onDismiss closure entered")
                                 meetingDetector.dismissPrompt()
                             }
                         )
@@ -158,42 +117,14 @@ struct MainContainerView: View {
         .preferredColorScheme(OrinThemeMode(rawValue: themeModeRawValue)?.colorScheme)
         .errorHandlingOverlay()
         .onAppear {
-            CrashDiag.trace("MainContainerView.onAppear selectedModule=\(selectedModule)")
             meetingDetector.startMonitoring()
             calendarService.refreshAuthorizationStatus()
             if calendarBackgroundSync {
                 calendarService.startBackgroundSync()
             }
         }
-        // CRASH-DIAG: Track every module navigation. The key transition is
-        // .today → .meetings triggered from onStart. If this fires BEFORE
-        // "safeSave END" is logged, the ordering hypothesis is wrong.
-        .onChange(of: selectedModule) { old, new in
-            CrashDiag.trace("MainContainerView selectedModule changed: \(old) → \(new) inTask=\(CrashDiag.isInSwiftTask)")
-        }
-        // CRASH-DIAG: Track activeRecordingMeeting identity. If its address
-        // differs from the @Query result that MeetingDetailView receives, we have
-        // two distinct Swift objects for the same persistent record — which means
-        // MainContainerView and MeetingDetailView are double-writing on stop.
-        .onChange(of: activeRecordingMeeting?.id) { old, new in
-            let addr = activeRecordingMeeting.map { CrashDiag.addr($0) } ?? "nil"
-            CrashDiag.trace("MainContainerView activeRecordingMeeting.id: \(String(describing: old)) → \(String(describing: new)) addr=\(addr)")
-        }
-        // CRASH-DIAG: Track prompt lifecycle.
-        .onChange(of: meetingDetector.shouldShowRecordingPrompt) { _, shown in
-            CrashDiag.trace("MainContainerView shouldShowRecordingPrompt=\(shown) app=\(meetingDetector.detectedMeetingApp ?? "nil")")
-        }
-        // CRASH-DIAG: Track recording phase transitions. isRecording goes TRUE
-        // during startRecording (inside the await), and FALSE when stopRecording
-        // fires. Any crash between the TRUE and FALSE events pinpoints the window.
         .onChange(of: recordingService.isRecording) { _, isNow in
-            CrashDiag.trace("MainContainerView recordingService.isRecording=\(isNow) activeMeetingID=\(String(describing: recordingService.activeMeetingID)) inTask=\(CrashDiag.isInSwiftTask)")
             guard !isNow, let meeting = activeRecordingMeeting else { return }
-            // CRASH-DIAG: recording stopped — about to mutate MeetingItem and save.
-            // This is a SECOND write path (MeetingDetailView has its own matching handler).
-            // Both will fire on stop, both mutating different Swift object references
-            // to the same persistent record, and both calling safeSave.
-            CrashDiag.trace("MainContainerView recording stopped — writing to meeting id=\(meeting.id) addr=\(CrashDiag.addr(meeting))")
             meeting.transcript = recordingService.transcript
             meeting.durationSeconds = TimeInterval(recordingService.elapsedSeconds)
             if let url = recordingService.recordingURL {
@@ -201,7 +132,6 @@ struct MainContainerView: View {
             }
             modelContext.safeSave(context: "meeting recording")
             activeRecordingMeeting = nil
-            CrashDiag.trace("MainContainerView activeRecordingMeeting cleared")
         }
         .onChange(of: calendarBackgroundSync) { _, enabled in
             if enabled {

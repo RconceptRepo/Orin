@@ -136,15 +136,8 @@ final class RecordingService: Service {
 
     @MainActor
     func startRecording(for meetingID: UUID? = nil) async {
-        // CRASH-DIAG: startRecording entry point.
-        CrashDiag.trace("RecordingService.startRecording ENTER phase=\(phase) meetingID=\(String(describing: meetingID)) inTask=\(CrashDiag.isInSwiftTask)")
-        guard phase == .idle else {
-            CrashDiag.trace("RecordingService.startRecording EARLY-EXIT (not idle) phase=\(phase)")
-            return
-        }
+        guard phase == .idle else { return }
         phase = .starting
-        CrashDiag.trace("RecordingService phase → .starting")
-        // ─────────────────────────────────────────────────────────────────────
 
         errorMessage = nil
         recordingURL = nil
@@ -154,15 +147,10 @@ final class RecordingService: Service {
         // `startRecording` independently).  Re-confirm the phase is still
         // `.starting` before proceeding with hardware setup.
         if !hasMicPermission || !hasSpeechPermission {
-            CrashDiag.trace("RecordingService requesting permissions (SUSPEND POINT)")
             await requestPermissions()
-            CrashDiag.trace("RecordingService permissions returned hasMic=\(hasMicPermission) hasSpeech=\(hasSpeechPermission)")
         }
 
-        guard phase == .starting else {
-            CrashDiag.trace("RecordingService phase changed during permission await — ABORT phase=\(phase)")
-            return
-        }
+        guard phase == .starting else { return }
 
         guard hasMicPermission else {
             errorMessage = "Microphone access denied. Enable it in System Settings → Privacy & Security → Microphone."
@@ -181,7 +169,6 @@ final class RecordingService: Service {
         }
 
         activeMeetingID = meetingID
-        CrashDiag.trace("RecordingService activeMeetingID set = \(String(describing: meetingID))")
         transcriptPrefix = ""
 
         // `prepare()` must precede the format query so the audio hardware
@@ -225,19 +212,9 @@ final class RecordingService: Service {
             return
         }
 
-        // CRASH-DIAG: phase → .recording makes isRecording = true.
-        // This @Observable mutation fires all observers of isRecording:
-        //   • MainContainerView.onChange(of: isRecording) — guard !isNow, no-op on start
-        //   • MeetingDetailView.onChange(of: isRecording) — guard !isNow, no-op on start
-        //   • MainContainerView.body — shows RecordingWidgetView
-        // SwiftUI schedules these re-renders. If any @Query-holding view (TodayView,
-        // MeetingsView) is simultaneously being torn down or initialized, the render
-        // cycle may race with a pending @Query notification from the earlier safeSave.
-        CrashDiag.trace("RecordingService phase → .recording (isRecording = true) inTask=\(CrashDiag.isInSwiftTask)")
         phase = .recording
         elapsedSeconds = 0
         transcript = ""
-        CrashDiag.trace("RecordingService startRecording COMPLETE — timer armed")
 
         // IMPORTANT: use Task { @MainActor in }, NOT a bare run-loop callback.
         //
