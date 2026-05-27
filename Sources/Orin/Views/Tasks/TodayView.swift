@@ -56,6 +56,12 @@ struct TodayView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: OrinSpacing.gap) {
+            // CRASH-DIAG: TodayView body is being evaluated. This fires on every render
+            // driven by any @Query or @State change inside this view. If this fires AFTER
+            // "onStart selectedModule = .meetings" is logged but BEFORE "TodayView.onDisappear",
+            // the view is rendering while being torn down — the window in which the
+            // use-after-free on EmbeddedDynamicPropertyBox occurs.
+            let _ = CrashDiag.trace("TodayView.body evaluated meetingsCount=\(meetings.count) tasksCount=\(tasks.count) inTask=\(CrashDiag.isInSwiftTask)")
             OrinPageHeader(title: "Today's Execution", subtitle: "Think Less. Do Better.") {
                 HStack {
                     Button {
@@ -118,8 +124,38 @@ struct TodayView: View {
         .padding(OrinSpacing.page)
         .background(OrinColor.backgroundPrimary(colorScheme))
         .onAppear {
+            // CRASH-DIAG: TodayView is now live with its @Query(MeetingItem) subscribed.
+            // After this point, any modelContext.save() that inserts/modifies a MeetingItem
+            // will trigger this view's @Query.update() path inside _SwiftData_SwiftUI.
+            CrashDiag.trace("TodayView.onAppear meetingsCount=\(meetings.count) inTask=\(CrashDiag.isInSwiftTask)")
             dailyBrief = dailyBriefService.generate(tasks: tasks, meetings: meetings, commitments: commitments)
             seedSuggestionIfNeeded()
+        }
+        .onDisappear {
+            // CRASH-DIAG: TodayView is being removed. After this, its EmbeddedDynamicPropertyBox
+            // storage (holding the @Query) is FREED by SwiftUI.  Any @Query.update() that
+            // arrives after this point is a use-after-free.
+            // KEY OBSERVATION: If crash logs show "safeSave BEGIN" → crash WITHOUT
+            // "TodayView.onDisappear" appearing between them, the @Query fires BEFORE the
+            // view teardown completes — the free is racing with the notification delivery.
+            CrashDiag.trace("TodayView.onDisappear meetingsCount=\(meetings.count) inTask=\(CrashDiag.isInSwiftTask)")
+        }
+        // CRASH-DIAG: THIS IS THE CRITICAL OBSERVER.
+        // If this onChange fires AFTER "onStart selectedModule = .meetings" is logged
+        // but BEFORE or DURING "TodayView.onDisappear", we have confirmed the race:
+        // the @Query update and the view teardown are overlapping.
+        //
+        // If this onChange fires with a count that INCLUDES the newly inserted meeting,
+        // it means the save notification reached this @Query while TodayView was still
+        // rendering — which is valid.  But if we NEVER see this onChange (because the
+        // crash happens before it prints), the notification fires in a path that doesn't
+        // reach the onChange wrapper — meaning @Query.update() fires directly from
+        // within the EmbeddedDynamicPropertyBox.update() call, not through a SwiftUI
+        // onChange modifier.
+        .onChange(of: meetings) { old, new in
+            let oldIDs = old.map(\.id)
+            let newIDs = new.map(\.id)
+            CrashDiag.trace("TodayView @Query(MeetingItem) changed: \(old.count) → \(new.count) added=\(newIDs.filter { !oldIDs.contains($0) }) removed=\(oldIDs.filter { !newIDs.contains($0) }) inTask=\(CrashDiag.isInSwiftTask)")
         }
         .sheet(isPresented: $isAddingTask) {
             TaskEditorView(title: "Create Tasks", defaultDueDate: Date()) { drafts in

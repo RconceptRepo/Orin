@@ -141,6 +141,14 @@ final class MeetingItem {
         actionItems = []
         suggestedTaskTitles = []
         acceptedSuggestedTaskTitles = []
+        // CRASH-DIAG: log creation so we can verify object address vs @Query proxy addresses
+        CrashDiag.trace("MeetingItem.init id=\(id) addr=\(CrashDiag.addr(self)) title='\(title)'")
+    }
+
+    deinit {
+        // CRASH-DIAG: if this fires BEFORE the @Query update for TodayView or MeetingsView
+        // completes, the @Bindable in MeetingDetailView is referencing freed memory.
+        CrashDiag.trace("MeetingItem.deinit id=\(id) addr=\(CrashDiag.addr(self))")
     }
 }
 
