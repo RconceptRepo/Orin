@@ -10,6 +10,13 @@ struct OrinApp: App {
 
     private static let appLogger = Logger(subsystem: "com.clavrit.orin", category: "App")
 
+    // Debug-only: state for the Developer → Reset Application State sheet.
+    // Wrapped in #if DEBUG so the property and all its dependencies are
+    // completely absent from Release builds.
+#if DEBUG
+    @State private var showingDebugReset = false
+#endif
+
     init() {
         let schema = Schema([
             TaskItem.self,
@@ -137,6 +144,18 @@ struct OrinApp: App {
                     OnboardingView()
                         .interactiveDismissDisabled()
                 }
+#if DEBUG
+                // Debug reset sheet — only present in DEBUG builds.
+                // Posted by the Developer → Reset Application State menu item.
+                .onReceive(
+                    NotificationCenter.default.publisher(for: .debugResetRequested)
+                ) { _ in
+                    showingDebugReset = true
+                }
+                .sheet(isPresented: $showingDebugReset) {
+                    DebugResetView()
+                }
+#endif
         }
         .windowStyle(.titleBar)
         .windowToolbarStyle(.unified)
@@ -147,6 +166,19 @@ struct OrinApp: App {
                 }
                 .keyboardShortcut(" ", modifiers: [.control, .option])
             }
+#if DEBUG
+            // Developer menu — compiled only in DEBUG; absent from Release.
+            CommandMenu("Developer") {
+                Button("Reset Application State…") {
+                    NotificationCenter.default.post(
+                        name: .debugResetRequested,
+                        object: nil
+                    )
+                }
+                .keyboardShortcut("R", modifiers: [.command, .shift, .option])
+                .help("Clear all local data and reproduce the first-launch experience. Debug only.")
+            }
+#endif
         }
 
         MenuBarExtra("Orin", systemImage: "bolt.shield") {
