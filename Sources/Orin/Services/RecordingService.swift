@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreAudio
 import Foundation
 import Observation
 import Speech
@@ -142,40 +143,107 @@ final class RecordingService: Service {
         errorMessage = nil
         recordingURL = nil
 
-        // `requestPermissions()` suspends this function and allows other
-        // @MainActor work to run (e.g. the auto-detection prompt calling
-        // `startRecording` independently).  Re-confirm the phase is still
-        // `.starting` before proceeding with hardware setup.
+        // ── STEP 1: permissions ───────────────────────────────────────────────
+        print("STEP 1: checking mic permission")
+
+        // `requestPermissions()` suspends and allows other @MainActor work to run.
+        // Re-confirm phase is still `.starting` after the await.
         if !hasMicPermission || !hasSpeechPermission {
+            print("STEP 1: requesting permissions (suspended)")
             await requestPermissions()
+            print("STEP 1: permissions returned hasMic=\(hasMicPermission) hasSpeech=\(hasSpeechPermission)")
         }
 
-        guard phase == .starting else { return }
+        guard phase == .starting else {
+            print("STEP 1: phase changed during permission request — aborting (phase=\(phase))")
+            return
+        }
 
         guard hasMicPermission else {
+            print("STEP 1: microphone access denied")
             errorMessage = "Microphone access denied. Enable it in System Settings → Privacy & Security → Microphone."
             phase = .idle
             return
         }
         guard hasSpeechPermission else {
+            print("STEP 1: speech recognition access denied")
             errorMessage = "Speech Recognition access denied. Enable it in System Settings → Privacy & Security → Speech Recognition."
             phase = .idle
             return
         }
         guard let recognizer = speechRecognizer, recognizer.isAvailable else {
+            print("STEP 1: speech recognizer unavailable")
             errorMessage = "Speech recognition is unavailable on this device."
             phase = .idle
             return
         }
+        print("STEP 1: permissions OK — mic=\(hasMicPermission) speech=\(hasSpeechPermission)")
+
+        // ── STEP 2: audio device check + engine guard ─────────────────────────
+        // Root cause of EXC_BAD_ACCESS (SIGSEGV) KERN_INVALID_ADDRESS 0x0:
+        //
+        // `AVAudioEngine.prepare()` initialises AVAudioEngineGraph, which calls
+        // into the CoreAudio Hardware Abstraction Layer (HAL) to open the default
+        // input device. If no default input device exists (Mac mini without a
+        // microphone, Bluetooth device disconnected mid-session, etc.), the HAL
+        // returns kAudioObjectUnknown (0) and the graph stores a null device ID.
+        // When the graph then tries to dereference that device pointer, the process
+        // crashes with KERN_INVALID_ADDRESS 0x0000000000000000.
+        //
+        // Fix: query the default input device ID via CoreAudio BEFORE touching
+        // AVAudioEngine. This is lightweight (a single HAL property read) and does
+        // not open any hardware. We fail fast with a user-visible error.
+        print("STEP 2: creating AVAudioEngine")
+
+        var defaultInputDeviceID: AudioDeviceID = kAudioObjectUnknown
+        var propSize = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var propAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope:    kAudioObjectPropertyScopeGlobal,
+            mElement:  kAudioObjectPropertyElementMain
+        )
+        let halStatus = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &propAddr, 0, nil, &propSize, &defaultInputDeviceID
+        )
+        guard halStatus == noErr, defaultInputDeviceID != kAudioObjectUnknown else {
+            print("STEP 2: no default audio input device (halStatus=\(halStatus) deviceID=\(defaultInputDeviceID))")
+            errorMessage = "No audio input device detected. Connect a microphone and try again."
+            phase = .idle
+            return
+        }
+        print("STEP 2: audio input device found (halStatus=\(halStatus) deviceID=\(defaultInputDeviceID))")
+
+        // Safety: remove any tap left over from a previous session that was not
+        // cleaned up cleanly (e.g. crash, force-quit, or failed stopRecording).
+        // `removeTap(onBus:)` on an untapped bus is a documented no-op.
+        audioEngine.inputNode.removeTap(onBus: 0)
+        print("STEP 2: stale tap removed (or was already absent)")
+
+        // ── STEP 3: input node ────────────────────────────────────────────────
+        // Accessing `inputNode` after the HAL device check is safe: the lazy
+        // property connects to the now-confirmed default device. Do NOT call
+        // `audioEngine.prepare()` here — that is deferred until STEP 6 so the
+        // graph is configured with the tap already in place.
+        print("STEP 3: getting input node")
+        let inputNode = audioEngine.inputNode
+
+        // ── STEP 4: format validation ─────────────────────────────────────────
+        // `outputFormat(forBus:)` on the input node returns the hardware capture
+        // format. A zero sample rate means the driver did not initialise (e.g.
+        // the device was removed between the HAL check and this point).
+        let format = inputNode.outputFormat(forBus: 0)
+        print("STEP 4: format = \(format)")
+        guard format.sampleRate > 0 else {
+            print("STEP 4: invalid format — sampleRate=0, aborting")
+            errorMessage = "Audio input format is invalid (sample rate 0). Check your microphone connection and try again."
+            phase = .idle
+            return
+        }
+        print("STEP 4: format valid — sampleRate=\(format.sampleRate) channels=\(format.channelCount)")
 
         activeMeetingID = meetingID
         transcriptPrefix = ""
-
-        // `prepare()` must precede the format query so the audio hardware
-        // driver initialises and `outputFormat(forBus:)` returns a non-zero rate.
-        audioEngine.prepare()
-        let inputNode = audioEngine.inputNode
-        let format    = inputNode.outputFormat(forBus: 0)
 
         // Create the on-disk file before arming the tap state.  If this fails,
         // no tap is installed and no hardware is left in a partial state.
@@ -183,29 +251,42 @@ final class RecordingService: Service {
         do {
             audioFile = try makeAudioFile(format: format)
         } catch {
+            print("STEP 4: audio file creation failed — \(error)")
             errorMessage = "Could not create audio file: \(error.localizedDescription)"
             phase = .idle
             return
         }
 
-        // Arm the tap state **before** calling `installTap`.  The Core-Audio
-        // callback may fire immediately after installation; both `audioFile` and
-        // `recognitionRequest` must already be valid at that moment.
+        // Arm tap state BEFORE installTap — the Core-Audio callback may fire
+        // immediately after installation, so both audioFile and recognitionRequest
+        // must be valid at that moment.
         let initialRequest = buildRecognitionRequest(recognizer: recognizer)
         tapState.arm(audioFile: audioFile, recognitionRequest: initialRequest)
-
         startRecognitionTask(with: recognizer, request: initialRequest)
 
-        // The tap closure captures `tapState` by value (strong reference to the
-        // object), not `self`.  This avoids touching any @Observable state from
-        // the audio thread.
+        // ── STEP 5: install tap ───────────────────────────────────────────────
+        // The tap closure captures `tapState` (not `self`) to avoid touching
+        // @Observable state from the Core-Audio real-time I/O thread.
+        print("STEP 5: installing tap")
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [tapState] buffer, _ in
             tapState.feed(buffer: buffer)
         }
+        print("STEP 5: tap installed")
+
+        // ── STEP 6: prepare + start ───────────────────────────────────────────
+        // `prepare()` is called AFTER installTap so the engine graph is
+        // configured with the tap already in place. Calling prepare() earlier
+        // (before the tap) required a second implicit re-initialisation inside
+        // start(), which was the observed crash site.
+        print("STEP 6: preparing engine")
+        audioEngine.prepare()
+        print("STEP 6: engine prepared — calling start()")
 
         do {
             try audioEngine.start()
+            print("STEP 6: engine started successfully")
         } catch {
+            print("STEP 6: engine start FAILED — \(error)")
             teardownAudioEngine()
             errorMessage = "Audio engine failed to start: \(error.localizedDescription)"
             phase = .idle
@@ -216,20 +297,15 @@ final class RecordingService: Service {
         elapsedSeconds = 0
         transcript = ""
 
-        // IMPORTANT: use Task { @MainActor in }, NOT a bare run-loop callback.
-        //
-        // The Timer callback fires on the main-thread run loop, which is on the
-        // main *thread* but NOT within a Swift Concurrency actor task.
-        // macOS 26 enforces that @Query.update() is called from a Swift task via
-        // swift_task_isCurrentExecutorWithFlagsImpl; a bare run-loop callback has
-        // no current task, causing the PAC-pointer EXC_BREAKPOINT crash.
-        // Wrapping the mutation in Task { @MainActor in } creates a proper Swift
-        // actor task, satisfying the runtime invariant.
+        // Timer fires on the main-thread run loop. Wrap mutation in
+        // Task { @MainActor in } to create a proper Swift Concurrency
+        // task context — required by macOS 26 executor isolation checks.
         durationTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.elapsedSeconds += 1
             }
         }
+        print("STEP 6: recording started — phase=\(phase)")
     }
 
     @MainActor
