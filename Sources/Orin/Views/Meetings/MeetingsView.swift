@@ -73,8 +73,13 @@ private struct MeetingDetailView: View {
 
     @State private var isAnalyzing = false
     @State private var isImportingTranscript = false
-    @State private var recordingService = ServiceContainer.shared.resolve(RecordingService.self)
+    @State private var recordingService  = ServiceContainer.shared.resolve(RecordingService.self)
+    @State private var meetingDetector   = ServiceContainer.shared.resolve(MeetingDetectorService.self)
     @State private var wasRecordingThisMeeting = false
+    /// Set when the user taps "Start Recording" with no meeting detected.
+    @State private var noActiveMeetingError = false
+    /// Fires every 10 s during recording to checkpoint transcript to SwiftData.
+    @State private var transcriptCheckpointTimer: Timer?
 
     private let intelligence = ServiceContainer.shared.resolve(MeetingIntelligenceService.self)
 
@@ -127,28 +132,45 @@ private struct MeetingDetailView: View {
                                         recordingService.stopRecording()
                                     }
                                 }
-                                if !recordingService.transcript.isEmpty {
-                                    Text(recordingService.transcript)
+                                if !recordingService.speakerTranscript.isEmpty {
+                                    Text(recordingService.speakerTranscript)
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                         .lineLimit(3)
                                 }
                             }
                         } else {
-                            HStack {
-                                if let path = meeting.audioFilePath {
-                                    Label("Audio saved: \(URL(fileURLWithPath: path).lastPathComponent)", systemImage: "waveform")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                } else {
-                                    Text("Not recording").foregroundStyle(.secondary).font(.body)
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    if let path = meeting.audioFilePath {
+                                        Label("Audio saved: \(URL(fileURLWithPath: path).lastPathComponent)", systemImage: "waveform")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    } else {
+                                        Text("Not recording").foregroundStyle(.secondary).font(.body)
+                                    }
+                                    Spacer()
+                                    // Part 4: block recording when no meeting platform is detected.
+                                    // meetingDetector.detectedMeetingApp is nil between meetings.
+                                    Button {
+                                        guard meetingDetector.detectedMeetingApp != nil else {
+                                            noActiveMeetingError = true
+                                            print("[Recording] manual start blocked — no active meeting detected for '\(meeting.title)'")
+                                            return
+                                        }
+                                        noActiveMeetingError = false
+                                        wasRecordingThisMeeting = true
+                                        print("[Recording] manual start approved meeting='\(meeting.title)' platform=\(meetingDetector.detectedMeetingApp ?? "?")")
+                                        Task { await recordingService.startRecording(for: meeting.id) }
+                                    } label: {
+                                        Label("Start Recording", systemImage: "record.circle")
+                                    }
                                 }
-                                Spacer()
-                                Button {
-                                    wasRecordingThisMeeting = true
-                                    Task { await recordingService.startRecording(for: meeting.id) }
-                                } label: {
-                                    Label("Start Recording", systemImage: "record.circle")
+                                if noActiveMeetingError {
+                                    Text("No active meeting detected. Start a meeting in your browser or app first.")
+                                        .font(.caption)
+                                        .foregroundStyle(.orange)
+                                        .fixedSize(horizontal: false, vertical: true)
                                 }
                             }
                         }
@@ -236,26 +258,41 @@ private struct MeetingDetailView: View {
         .padding()
         .onAppear {
             if recordingService.activeMeetingID == meeting.id {
+                print("[Recording] MeetingDetailView appeared — recording already in progress meetingID=\(meeting.id)")
                 wasRecordingThisMeeting = true
+                startTranscriptCheckpoints()
             }
         }
         .onChange(of: recordingService.activeMeetingID) { _, newID in
             if newID == meeting.id {
+                print("[Recording] activeMeetingID now matches this view meetingID=\(meeting.id)")
                 wasRecordingThisMeeting = true
+                startTranscriptCheckpoints()
             }
         }
-        .onChange(of: recordingService.transcript) { _, newValue in
+        // Part 2: store speaker-labeled transcript so speaker labels persist through checkpoints.
+        // Part 1: live write keeps meeting.transcript always current for checkpoint saves.
+        .onChange(of: recordingService.transcript) { _, _ in
             guard wasRecordingThisMeeting else { return }
-            meeting.transcript = newValue
+            let labeled = recordingService.speakerTranscript
+            meeting.transcript = labeled
+            print("[Transcript] live update chars=\(labeled.count) meeting=\(meeting.id)")
         }
+        // Part 1: stop checkpoint timer and finalize on recording end.
         .onChange(of: recordingService.isRecording) { _, isNow in
             guard !isNow, wasRecordingThisMeeting else { return }
             wasRecordingThisMeeting = false
+            // Stop checkpoint timer
+            transcriptCheckpointTimer?.invalidate()
+            transcriptCheckpointTimer = nil
+            print("[Transcript] checkpoint timer stopped (recording ended) meeting=\(meeting.id)")
+            // Final metadata + persist
             meeting.durationSeconds = TimeInterval(recordingService.elapsedSeconds)
             if let url = recordingService.recordingURL {
                 meeting.audioFilePath = url.path
             }
             modelContext.safeSave(context: "meeting recording")
+            print("[Transcript] finalized meeting=\(meeting.id) chars=\(meeting.transcript.count) duration=\(meeting.durationSeconds)s")
         }
         .fileImporter(
             isPresented: $isImportingTranscript,
@@ -301,6 +338,27 @@ private struct MeetingDetailView: View {
         meeting.acceptedSuggestedTaskTitles.append(title)
         modelContext.insert(task)
         modelContext.safeSave(context: "task from meeting")
+    }
+
+    // MARK: - Transcript checkpointing (Part 1)
+
+    /// Starts a 10-second repeating timer that persists the current transcript to SwiftData.
+    ///
+    /// Calling this while a timer is already running invalidates the old timer first,
+    /// preventing duplicate timers if `onAppear` and `onChange(of: activeMeetingID)` both fire.
+    ///
+    /// The timer callback wraps in `Task { @MainActor in }` so it runs as a proper Swift
+    /// Concurrency task (required by macOS 26's executor-isolation checks).
+    private func startTranscriptCheckpoints() {
+        transcriptCheckpointTimer?.invalidate()
+        transcriptCheckpointTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { _ in
+            Task { @MainActor in
+                guard wasRecordingThisMeeting, recordingService.isRecording else { return }
+                modelContext.safeSave(context: "transcript checkpoint")
+                print("[Transcript] checkpoint persisted chars=\(meeting.transcript.count) elapsed=\(recordingService.elapsedSeconds)s meeting=\(meeting.id)")
+            }
+        }
+        print("[Transcript] checkpoint timer started (10 s interval) meeting=\(meeting.id)")
     }
 
     private func importTranscript(_ result: Result<[URL], Error>) {

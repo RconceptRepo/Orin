@@ -49,6 +49,11 @@ final class MeetingDetectorService: Service {
     /// Fired on the main thread the first time a new meeting session is discovered.
     var onMeetingDetected: ((String) -> Void)?
 
+    /// Called on the main actor when an active meeting disappears from the detection window.
+    /// Used by `MainContainerView` to auto-stop recording within 3–5 s of meeting end.
+    /// Safe to set multiple times (last writer wins); nil by default.
+    var onMeetingEnded: (() -> Void)?
+
     // MARK: - Private Configuration
 
     private let nativeApps: [(bundleID: String, displayName: String)] = [
@@ -87,6 +92,8 @@ final class MeetingDetectorService: Service {
     // MARK: - Private State
 
     private var timer: Timer?
+    /// Prevents concurrent poll tasks from stacking when fast-poll is active.
+    @ObservationIgnored private var isPollInFlight = false
 
     /// Key of the currently detected meeting session.
     private var activeMeetingKey: String?
@@ -160,6 +167,7 @@ final class MeetingDetectorService: Service {
     func stopMonitoring() {
         timer?.invalidate()
         timer = nil
+        isPollInFlight = false
         detectedMeetingApp = nil
         shouldShowRecordingPrompt = false
         activeMeetingKey = nil
@@ -172,6 +180,35 @@ final class MeetingDetectorService: Service {
     func dismissPrompt() {
         shouldShowRecordingPrompt = false
         dismissedMeetingKey = activeMeetingKey
+    }
+
+    /// Switches the poll interval to 4 s while recording is active.
+    ///
+    /// Called by `MainContainerView` when `recordingService.isRecording` becomes `true`.
+    /// A 4 s cadence allows meeting-end detection within ≤ 8 s (one miss + one hit),
+    /// satisfying the 3–5 s auto-stop requirement for typical meeting-end events.
+    ///
+    /// No-op if monitoring has not been started yet.
+    @MainActor
+    func enableFastPoll() {
+        guard timer != nil else { return }
+        print("[AutoStop] fast poll enabled (4 s interval)")
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
+            self?.poll()
+        }
+        poll()   // immediate check so first detection fires within ≤ 4 s, not 4+4
+    }
+
+    /// Restores the normal 30 s poll interval after recording stops.
+    @MainActor
+    func disableFastPoll() {
+        guard timer != nil else { return }
+        print("[AutoStop] fast poll disabled — restoring 30 s interval")
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            self?.poll()
+        }
     }
 
     /// Re-triggers browser detection immediately after the user grants Automation permission.
@@ -189,10 +226,19 @@ final class MeetingDetectorService: Service {
     // MARK: - Polling (timer fires on main thread)
 
     private func poll() {
+        // Guard: prevent concurrent detection tasks when fast-poll fires faster than
+        // a slow AppleScript/EventKit query can complete. Without this, tasks queue on
+        // scriptQueue and back up under poor network or script-timeout conditions.
+        guard !isPollInFlight else {
+            print("[MeetingDetector] poll skipped — previous task still in flight")
+            return
+        }
+        isPollInFlight = true
         Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
             let detection = await self.detectMeeting()
             await self.applyDetectionResult(detection)
+            await MainActor.run { self.isPollInFlight = false }
         }
     }
 
@@ -560,8 +606,11 @@ final class MeetingDetectorService: Service {
             // Meeting left the detection window (or native app exited).
             // Always clear the visible overlay state.
             guard detectedMeetingApp != nil || shouldShowRecordingPrompt else { return }
+            let endedApp = detectedMeetingApp ?? "unknown"
+            print("[MeetingDetector] meeting ended app='\(endedApp)' — notifying auto-stop watchdog")
             detectedMeetingApp = nil
             shouldShowRecordingPrompt = false
+            onMeetingEnded?()    // auto-stop watchdog registered by MainContainerView
 
             // Key-reset policy:
             //

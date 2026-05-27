@@ -11,6 +11,8 @@ struct MainContainerView: View {
     @State private var meetingDetector = ServiceContainer.shared.resolve(MeetingDetectorService.self)
     @State private var calendarService = ServiceContainer.shared.resolve(CalendarService.self)
     @State private var activeRecordingMeeting: MeetingItem?
+    /// Fires every 10 s during recording to checkpoint `activeRecordingMeeting.transcript`.
+    @State private var transcriptCheckpointTimer: Timer?
 
     enum SidebarModule: Hashable, CaseIterable {
         case today
@@ -118,20 +120,67 @@ struct MainContainerView: View {
         .errorHandlingOverlay()
         .onAppear {
             meetingDetector.startMonitoring()
+
+            // Part 3 — auto-stop: when the meeting disappears from the detection
+            // window, wait up to 4 s (one fast-poll miss) then stop recording.
+            // The closure is set once; re-appearing re-registers (last writer wins,
+            // which is always this same closure so there are no semantic differences).
+            meetingDetector.onMeetingEnded = {
+                Task { @MainActor in
+                    guard recordingService.isRecording else { return }
+                    print("[AutoStop] meeting ended while recording — waiting 4 s before stop")
+                    try? await Task.sleep(nanoseconds: 4_000_000_000)
+                    guard recordingService.isRecording else {
+                        print("[AutoStop] recording already stopped during grace period — no action")
+                        return
+                    }
+                    print("[AutoStop] auto-stopping recording (meeting gone for ≥ 4 s)")
+                    recordingService.stopRecording()
+                }
+            }
+
             calendarService.refreshAuthorizationStatus()
             if calendarBackgroundSync {
                 calendarService.startBackgroundSync()
             }
         }
         .onChange(of: recordingService.isRecording) { _, isNow in
-            guard !isNow, let meeting = activeRecordingMeeting else { return }
-            meeting.transcript = recordingService.transcript
-            meeting.durationSeconds = TimeInterval(recordingService.elapsedSeconds)
-            if let url = recordingService.recordingURL {
-                meeting.audioFilePath = url.path
+            if isNow {
+                // ── Recording started ─────────────────────────────────────────
+                print("[Recording] MainContainerView: recording started — enabling fast poll + checkpoint timer")
+                meetingDetector.enableFastPoll()
+
+                // Part 1: checkpoint timer — persists activeRecordingMeeting.transcript
+                // every 10 s. MeetingDetailView keeps meeting.transcript current via its
+                // own onChange(of: transcript), so a safeSave() here is sufficient.
+                transcriptCheckpointTimer?.invalidate()
+                transcriptCheckpointTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { _ in
+                    Task { @MainActor in
+                        guard recordingService.isRecording,
+                              let meeting = activeRecordingMeeting else { return }
+                        meeting.transcript = recordingService.speakerTranscript
+                        modelContext.safeSave(context: "transcript checkpoint")
+                        print("[Transcript] MainContainer checkpoint persisted chars=\(meeting.transcript.count) elapsed=\(recordingService.elapsedSeconds)s")
+                    }
+                }
+            } else {
+                // ── Recording stopped ─────────────────────────────────────────
+                print("[Recording] MainContainerView: recording stopped — disabling fast poll + finalizing")
+                transcriptCheckpointTimer?.invalidate()
+                transcriptCheckpointTimer = nil
+                meetingDetector.disableFastPoll()
+
+                guard let meeting = activeRecordingMeeting else { return }
+                // Part 2: save speaker-labeled transcript.
+                meeting.transcript = recordingService.speakerTranscript
+                meeting.durationSeconds = TimeInterval(recordingService.elapsedSeconds)
+                if let url = recordingService.recordingURL {
+                    meeting.audioFilePath = url.path
+                }
+                modelContext.safeSave(context: "meeting recording")
+                print("[Transcript] MainContainer finalized meeting=\(meeting.id) chars=\(meeting.transcript.count) duration=\(meeting.durationSeconds)s")
+                activeRecordingMeeting = nil
             }
-            modelContext.safeSave(context: "meeting recording")
-            activeRecordingMeeting = nil
         }
         .onChange(of: calendarBackgroundSync) { _, enabled in
             if enabled {

@@ -57,6 +57,21 @@ final class RecordingService: Service {
 
     private(set) var elapsedSeconds: Int = 0
     private(set) var transcript = ""
+
+    /// Speaker-labeled version of `transcript`.
+    ///
+    /// Labels all microphone-captured speech as "Me:". True per-speaker
+    /// diarization (separating "Me" from "Participant" using system audio)
+    /// requires ScreenCaptureKit and is tracked for a future iteration.
+    /// If transcript is empty, returns "" so callers never store a "Me: "
+    /// prefix stub in the database.
+    ///
+    /// Safe to call from any @Observable observer — reads `transcript` only.
+    var speakerTranscript: String {
+        guard !transcript.isEmpty else { return "" }
+        return "Me: \(transcript)"
+    }
+
     private(set) var recordingURL: URL?
     private(set) var errorMessage: String?
     private(set) var activeMeetingID: UUID?
@@ -106,6 +121,8 @@ final class RecordingService: Service {
     private nonisolated(unsafe) var durationTimer: Timer?
 
     private var transcriptPrefix = ""
+    /// Count of partial-result callbacks received in the current session; for logging only.
+    @ObservationIgnored private var transcriptChunkCount = 0
 
     // MARK: - Private — cross-thread state
 
@@ -242,8 +259,10 @@ final class RecordingService: Service {
         }
         print("STEP 4: format valid — sampleRate=\(format.sampleRate) channels=\(format.channelCount)")
 
-        activeMeetingID = meetingID
+        activeMeetingID  = meetingID
         transcriptPrefix = ""
+        transcriptChunkCount = 0
+        print("[Transcript] session started meetingID=\(String(describing: meetingID))")
 
         // Create the on-disk file before arming the tap state.  If this fails,
         // no tap is installed and no hardware is left in a partial state.
@@ -313,6 +332,7 @@ final class RecordingService: Service {
         // Idempotency guard — safe to call from any code path, including error
         // handlers, without risking a double-teardown or double-removeTap crash.
         guard phase == .recording || phase == .starting else { return }
+        print("[Recording] stopRecording called phase=\(phase) chunks=\(transcriptChunkCount) transcriptChars=\(transcript.count)")
         phase = .stopping
 
         durationTimer?.invalidate()
@@ -353,6 +373,7 @@ final class RecordingService: Service {
         }
 
         phase = .idle
+        print("[Transcript] finalized url=\(recordingURL?.lastPathComponent ?? "nil") chars=\(transcript.count) speakerChars=\(speakerTranscript.count)")
     }
 
     @MainActor
@@ -401,6 +422,8 @@ final class RecordingService: Service {
                     self.transcript = self.transcriptPrefix.isEmpty
                         ? segment
                         : self.transcriptPrefix + segment
+                    self.transcriptChunkCount += 1
+                    print("[Transcript] chunk #\(self.transcriptChunkCount) received chars=\(segment.count) isFinal=\(result.isFinal) totalChars=\(self.transcript.count)")
                 }
 
                 // Apple's network recogniser ends sessions at ~60 s.
@@ -408,6 +431,7 @@ final class RecordingService: Service {
                 // Guard on `isRecording` so a teardown-triggered final result
                 // does not re-arm a new session.
                 if result?.isFinal == true, self.isRecording {
+                    print("[Transcript] segment finalised — restarting recognition session totalChars=\(self.transcript.count)")
                     if !self.transcript.isEmpty {
                         self.transcriptPrefix = self.transcript + " "
                     }
