@@ -12,13 +12,17 @@
 #   5. Confirms only one DMG exists in the output directory
 #
 # Requirements:
-#   - Xcode (xcodebuild + hdiutil)
-#   - Project at: "Orin 2.xcodeproj" (in repo root)
+#   - Xcode command-line tools (swift build, hdiutil, codesign)
+#   - An existing Xcode-built Orin.app bundle template in build-xcode/ (for
+#     Info.plist, resources, and bundle structure — only needed on first run).
+#     Run `xcodebuild build -project "Orin 2.xcodeproj" -target Orin` once to
+#     create the template, then use this script for all subsequent QA builds.
+#   - Package.swift at repo root (SPM manifest)
 #
 # Usage:
 #   ./scripts/build_qa_dmg.sh                  # full clean build + DMG
-#   ./scripts/build_qa_dmg.sh --skip-build     # repackage most recent Orin.app
-#   ./scripts/build_qa_dmg.sh --verbose        # pass -verbose to xcodebuild
+#   ./scripts/build_qa_dmg.sh --skip-build     # repackage most recent app bundle
+#   ./scripts/build_qa_dmg.sh --verbose        # pass -v to swift build
 
 set -euo pipefail
 
@@ -57,14 +61,17 @@ divider(){ echo "━━━━━━━━━━━━━━━━━━━━━
 # ── 0. Pre-flight ────────────────────────────────────────────────────────────
 
 log "Pre-flight checks..."
-command -v xcodebuild >/dev/null || die "xcodebuild not found — install Xcode."
-command -v hdiutil    >/dev/null || die "hdiutil not found."
-command -v shasum     >/dev/null || die "shasum not found."
+command -v swift    >/dev/null || die "swift not found — install Xcode command-line tools."
+command -v codesign >/dev/null || die "codesign not found — install Xcode command-line tools."
+command -v hdiutil  >/dev/null || die "hdiutil not found."
+command -v shasum   >/dev/null || die "shasum not found."
 
-[[ -f "$XCPROJECT/project.pbxproj" ]] || \
-    die "Xcode project not found at: $XCPROJECT\nRun: xcodegen generate (if using XcodeGen)"
+[[ -f "$REPO_ROOT/Package.swift" ]] || \
+    die "Package.swift not found at repo root: $REPO_ROOT"
+[[ -f "$REPO_ROOT/Orin-local.entitlements" ]] || \
+    die "Orin-local.entitlements not found — required for ad-hoc signing."
 
-mkdir -p "$BUILD_ROOT"
+mkdir -p "$BUILD_ROOT" "$APP_PRODUCTS"
 
 # ── 1. Clean previous artifacts ──────────────────────────────────────────────
 
@@ -101,35 +108,38 @@ if [[ "$SKIP_BUILD" == false ]]; then
     log "Building Orin (Debug, ad-hoc signed)..."
     echo ""
 
-    # Build without codesigning, then apply ad-hoc signature with codesign.
-    # This avoids the "requires provisioning profile" error from xcodebuild
-    # that appears when CODE_SIGN_STYLE=Manual with no Developer certificate.
-    log "  Phase 1: compiling (no signing)..."
-    xcodebuild build \
-        -project "$XCPROJECT" \
-        -target Orin \
-        -configuration Debug \
-        BUILD_DIR="$BUILD_ROOT/Build" \
-        CONFIGURATION_BUILD_DIR="$APP_PRODUCTS" \
-        BUILT_PRODUCTS_DIR="$APP_PRODUCTS" \
-        CODE_SIGNING_ALLOWED=NO \
-        CODE_SIGNING_REQUIRED=NO \
-        CODE_SIGN_IDENTITY="" \
-        CODE_SIGN_STYLE=Manual \
-        PROVISIONING_PROFILE_SPECIFIER="" \
-        ONLY_ACTIVE_ARCH=YES \
-        $VERBOSE_FLAG \
-        2>&1 | grep --line-buffered \
-            -E "(error:|warning:|BUILD SUCCEEDED|BUILD FAILED)" \
-        || true
+    # Strategy: use `swift build` (SPM) which reliably compiles ALL source files,
+    # including any files not yet registered in project.pbxproj (e.g. the
+    # Developer/ debug utilities added after the last xcodebuild run).
+    # We then graft the fresh binary into the Xcode .app bundle template so the
+    # final app has the correct Info.plist, assets, entitlements, and bundle ID.
+    log "  Phase 1: compiling with swift build..."
+    SWIFT_VERBOSE_FLAG=""
+    [[ -n "$VERBOSE_FLAG" ]] && SWIFT_VERBOSE_FLAG="-v"
+    swift build --configuration debug $SWIFT_VERBOSE_FLAG 2>&1 | \
+        grep --line-buffered -E "(error:|warning:|Build complete|build error)" || true
 
     echo ""
 
-    # Locate the built app
-    APP_PATH=$(find "$APP_PRODUCTS" -maxdepth 1 -name "Orin.app" -type d 2>/dev/null | head -1)
-    if [[ -z "$APP_PATH" || ! -d "$APP_PATH" ]]; then
-        die "Build produced no Orin.app at $APP_PRODUCTS\nRun with --verbose to see the full build log."
+    # Locate the SPM binary
+    SPM_BIN_DIR="$(swift build --configuration debug --show-bin-path 2>/dev/null)"
+    SPM_BINARY="$SPM_BIN_DIR/Orin"
+    [[ -f "$SPM_BINARY" ]] || \
+        die "swift build did not produce a binary at: $SPM_BIN_DIR/Orin\nRun with --verbose to see full build output."
+
+    # Find the Xcode-built .app bundle to use as structural template.
+    # This provides Info.plist, compiled assets, and the correct bundle structure.
+    TEMPLATE_APP=$(find "$APP_PRODUCTS" -maxdepth 1 -name "Orin.app" -type d 2>/dev/null | head -1)
+    if [[ -z "$TEMPLATE_APP" || ! -d "$TEMPLATE_APP" ]]; then
+        die "No Xcode app bundle template found at:\n  $APP_PRODUCTS\n\nRun once to create it:\n  xcodebuild build -project \"Orin 2.xcodeproj\" -target Orin \\\\\n    CODE_SIGNING_ALLOWED=NO BUILD_DIR=\"$BUILD_ROOT/Build\"\nThen re-run this script."
     fi
+
+    # Assemble the QA app: copy bundle template, swap in the fresh SPM binary
+    QA_APP="$APP_PRODUCTS/OrinQA.app"
+    rm -rf "$QA_APP"
+    cp -R "$TEMPLATE_APP" "$QA_APP"
+    cp "$SPM_BINARY" "$QA_APP/Contents/MacOS/Orin"
+    APP_PATH="$QA_APP"
 
     # Apply ad-hoc codesign so macOS will launch the app
     log "  Phase 2: applying ad-hoc signature..."
@@ -140,12 +150,12 @@ if [[ "$SKIP_BUILD" == false ]]; then
     log "Build complete → $(basename "$APP_PATH")"
 
 else
-    log "Skipping build (--skip-build). Locating most recent Orin.app..."
-    APP_PATH=$(find "$BUILD_ROOT" -name "Orin.app" -type d \
+    log "Skipping build (--skip-build). Locating most recent app bundle..."
+    APP_PATH=$(find "$BUILD_ROOT" -name "*.app" -type d \
         \( -not -path "*/dmg-staging*" \) \
         2>/dev/null | head -1)
     [[ -n "$APP_PATH" && -d "$APP_PATH" ]] || \
-        die "No existing Orin.app found in $BUILD_ROOT.\nRun without --skip-build to build first."
+        die "No existing .app found in $BUILD_ROOT.\nRun without --skip-build to build first."
     log "Using: $APP_PATH"
 fi
 
