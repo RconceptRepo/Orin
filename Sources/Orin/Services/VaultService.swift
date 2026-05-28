@@ -159,63 +159,40 @@ final class VaultService: Service {
         let context = LAContext()
         context.touchIDAuthenticationAllowableReuseDuration = sessionDuration
 
-        var biometricError: NSError?
-        let biometricsAvailable = context.canEvaluatePolicy(
-            .deviceOwnerAuthenticationWithBiometrics, error: &biometricError
-        )
-
         do {
-            if biometricsAvailable {
-                try await context.evaluatePolicy(
-                    .deviceOwnerAuthenticationWithBiometrics,
-                    localizedReason: "Re-link your vault to Touch ID."
-                )
-            } else {
-                try await context.evaluatePolicy(
-                    .deviceOwnerAuthentication,
-                    localizedReason: "Authenticate to re-link your vault."
-                )
-            }
+            let reason = canUseBiometrics
+                ? "Use Touch ID or your password to re-link your Orin Vault."
+                : "Enter your password to re-link your Orin Vault."
+            try await context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason)
         } catch let laError as LAError {
-            return laError.code == .userCancel || laError.code == .appCancel
-                ? .failure(.userCancelled)
-                : .failure(.authenticationFailed)
+            switch laError.code {
+            case .userCancel, .appCancel, .systemCancel:
+                return .failure(.userCancelled)
+            default:
+                return .failure(.authenticationFailed)
+            }
         } catch {
             return .failure(.authenticationFailed)
         }
 
-        // Delete any existing (possibly inaccessible) item first
+        // Delete any existing item, then write the fresh key.
         let deleteQuery: [String: Any] = [
-            kSecClass as String:                    kSecClassGenericPassword,
-            kSecAttrService as String:              keychainServiceKey,
-            kSecUseAuthenticationContext as String: context
+            kSecClass as String:       kSecClassGenericPassword,
+            kSecAttrService as String: keychainServiceKey
         ]
         SecItemDelete(deleteQuery as CFDictionary)
 
-        let keyData = key.withUnsafeBytes { Data($0) }
-        guard let access = SecAccessControlCreateWithFlags(
-            kCFAllocatorDefault,
-            kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-            .userPresence,
-            nil
-        ) else {
-            return .failure(.keychainError(errSecParam))
+        do {
+            try storeMasterKey(key, context: context)
+        } catch let vaultError as VaultError {
+            return .failure(vaultError)
+        } catch {
+            return .failure(.authenticationFailed)
         }
-
-        let addQuery: [String: Any] = [
-            kSecClass as String:                    kSecClassGenericPassword,
-            kSecAttrService as String:              keychainServiceKey,
-            kSecValueData as String:                keyData,
-            kSecAttrAccessControl as String:        access,
-            kSecUseAuthenticationContext as String: context
-        ]
-
-        let status = SecItemAdd(addQuery as CFDictionary, nil)
-        guard status == errSecSuccess else { return .failure(.keychainError(status)) }
 
         sessionKey = key
         sessionExpiry = Date().addingTimeInterval(sessionDuration)
-        sessionContext = context   // re-link also establishes a valid session context
+        sessionContext = context
         return .success(())
     }
 
@@ -224,51 +201,19 @@ final class VaultService: Service {
     /// Encrypted items in SwiftData must be deleted by the caller — they cannot
     /// be decrypted after this call returns `.success`.
     ///
-    /// - Parameter context: An already-evaluated `LAContext` from the active
-    ///   session. When provided it is included in the `SecItemDelete` query so
-    ///   the Keychain daemon can authorise deletion of a `.userPresence`-protected
-    ///   item without raising a new authentication prompt.  Pass `nil` (or omit)
-    ///   to use the internally cached session context; if no cached context exists
-    ///   the query runs without one, which succeeds when no item is present.
-    ///
     /// - Returns: `.success(())` when the item was deleted or was already absent.
-    ///   `.failure(.keychainError(status))` for any other Keychain status, including
-    ///   `errSecInteractionNotAllowed` (context cannot silently authorise deletion)
-    ///   and `errSecAuthFailed` (provided context was rejected). On failure the
-    ///   verification token and brute-force state are **not** cleared so the caller
-    ///   can surface the error and let the user retry without data loss.
     @discardableResult
     func resetVault(context: LAContext? = nil) -> Result<Void, VaultError> {
         logger.warning("Vault reset started")
-        let effectiveContext = context ?? sessionContext
-
-        // Attempt 1: Try with the cached evaluation context (silent if valid).
-        var deleteQuery: [String: Any] = [
+        let deleteQuery: [String: Any] = [
             kSecClass as String:       kSecClassGenericPassword,
             kSecAttrService as String: keychainServiceKey
         ]
-        if let ctx = effectiveContext {
-            deleteQuery[kSecUseAuthenticationContext as String] = ctx
-        }
-
-        var deleteStatus = SecItemDelete(deleteQuery as CFDictionary)
-
-        // Attempt 2: If context-based delete failed, try with UI allowed (will show auth dialog).
-        if deleteStatus != errSecSuccess && deleteStatus != errSecItemNotFound {
-            logger.warning("Vault reset attempt 1 failed (status=\(deleteStatus)); trying with UI")
-            let uiQuery: [String: Any] = [
-                kSecClass as String:               kSecClassGenericPassword,
-                kSecAttrService as String:         keychainServiceKey,
-                kSecUseAuthenticationUI as String: kSecUseAuthenticationUIAllow
-            ]
-            deleteStatus = SecItemDelete(uiQuery as CFDictionary)
-        }
-
+        let deleteStatus = SecItemDelete(deleteQuery as CFDictionary)
         guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
             logger.error("Vault keychain delete failed status=\(deleteStatus)")
             return .failure(.keychainError(deleteStatus))
         }
-
         UserDefaults.standard.removeObject(forKey: verificationTokenUDKey)
         resetFailCount()
         clearSession()
@@ -327,76 +272,39 @@ final class VaultService: Service {
 
     // MARK: - Authentication flow
 
+    /// Authenticates the user and returns the vault master key.
+    ///
+    /// Uses `.deviceOwnerAuthentication` which presents Touch ID first on Macs
+    /// that support it, then automatically falls back to the login password if
+    /// biometrics fail or are unavailable — no separate fallback path needed.
     private func authenticate() async -> Result<SymmetricKey, VaultError> {
         let context = LAContext()
         context.touchIDAuthenticationAllowableReuseDuration = sessionDuration
 
-        var biometricError: NSError?
-        let biometricsAvailable = context.canEvaluatePolicy(
-            .deviceOwnerAuthenticationWithBiometrics, error: &biometricError
-        )
-
-        if biometricsAvailable {
-            return await tryBiometrics(context: context)
-        }
-        logger.info("Vault biometrics unavailable; using device password")
-        return await tryPassword(context: context, lockedOut: false)
-    }
-
-    private func tryBiometrics(context: LAContext) async -> Result<SymmetricKey, VaultError> {
-        do {
-            try await context.evaluatePolicy(
-                .deviceOwnerAuthenticationWithBiometrics,
-                localizedReason: "Use Touch ID to unlock your Orin Vault."
-            )
-            let key = try masterKey(context: context)
-            sessionContext = context   // cache for later use by resetVault()
-            logger.info("Vault Touch ID authentication succeeded")
-            return .success(key)
-        } catch let laError as LAError {
-            switch laError.code {
-            case .userCancel, .appCancel, .systemCancel:
-                logger.info("Vault Touch ID cancelled")
-                return .failure(.userCancelled)
-            case .biometryLockout:
-                logger.warning("Vault Touch ID locked out; falling back to password")
-                return await tryPassword(context: LAContext(), lockedOut: true)
-            default:
-                logger.error("Vault Touch ID failed: \(laError.localizedDescription)")
-                return .failure(.authenticationFailed)
-            }
-        } catch let vaultError as VaultError {
-            logger.error("Vault Touch ID keychain failure")
-            return .failure(vaultError)
-        } catch {
-            logger.error("Vault Touch ID unknown failure")
-            return .failure(.authenticationFailed)
-        }
-    }
-
-    private func tryPassword(context: LAContext, lockedOut: Bool) async -> Result<SymmetricKey, VaultError> {
-        let reason = lockedOut
-            ? "Touch ID is locked. Enter your password to unlock your Orin Vault."
+        let reason = canUseBiometrics
+            ? "Use Touch ID or enter your password to unlock your Orin Vault."
             : "Enter your password to unlock your Orin Vault."
+
         do {
             try await context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason)
             let key = try masterKey(context: context)
-            sessionContext = context   // cache for later use by resetVault()
-            logger.info("Vault password authentication succeeded")
+            sessionContext = context
+            logger.info("Vault unlock succeeded")
             return .success(key)
         } catch let laError as LAError {
             switch laError.code {
             case .userCancel, .appCancel, .systemCancel:
-                logger.info("Vault password authentication cancelled")
+                logger.info("Vault authentication cancelled by user")
                 return .failure(.userCancelled)
             default:
-                logger.error("Vault password authentication failed: \(laError.localizedDescription)")
+                logger.error("Vault authentication failed: \(laError.localizedDescription)")
                 return .failure(.authenticationFailed)
             }
         } catch let vaultError as VaultError {
-            logger.error("Vault password keychain failure")
+            logger.error("Vault keychain failure after authentication")
             return .failure(vaultError)
         } catch {
+            logger.error("Vault unknown failure: \(error)")
             return .failure(.authenticationFailed)
         }
     }
@@ -445,20 +353,16 @@ final class VaultService: Service {
     private func storeMasterKey(_ key: SymmetricKey, context: LAContext?) throws {
         let keyData = key.withUnsafeBytes { Data($0) }
 
-        guard let access = SecAccessControlCreateWithFlags(
-            kCFAllocatorDefault,
-            kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-            .userPresence,
-            nil
-        ) else {
-            throw VaultError.keychainError(errSecParam)
-        }
-
+        // Store with kSecAttrAccessibleWhenUnlockedThisDeviceOnly (device-bound,
+        // not migratable, cleared when device is unenrolled).
+        // User-presence is enforced at the app layer: authenticate() is always
+        // called before any masterKey() read. This avoids kSecAccessControl with
+        // .userPresence which requires a Developer Team ID (fails on ad-hoc builds).
         var addQuery: [String: Any] = [
-            kSecClass as String:             kSecClassGenericPassword,
-            kSecAttrService as String:       keychainServiceKey,
-            kSecValueData as String:         keyData,
-            kSecAttrAccessControl as String: access
+            kSecClass as String:          kSecClassGenericPassword,
+            kSecAttrService as String:    keychainServiceKey,
+            kSecValueData as String:      keyData,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
         ]
         if let context {
             addQuery[kSecUseAuthenticationContext as String] = context

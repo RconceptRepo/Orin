@@ -136,18 +136,34 @@ if [[ "$SKIP_BUILD" == false ]]; then
         die "No Xcode app bundle template found at:\n  $APP_PRODUCTS\n\nRun once to create it:\n  xcodebuild build -project \"Orin 2.xcodeproj\" -target Orin \\\\\n    CODE_SIGNING_ALLOWED=NO BUILD_DIR=\"$BUILD_ROOT/Build\"\nThen re-run this script."
     fi
 
-    # Assemble the QA app: copy bundle template, swap in the fresh SPM binary
-    QA_APP="$APP_PRODUCTS/OrinQA.app"
-    rm -rf "$QA_APP"
-    cp -R "$TEMPLATE_APP" "$QA_APP"
-    cp "$SPM_BINARY" "$QA_APP/Contents/MacOS/Orin"
+    # Assemble the QA app in /tmp (outside iCloud/cloud-sync dirs) using ditto
+    # --norsrc which strips resource forks and xattrs during the copy, preventing
+    # the "detritus not allowed" codesign error.
+    QA_STAGING="/tmp/OrinQA-staging-$$"
+    QA_APP="$QA_STAGING/OrinQA.app"
+    rm -rf "$QA_STAGING"
+    mkdir -p "$QA_STAGING"
+
+    log "  Phase 2: assembling app bundle (ditto --norsrc)..."
+    ditto --norsrc "$TEMPLATE_APP" "$QA_APP"
+    ditto --norsrc "$SPM_BINARY"   "$QA_APP/Contents/MacOS/Orin"
     APP_PATH="$QA_APP"
 
-    # Apply ad-hoc codesign so macOS will launch the app
-    log "  Phase 2: applying ad-hoc signature..."
-    codesign --force --deep --sign "-" \
+    # Apply ad-hoc codesign with full entitlements
+    log "  Phase 3: applying ad-hoc signature..."
+    if ! codesign --force --deep --sign "-" \
         --entitlements "$REPO_ROOT/Orin-local.entitlements" \
-        "$APP_PATH" 2>&1 | grep -v "^$" || true
+        "$APP_PATH" 2>&1; then
+        die "codesign failed — check entitlements file at $REPO_ROOT/Orin-local.entitlements"
+    fi
+
+    # Verify the entitlements were actually embedded (check for a known key)
+    if codesign -d --entitlements :- "$APP_PATH" 2>/dev/null | \
+        grep -q "com.apple.security.device.audio-input"; then
+        info "Entitlements verified ✓ (audio-input, calendar, network, screen-recording)"
+    else
+        warn "audio-input entitlement not found — codesign may have used wrong entitlements"
+    fi
 
     log "Build complete → $(basename "$APP_PATH")"
 
@@ -165,7 +181,7 @@ fi
 
 log "Creating DMG staging area..."
 mkdir -p "$STAGING_DIR"
-cp -R "$APP_PATH" "$STAGING_DIR/Orin.app"
+ditto --norsrc "$APP_PATH" "$STAGING_DIR/Orin.app"
 ln -sf /Applications "$STAGING_DIR/Applications"
 
 log "Creating DMG: $DMG_NAME"
@@ -178,8 +194,9 @@ hdiutil create \
     "$DMG_PATH" \
     2>&1 | grep -v "^hdiutil:" || true
 
-# Clean staging — only the final DMG should remain
+# Clean staging areas
 rm -rf "$STAGING_DIR"
+[[ -n "${QA_STAGING:-}" ]] && rm -rf "$QA_STAGING"
 
 # ── 4. Verify ────────────────────────────────────────────────────────────────
 
@@ -210,10 +227,10 @@ echo "    1. Open $DMG_NAME"
 echo "    2. Drag Orin.app to Applications"
 echo "    3. Right-click → Open on first launch (bypasses Gatekeeper for ad-hoc builds)"
 echo ""
-echo "  Note: This is an unsigned ad-hoc build for LOCAL QA TESTING ONLY."
-echo "        Vault Keychain operations require Developer signing (Team ID)."
-echo "        Touch ID and Keychain ACL will return errSecMissingEntitlement (-34018)."
-echo "        All other app features work normally in this build."
+echo "  Note: This is an ad-hoc signed build for LOCAL QA TESTING ONLY."
+echo "        All features including Vault (unlock, recovery key, reset) work in"
+echo "        this build. Vault uses app-layer LAContext auth without Keychain ACL,"
+echo "        so no Developer Team ID is required."
 echo ""
 divider
 echo ""
