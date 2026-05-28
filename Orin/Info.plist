@@ -43,6 +43,8 @@
 	<string>Orin may use the camera for future video features. No camera access is used in V1.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Orin uses the microphone only when you explicitly start meeting transcription. Audio is processed on-device and stored locally.</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>Orin captures system audio to transcribe meeting participants during a call. No screen content is recorded or stored — audio only, processed on-device.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 	<key>NSRemindersUsageDescription</key>

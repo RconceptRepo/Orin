@@ -53,6 +53,7 @@ struct OrinApp: App {
         services.register(MeetingDetectorService(calendarService: calendarService), for: MeetingDetectorService.self)
         services.register(LoginItemService(), for: LoginItemService.self)
         services.register(WhisperTranscriptionService(), for: WhisperTranscriptionService.self)
+        services.register(SystemAudioCaptureService(), for: SystemAudioCaptureService.self)
 
         let retentionService = MeetingRetentionService()
         services.register(retentionService, for: MeetingRetentionService.self)

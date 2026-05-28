@@ -73,12 +73,13 @@ private struct MeetingDetailView: View {
 
     @State private var isAnalyzing = false
     @State private var isImportingTranscript = false
-    @State private var recordingService  = ServiceContainer.shared.resolve(RecordingService.self)
-    @State private var meetingDetector   = ServiceContainer.shared.resolve(MeetingDetectorService.self)
+    @State private var recordingService    = ServiceContainer.shared.resolve(RecordingService.self)
+    @State private var meetingDetector     = ServiceContainer.shared.resolve(MeetingDetectorService.self)
+    @State private var systemAudioService  = ServiceContainer.shared.resolve(SystemAudioCaptureService.self)
     @State private var wasRecordingThisMeeting = false
     /// Set when the user taps "Start Recording" with no meeting detected.
     @State private var noActiveMeetingError = false
-    /// Fires every 10 s during recording to checkpoint transcript to SwiftData.
+    /// Fires every 5 s during recording to checkpoint the merged transcript to SwiftData.
     @State private var transcriptCheckpointTimer: Timer?
 
     private let intelligence = ServiceContainer.shared.resolve(MeetingIntelligenceService.self)
@@ -161,7 +162,13 @@ private struct MeetingDetailView: View {
                                         noActiveMeetingError = false
                                         wasRecordingThisMeeting = true
                                         print("[Recording] manual start approved meeting='\(meeting.title)' platform=\(meetingDetector.detectedMeetingApp ?? "?")")
-                                        Task { await recordingService.startRecording(for: meeting.id) }
+                                        Task {
+                                            await recordingService.startRecording(for: meeting.id)
+                                            // Start system audio after mic is confirmed running
+                                            if recordingService.isRecording {
+                                                await systemAudioService.startCapturing(for: meeting.id)
+                                            }
+                                        }
                                     } label: {
                                         Label("Start Recording", systemImage: "record.circle")
                                     }
@@ -270,29 +277,40 @@ private struct MeetingDetailView: View {
                 startTranscriptCheckpoints()
             }
         }
-        // Part 2: store speaker-labeled transcript so speaker labels persist through checkpoints.
-        // Part 1: live write keeps meeting.transcript always current for checkpoint saves.
+        // Live update: merge mic ("Me:") + system audio ("Participant:") into meeting.transcript
+        // whenever either stream delivers a new chunk. This keeps the transcript current for
+        // both the TextEditor display and the 5 s checkpoint saves.
         .onChange(of: recordingService.transcript) { _, _ in
             guard wasRecordingThisMeeting else { return }
-            let labeled = recordingService.speakerTranscript
-            meeting.transcript = labeled
-            print("[Transcript] live update chars=\(labeled.count) meeting=\(meeting.id)")
+            syncMergedTranscript()
         }
-        // Part 1: stop checkpoint timer and finalize on recording end.
+        .onChange(of: systemAudioService.transcript) { _, _ in
+            guard wasRecordingThisMeeting else { return }
+            syncMergedTranscript()
+        }
+        // Stop checkpoint timer and finalize on recording end.
+        // Delay 1.5 s so both recognizers can deliver their final partial result
+        // before the terminal save — prevents losing the last spoken sentence.
         .onChange(of: recordingService.isRecording) { _, isNow in
             guard !isNow, wasRecordingThisMeeting else { return }
             wasRecordingThisMeeting = false
-            // Stop checkpoint timer
             transcriptCheckpointTimer?.invalidate()
             transcriptCheckpointTimer = nil
-            print("[Transcript] checkpoint timer stopped (recording ended) meeting=\(meeting.id)")
-            // Final metadata + persist
-            meeting.durationSeconds = TimeInterval(recordingService.elapsedSeconds)
-            if let url = recordingService.recordingURL {
-                meeting.audioFilePath = url.path
+            print("[Transcript] MeetingDetail: checkpoint timer stopped (recording ended) meeting=\(meeting.id)")
+
+            Task { @MainActor in
+                print("[Transcript] MeetingDetail: waiting 1.5 s for final recognition chunks meeting=\(meeting.id)")
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                let merged = MainContainerView.mergeTranscripts(
+                    mic: recordingService.speakerTranscript,
+                    participant: systemAudioService.participantSpeakerTranscript
+                )
+                if !merged.isEmpty { meeting.transcript = merged }
+                meeting.durationSeconds = TimeInterval(recordingService.elapsedSeconds)
+                if let url = recordingService.recordingURL { meeting.audioFilePath = url.path }
+                modelContext.safeSave(context: "meeting recording final")
+                print("[Transcript] MeetingDetail: finalized meeting=\(meeting.id) merged=\(merged.count) mic=\(recordingService.transcript.count) participant=\(systemAudioService.transcript.count) duration=\(meeting.durationSeconds)s")
             }
-            modelContext.safeSave(context: "meeting recording")
-            print("[Transcript] finalized meeting=\(meeting.id) chars=\(meeting.transcript.count) duration=\(meeting.durationSeconds)s")
         }
         .fileImporter(
             isPresented: $isImportingTranscript,
@@ -340,9 +358,27 @@ private struct MeetingDetailView: View {
         modelContext.safeSave(context: "task from meeting")
     }
 
-    // MARK: - Transcript checkpointing (Part 1)
+    // MARK: - Transcript helpers
 
-    /// Starts a 10-second repeating timer that persists the current transcript to SwiftData.
+    /// Merges the current mic and participant transcripts into `meeting.transcript`.
+    ///
+    /// Called on every `onChange(of: transcript)` event for either stream.
+    /// Uses `MainContainerView.mergeTranscripts` so the merge logic is defined once.
+    private func syncMergedTranscript() {
+        let merged = MainContainerView.mergeTranscripts(
+            mic: recordingService.speakerTranscript,
+            participant: systemAudioService.participantSpeakerTranscript
+        )
+        meeting.transcript = merged
+        print("[Transcript] MeetingDetail live sync mic=\(recordingService.transcript.count) participant=\(systemAudioService.transcript.count) meeting=\(meeting.id)")
+    }
+
+    // MARK: - Transcript checkpointing
+
+    /// Starts a 5-second repeating timer that persists the merged transcript to SwiftData.
+    ///
+    /// 5 s interval: reduces crash-loss window vs the previous 10 s without excessive
+    /// write pressure.
     ///
     /// Calling this while a timer is already running invalidates the old timer first,
     /// preventing duplicate timers if `onAppear` and `onChange(of: activeMeetingID)` both fire.
@@ -351,14 +387,20 @@ private struct MeetingDetailView: View {
     /// Concurrency task (required by macOS 26's executor-isolation checks).
     private func startTranscriptCheckpoints() {
         transcriptCheckpointTimer?.invalidate()
-        transcriptCheckpointTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { _ in
+        transcriptCheckpointTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
             Task { @MainActor in
                 guard wasRecordingThisMeeting, recordingService.isRecording else { return }
+                // Sync before save in case the last chunk arrived between Timer fires
+                let merged = MainContainerView.mergeTranscripts(
+                    mic: recordingService.speakerTranscript,
+                    participant: systemAudioService.participantSpeakerTranscript
+                )
+                if !merged.isEmpty { meeting.transcript = merged }
                 modelContext.safeSave(context: "transcript checkpoint")
-                print("[Transcript] checkpoint persisted chars=\(meeting.transcript.count) elapsed=\(recordingService.elapsedSeconds)s meeting=\(meeting.id)")
+                print("[Transcript] MeetingDetail checkpoint mic=\(recordingService.transcript.count) participant=\(systemAudioService.transcript.count) elapsed=\(recordingService.elapsedSeconds)s meeting=\(meeting.id)")
             }
         }
-        print("[Transcript] checkpoint timer started (10 s interval) meeting=\(meeting.id)")
+        print("[Transcript] checkpoint timer started (5 s interval) meeting=\(meeting.id)")
     }
 
     private func importTranscript(_ result: Result<[URL], Error>) {

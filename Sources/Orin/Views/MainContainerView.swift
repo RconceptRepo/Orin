@@ -10,8 +10,9 @@ struct MainContainerView: View {
     @State private var recordingService = ServiceContainer.shared.resolve(RecordingService.self)
     @State private var meetingDetector = ServiceContainer.shared.resolve(MeetingDetectorService.self)
     @State private var calendarService = ServiceContainer.shared.resolve(CalendarService.self)
+    @State private var systemAudioService = ServiceContainer.shared.resolve(SystemAudioCaptureService.self)
     @State private var activeRecordingMeeting: MeetingItem?
-    /// Fires every 10 s during recording to checkpoint `activeRecordingMeeting.transcript`.
+    /// Fires every 5 s during recording to checkpoint `activeRecordingMeeting.transcript`.
     @State private var transcriptCheckpointTimer: Timer?
 
     enum SidebarModule: Hashable, CaseIterable {
@@ -96,6 +97,9 @@ struct MainContainerView: View {
                                     meetingDetector.dismissPrompt()
 
                                     await recordingService.startRecording(for: meeting.id)
+                                    // Start system audio capture alongside mic (graceful if Screen
+                                    // Recording permission denied — mic-only fallback applies)
+                                    await systemAudioService.startCapturing(for: meeting.id)
                                 }
                             },
                             onDismiss: {
@@ -128,13 +132,14 @@ struct MainContainerView: View {
             meetingDetector.onMeetingEnded = {
                 Task { @MainActor in
                     guard recordingService.isRecording else { return }
-                    print("[AutoStop] meeting ended while recording — waiting 4 s before stop")
-                    try? await Task.sleep(nanoseconds: 4_000_000_000)
+                    // 1.5 s grace period — combined with 3 s fast-poll gives ≤ 4.5 s max auto-stop.
+                    print("[AutoStop] meeting ended while recording — waiting 1.5 s grace before stop")
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
                     guard recordingService.isRecording else {
                         print("[AutoStop] recording already stopped during grace period — no action")
                         return
                     }
-                    print("[AutoStop] auto-stopping recording (meeting gone for ≥ 4 s)")
+                    print("[AutoStop] auto-stopping recording (meeting gone for ≥ 1.5 s)")
                     recordingService.stopRecording()
                 }
             }
@@ -147,20 +152,29 @@ struct MainContainerView: View {
         .onChange(of: recordingService.isRecording) { _, isNow in
             if isNow {
                 // ── Recording started ─────────────────────────────────────────
-                print("[Recording] MainContainerView: recording started — enabling fast poll + checkpoint timer")
+                print("[Recording] MainContainerView: recording started — fast poll + system audio + checkpoint timer")
                 meetingDetector.enableFastPoll()
 
-                // Part 1: checkpoint timer — persists activeRecordingMeeting.transcript
-                // every 10 s. MeetingDetailView keeps meeting.transcript current via its
-                // own onChange(of: transcript), so a safeSave() here is sufficient.
+                // Start system audio capture for participant labeling (if not already started
+                // by the onStart handler above). Guard inside startCapturing prevents double-start.
+                Task { @MainActor in
+                    await systemAudioService.startCapturing(for: activeRecordingMeeting?.id)
+                }
+
+                // Checkpoint every 5 s — merges mic ("Me:") and system audio ("Participant:")
+                // before persisting, so a crash loses at most 5 s of combined transcript.
                 transcriptCheckpointTimer?.invalidate()
-                transcriptCheckpointTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { _ in
+                transcriptCheckpointTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
                     Task { @MainActor in
                         guard recordingService.isRecording,
                               let meeting = activeRecordingMeeting else { return }
-                        meeting.transcript = recordingService.speakerTranscript
+                        let merged = Self.mergeTranscripts(
+                            mic: recordingService.speakerTranscript,
+                            participant: systemAudioService.participantSpeakerTranscript
+                        )
+                        if !merged.isEmpty { meeting.transcript = merged }
                         modelContext.safeSave(context: "transcript checkpoint")
-                        print("[Transcript] MainContainer checkpoint persisted chars=\(meeting.transcript.count) elapsed=\(recordingService.elapsedSeconds)s")
+                        print("[Transcript] MainContainer checkpoint mic=\(recordingService.transcript.count) participant=\(systemAudioService.transcript.count) elapsed=\(recordingService.elapsedSeconds)s")
                     }
                 }
             } else {
@@ -169,17 +183,26 @@ struct MainContainerView: View {
                 transcriptCheckpointTimer?.invalidate()
                 transcriptCheckpointTimer = nil
                 meetingDetector.disableFastPoll()
+                systemAudioService.stopCapturing()
 
+                // Capture meeting reference before nil-ing — then delay 1.5 s so the
+                // SFSpeechRecognizer can deliver its final partial result for BOTH streams.
                 guard let meeting = activeRecordingMeeting else { return }
-                // Part 2: save speaker-labeled transcript.
-                meeting.transcript = recordingService.speakerTranscript
-                meeting.durationSeconds = TimeInterval(recordingService.elapsedSeconds)
-                if let url = recordingService.recordingURL {
-                    meeting.audioFilePath = url.path
-                }
-                modelContext.safeSave(context: "meeting recording")
-                print("[Transcript] MainContainer finalized meeting=\(meeting.id) chars=\(meeting.transcript.count) duration=\(meeting.durationSeconds)s")
                 activeRecordingMeeting = nil
+
+                Task { @MainActor in
+                    print("[Transcript] MainContainer: waiting 1.5 s for final recognition chunks...")
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                    let merged = Self.mergeTranscripts(
+                        mic: recordingService.speakerTranscript,
+                        participant: systemAudioService.participantSpeakerTranscript
+                    )
+                    if !merged.isEmpty { meeting.transcript = merged }
+                    meeting.durationSeconds = TimeInterval(recordingService.elapsedSeconds)
+                    if let url = recordingService.recordingURL { meeting.audioFilePath = url.path }
+                    modelContext.safeSave(context: "meeting recording final")
+                    print("[Transcript] MainContainer finalized meeting=\(meeting.id) merged=\(merged.count) mic=\(recordingService.transcript.count) participant=\(systemAudioService.transcript.count) duration=\(meeting.durationSeconds)s")
+                }
             }
         }
         .onChange(of: calendarBackgroundSync) { _, enabled in
@@ -188,6 +211,23 @@ struct MainContainerView: View {
             } else {
                 calendarService.stopBackgroundSync()
             }
+        }
+    }
+
+    // MARK: - Transcript helpers
+
+    /// Combines mic and participant transcripts into a single labeled string.
+    ///
+    /// - If both are non-empty: "Me: …\n\nParticipant: …"
+    /// - If only mic: "Me: …"  (system audio unavailable or no participant speech)
+    /// - If only participant: "Participant: …"  (edge case — mic silent)
+    /// - If both empty: ""
+    static func mergeTranscripts(mic: String, participant: String) -> String {
+        switch (mic.isEmpty, participant.isEmpty) {
+        case (true,  true):  return ""
+        case (false, true):  return mic
+        case (true,  false): return participant
+        case (false, false): return "\(mic)\n\n\(participant)"
         }
     }
 

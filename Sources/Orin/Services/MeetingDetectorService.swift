@@ -192,12 +192,12 @@ final class MeetingDetectorService: Service {
     @MainActor
     func enableFastPoll() {
         guard timer != nil else { return }
-        print("[AutoStop] fast poll enabled (4 s interval)")
+        print("[AutoStop] fast poll enabled (3 s interval)")
         timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
             self?.poll()
         }
-        poll()   // immediate check so first detection fires within ≤ 4 s, not 4+4
+        poll()   // immediate check so first detection fires within ≤ 3 s, not 3+3
     }
 
     /// Restores the normal 30 s poll interval after recording stops.
