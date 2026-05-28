@@ -54,6 +54,7 @@ struct OrinApp: App {
         services.register(LoginItemService(), for: LoginItemService.self)
         services.register(WhisperTranscriptionService(), for: WhisperTranscriptionService.self)
         services.register(SystemAudioCaptureService(), for: SystemAudioCaptureService.self)
+        services.register(TranscriptStore(), for: TranscriptStore.self)
 
         let retentionService = MeetingRetentionService()
         services.register(retentionService, for: MeetingRetentionService.self)
@@ -134,6 +135,19 @@ struct OrinApp: App {
                     rolloverEngine.verifyAndExecuteRollover()
                     ServiceContainer.shared.resolve(AssistantService.self).processPendingIntents()
                     bringWindowToFront()
+
+                    // Orphan recovery: if the previous session crashed or was force-quit,
+                    // restore the most-recent checkpoint text to the meeting model.
+                    ServiceContainer.shared.resolve(TranscriptStore.self)
+                        .recoverOrphan(in: modelContainer.mainContext)
+                }
+                // Final checkpoint on clean quit — captures any transcript not yet persisted
+                // by the 3-second timer. Runs synchronously on the main actor before the
+                // process exits (NSApplication.willTerminateNotification fires on main thread).
+                .onReceive(
+                    NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)
+                ) { _ in
+                    ServiceContainer.shared.resolve(TranscriptStore.self).checkpoint()
                 }
                 .onOpenURL { url in
                     ServiceContainer.shared.resolve(AssistantService.self).handleURL(url)

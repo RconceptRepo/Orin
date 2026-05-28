@@ -11,9 +11,8 @@ struct MainContainerView: View {
     @State private var meetingDetector = ServiceContainer.shared.resolve(MeetingDetectorService.self)
     @State private var calendarService = ServiceContainer.shared.resolve(CalendarService.self)
     @State private var systemAudioService = ServiceContainer.shared.resolve(SystemAudioCaptureService.self)
+    @State private var transcriptStore = ServiceContainer.shared.resolve(TranscriptStore.self)
     @State private var activeRecordingMeeting: MeetingItem?
-    /// Fires every 5 s during recording to checkpoint `activeRecordingMeeting.transcript`.
-    @State private var transcriptCheckpointTimer: Timer?
 
     enum SidebarModule: Hashable, CaseIterable {
         case today
@@ -152,7 +151,7 @@ struct MainContainerView: View {
         .onChange(of: recordingService.isRecording) { _, isNow in
             if isNow {
                 // ── Recording started ─────────────────────────────────────────
-                print("[Recording] MainContainerView: recording started — fast poll + system audio + checkpoint timer")
+                print("[Recording] MainContainerView: recording started — fast poll + system audio + TranscriptStore session")
                 meetingDetector.enableFastPoll()
 
                 // Start system audio capture for participant labeling (if not already started
@@ -161,49 +160,42 @@ struct MainContainerView: View {
                     await systemAudioService.startCapturing(for: activeRecordingMeeting?.id)
                 }
 
-                // Checkpoint every 5 s — merges mic ("Me:") and system audio ("Participant:")
-                // before persisting, so a crash loses at most 5 s of combined transcript.
-                transcriptCheckpointTimer?.invalidate()
-                transcriptCheckpointTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
-                    Task { @MainActor in
-                        guard recordingService.isRecording,
-                              let meeting = activeRecordingMeeting else { return }
-                        let merged = Self.mergeTranscripts(
-                            mic: recordingService.speakerTranscript,
-                            participant: systemAudioService.participantSpeakerTranscript
-                        )
-                        if !merged.isEmpty { meeting.transcript = merged }
-                        modelContext.safeSave(context: "transcript checkpoint")
-                        print("[Transcript] MainContainer checkpoint mic=\(recordingService.transcript.count) participant=\(systemAudioService.transcript.count) elapsed=\(recordingService.elapsedSeconds)s")
-                    }
+                // Begin a TranscriptStore session for prompt-triggered recordings where
+                // MainContainerView owns the meeting reference.  Manual recordings (started
+                // from MeetingDetailView) call beginSession themselves via onChange(of: activeMeetingID).
+                if let meeting = activeRecordingMeeting {
+                    transcriptStore.beginSession(
+                        meetingID: meeting.id,
+                        meeting: meeting,
+                        context: modelContext
+                    )
+                    print("[Transcript] MainContainer: TranscriptStore session begun for \(meeting.id)")
                 }
             } else {
                 // ── Recording stopped ─────────────────────────────────────────
                 print("[Recording] MainContainerView: recording stopped — disabling fast poll + finalizing")
-                transcriptCheckpointTimer?.invalidate()
-                transcriptCheckpointTimer = nil
                 meetingDetector.disableFastPoll()
                 systemAudioService.stopCapturing()
 
-                // Capture meeting reference before nil-ing — then delay 1.5 s so the
-                // SFSpeechRecognizer can deliver its final partial result for BOTH streams.
-                guard let meeting = activeRecordingMeeting else { return }
+                let elapsed = TimeInterval(recordingService.elapsedSeconds)
+                let audioURL = recordingService.recordingURL
                 activeRecordingMeeting = nil
 
+                // Delegate finalization to TranscriptStore — idempotent, best-of-N selection,
+                // 1.5 s wait for trailing recognition chunks, integrity-checked save.
                 Task { @MainActor in
-                    print("[Transcript] MainContainer: waiting 1.5 s for final recognition chunks...")
-                    try? await Task.sleep(nanoseconds: 1_500_000_000)
-                    let merged = Self.mergeTranscripts(
-                        mic: recordingService.speakerTranscript,
-                        participant: systemAudioService.participantSpeakerTranscript
-                    )
-                    if !merged.isEmpty { meeting.transcript = merged }
-                    meeting.durationSeconds = TimeInterval(recordingService.elapsedSeconds)
-                    if let url = recordingService.recordingURL { meeting.audioFilePath = url.path }
-                    modelContext.safeSave(context: "meeting recording final")
-                    print("[Transcript] MainContainer finalized meeting=\(meeting.id) merged=\(merged.count) mic=\(recordingService.transcript.count) participant=\(systemAudioService.transcript.count) duration=\(meeting.durationSeconds)s")
+                    await transcriptStore.finalize(elapsed: elapsed, audioURL: audioURL)
+                    print("[Transcript] MainContainer: TranscriptStore.finalize complete")
                 }
             }
+        }
+        // Route mic transcript chunks into TranscriptStore on every recognition update.
+        .onChange(of: recordingService.speakerTranscript) { _, labeled in
+            transcriptStore.updateMic(labeled)
+        }
+        // Route participant transcript chunks into TranscriptStore on every recognition update.
+        .onChange(of: systemAudioService.participantSpeakerTranscript) { _, labeled in
+            transcriptStore.updateParticipant(labeled)
         }
         .onChange(of: calendarBackgroundSync) { _, enabled in
             if enabled {
@@ -211,23 +203,6 @@ struct MainContainerView: View {
             } else {
                 calendarService.stopBackgroundSync()
             }
-        }
-    }
-
-    // MARK: - Transcript helpers
-
-    /// Combines mic and participant transcripts into a single labeled string.
-    ///
-    /// - If both are non-empty: "Me: …\n\nParticipant: …"
-    /// - If only mic: "Me: …"  (system audio unavailable or no participant speech)
-    /// - If only participant: "Participant: …"  (edge case — mic silent)
-    /// - If both empty: ""
-    static func mergeTranscripts(mic: String, participant: String) -> String {
-        switch (mic.isEmpty, participant.isEmpty) {
-        case (true,  true):  return ""
-        case (false, true):  return mic
-        case (true,  false): return participant
-        case (false, false): return "\(mic)\n\n\(participant)"
         }
     }
 
