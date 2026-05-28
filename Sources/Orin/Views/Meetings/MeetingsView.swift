@@ -16,9 +16,12 @@ struct MeetingsView: View {
     @State private var isCreatingFolder = false
     @State private var newFolderName = ""
     @State private var importStatus: String?
-    @State private var exportProgress = false
     @State private var noActiveMeetingError = false
     @State private var recurringSuggestion: RecurringFolderSuggestion?
+
+    @State private var selectedMeetingIDs: Set<UUID> = []
+    @State private var isPastExpanded = false
+    @State private var isUpcomingExpanded = true
 
     @State private var recordingService = ServiceContainer.shared.resolve(RecordingService.self)
     @State private var meetingDetector = ServiceContainer.shared.resolve(MeetingDetectorService.self)
@@ -99,8 +102,11 @@ struct MeetingsView: View {
         }
     }
 
+    // MARK: - Meeting List Panel
+
     private var meetingList: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(spacing: 0) {
+            // Header
             HStack(spacing: 10) {
                 Text("Meetings")
                     .font(OrinFont.pageTitle)
@@ -115,8 +121,6 @@ struct MeetingsView: View {
 
                 Menu {
                     Button("Create Folder") { isCreatingFolder = true }
-                    Button("Export Full App") { exportFullApp() }
-                    Button("Import Orin Export") { importFullApp() }
                 } label: {
                     Image(systemName: "ellipsis.circle")
                         .font(.system(size: 18, weight: .medium))
@@ -124,56 +128,95 @@ struct MeetingsView: View {
                 .menuStyle(.button)
                 .help("Meeting actions")
             }
-
-            if exportProgress {
-                ProgressView("Preparing export…")
-                    .font(OrinFont.caption)
-            }
+            .padding(.horizontal, 24)
+            .padding(.top, 24)
+            .padding(.bottom, 16)
 
             if let importStatus {
                 Text(importStatus)
                     .font(OrinFont.caption)
                     .foregroundStyle(OrinColor.secondaryText(colorScheme))
+                    .padding(.horizontal, 24)
+                    .padding(.bottom, 8)
             }
 
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 14, pinnedViews: []) {
-                    upcomingBlock
-                    folderBlocks
-                    pastBlock
+                LazyVStack(spacing: 2) {
+                    comingUpSection
+                    folderBlocksSection
+                    pastSection
                 }
-                .padding(.bottom, 20)
+                .padding(.horizontal, 16)
+                .padding(.bottom, selectedMeetingIDs.isEmpty ? 20 : 72)
+            }
+
+            if !selectedMeetingIDs.isEmpty {
+                multiSelectBar
             }
         }
-        .padding(24)
         .background(OrinColor.backgroundPrimary(colorScheme))
     }
 
-    private var upcomingBlock: some View {
-        let upcoming = unfiledMeetings.filter { $0.date >= Calendar.current.startOfDay(for: Date()) }
-        return MeetingSectionView(title: "Coming Up", isEmpty: upcoming.isEmpty) {
-            ForEach(upcoming, id: \.id) { meeting in
-                MeetingRowView(
-                    meeting: meeting,
-                    isSelected: selectedMeetingID == meeting.id,
-                    folders: folders,
-                    onSelect: { selectedMeetingID = meeting.id },
-                    onRecord: { startManualRecording(for: meeting) },
-                    onExport: { export(meeting: meeting, format: $0) },
-                    onMoveToFolder: { move(meeting, to: $0) },
-                    onCreateFolder: { isCreatingFolder = true },
-                    onDeleteMeeting: { deleteMeeting(meeting) }
-                )
+    // MARK: - Coming Up Section
+
+    private var comingUpSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            // Section header
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isUpcomingExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: isUpcomingExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(OrinColor.secondaryText(colorScheme))
+                    Text("Coming Up")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(OrinColor.secondaryText(colorScheme))
+                    Spacer()
+                }
+                .padding(.vertical, 6)
+                .padding(.horizontal, 8)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isUpcomingExpanded {
+                let upcomingMeetings = upcomingUnfiled
+                if upcomingMeetings.isEmpty {
+                    Text("No upcoming meetings.")
+                        .font(.system(size: 13))
+                        .foregroundStyle(OrinColor.secondaryText(colorScheme))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 8)
+                } else {
+                    let groups = groupByDay(upcomingMeetings)
+                    ForEach(groups, id: \.date) { group in
+                        UpcomingDayGroupCard(
+                            dayDate: group.date,
+                            dayMeetings: group.meetings,
+                            selectedMeetingID: selectedMeetingID,
+                            onSelect: { selectedMeetingID = $0.id },
+                            onRecord: { startManualRecording(for: $0) }
+                        )
+                        .padding(.bottom, 4)
+                    }
+                }
             }
         }
+        .padding(.bottom, 4)
     }
 
-    private var folderBlocks: some View {
+    // MARK: - Folder Blocks
+
+    private var folderBlocksSection: some View {
         ForEach(folders) { folder in
-            FolderBlockView(
+            GranolaFolderBlockView(
                 folder: folder,
                 meetings: meetings.filter { $0.folderID == folder.id }.sorted(by: meetingSort),
                 selectedMeetingID: selectedMeetingID,
+                selectedMeetingIDs: $selectedMeetingIDs,
                 folders: folders,
                 onToggle: {
                     folder.isExpanded.toggle()
@@ -184,30 +227,126 @@ struct MeetingsView: View {
                 onRecord: { startManualRecording(for: $0) },
                 onExport: { export(meeting: $0, format: $1) },
                 onMoveToFolder: { move($0, to: $1) },
+                onCreateFolder: { isCreatingFolder = true },
                 onDeleteFolder: { deleteFolder(folder) },
                 onDeleteMeeting: { deleteMeeting($0) }
             )
         }
     }
 
-    private var pastBlock: some View {
-        let past = unfiledMeetings.filter { $0.date < Calendar.current.startOfDay(for: Date()) }
-        return MeetingSectionView(title: "Past", isEmpty: past.isEmpty, collapsedByDefault: true) {
-            ForEach(past, id: \.id) { meeting in
-                MeetingRowView(
-                    meeting: meeting,
-                    isSelected: selectedMeetingID == meeting.id,
-                    folders: folders,
-                    onSelect: { selectedMeetingID = meeting.id },
-                    onRecord: { startManualRecording(for: meeting) },
-                    onExport: { export(meeting: meeting, format: $0) },
-                    onMoveToFolder: { move(meeting, to: $0) },
-                    onCreateFolder: { isCreatingFolder = true },
-                    onDeleteMeeting: { deleteMeeting(meeting) }
-                )
+    // MARK: - Past Section
+
+    private var pastSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isPastExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: isPastExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(OrinColor.secondaryText(colorScheme))
+                    Text("Past")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(OrinColor.secondaryText(colorScheme))
+                    Spacer()
+                }
+                .padding(.vertical, 6)
+                .padding(.horizontal, 8)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isPastExpanded {
+                let pastMeetings = pastUnfiled
+                if pastMeetings.isEmpty {
+                    Text("No past meetings.")
+                        .font(.system(size: 13))
+                        .foregroundStyle(OrinColor.secondaryText(colorScheme))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 8)
+                } else {
+                    let groups = groupByDay(pastMeetings.reversed())
+                    ForEach(groups, id: \.date) { group in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(dayHeaderString(group.date))
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(OrinColor.secondaryText(colorScheme))
+                                .padding(.horizontal, 8)
+                                .padding(.top, 8)
+                                .padding(.bottom, 2)
+
+                            ForEach(group.meetings, id: \.id) { meeting in
+                                PastMeetingRowView(
+                                    meeting: meeting,
+                                    isSelected: selectedMeetingID == meeting.id,
+                                    selectedIDs: $selectedMeetingIDs,
+                                    folders: folders,
+                                    onSelect: { selectedMeetingID = meeting.id },
+                                    onRecord: { startManualRecording(for: meeting) },
+                                    onExport: { export(meeting: meeting, format: $0) },
+                                    onMoveToFolder: { move(meeting, to: $0) },
+                                    onCreateFolder: { isCreatingFolder = true },
+                                    onDelete: { deleteMeeting(meeting) }
+                                )
+                            }
+                        }
+                    }
+                }
             }
         }
+        .padding(.bottom, 4)
     }
+
+    // MARK: - Multi-select Bar
+
+    private var multiSelectBar: some View {
+        HStack(spacing: 12) {
+            Button {
+                selectedMeetingIDs.removeAll()
+            } label: {
+                HStack(spacing: 6) {
+                    Text("\(selectedMeetingIDs.count) selected")
+                        .font(.system(size: 13, weight: .semibold))
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .semibold))
+                }
+            }
+            .buttonStyle(.plain)
+
+            Divider().frame(height: 16)
+
+            Menu {
+                ForEach(folders) { folder in
+                    Button(folder.name) { moveSelectedToFolder(folder) }
+                }
+            } label: {
+                Label("Add to folder", systemImage: "folder.badge.plus")
+                    .font(.system(size: 13))
+            }
+            .menuStyle(.button)
+
+            Spacer()
+
+            Button(role: .destructive) {
+                deleteSelectedMeetings()
+            } label: {
+                Image(systemName: "trash")
+                    .font(.system(size: 14))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.red)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.ultraThinMaterial)
+        .overlay(alignment: .top) {
+            Rectangle().fill(OrinColor.border(colorScheme)).frame(height: 1)
+        }
+    }
+
+    // MARK: - Folder Sheet
 
     private var folderSheet: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -228,6 +367,49 @@ struct MeetingsView: View {
         .padding(22)
         .frame(width: 360)
     }
+
+    // MARK: - Computed Helpers
+
+    private var upcomingUnfiled: [MeetingItem] {
+        let today = Calendar.current.startOfDay(for: Date())
+        return unfiledMeetings
+            .filter { $0.date >= today }
+            .sorted { $0.date < $1.date }
+    }
+
+    private var pastUnfiled: [MeetingItem] {
+        let today = Calendar.current.startOfDay(for: Date())
+        return unfiledMeetings
+            .filter { $0.date < today }
+            .sorted { $0.date < $1.date }
+    }
+
+    // MARK: - Day grouping
+
+    private struct DayGroup {
+        let date: Date
+        let meetings: [MeetingItem]
+    }
+
+    private func groupByDay(_ items: [MeetingItem]) -> [DayGroup] {
+        let cal = Calendar.current
+        var result: [Date: [MeetingItem]] = [:]
+        for item in items {
+            let day = cal.startOfDay(for: item.date)
+            result[day, default: []].append(item)
+        }
+        return result.keys.sorted().map { day in
+            DayGroup(date: day, meetings: result[day]!.sorted { $0.date < $1.date })
+        }
+    }
+
+    private func dayHeaderString(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "EEE d MMM"
+        return formatter.string(from: date)
+    }
+
+    // MARK: - Business Logic
 
     private func meetingSort(_ lhs: MeetingItem, _ rhs: MeetingItem) -> Bool {
         let now = Date()
@@ -347,48 +529,356 @@ struct MeetingsView: View {
         }
     }
 
-    private func exportFullApp() {
-        exportProgress = true
-        let panel = NSSavePanel()
-        panel.nameFieldStringValue = "Orin Export.json"
-        panel.canCreateDirectories = true
-        panel.begin { response in
-            defer { exportProgress = false }
-            guard response == .OK, let url = panel.url else { return }
-            do {
-                let data = try dataService.exportFullApp(context: modelContext)
-                try data.write(to: url, options: .atomic)
-                importStatus = "Full export saved."
-            } catch {
-                importStatus = "Full export failed: \(error.localizedDescription)"
-            }
-        }
-    }
-
-    private func importFullApp() {
-        let panel = NSOpenPanel()
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
-        panel.canChooseFiles = true
-        panel.begin { response in
-            guard response == .OK, let url = panel.url else { return }
-            do {
-                let data = try Data(contentsOf: url)
-                try dataService.importPackage(from: data, context: modelContext)
-                importStatus = "Import complete."
-            } catch {
-                importStatus = "Import failed: \(error.localizedDescription)"
-            }
-        }
-    }
-
     private func removeRecordingFile(for meeting: MeetingItem) {
         guard let path = meeting.audioFilePath else { return }
         try? FileManager.default.removeItem(atPath: path)
         meeting.audioFilePath = nil
         meeting.recordingDeletedAt = Date()
     }
+
+    private func moveSelectedToFolder(_ folder: MeetingFolderItem) {
+        for id in selectedMeetingIDs {
+            if let m = meetings.first(where: { $0.id == id }) { m.folderID = folder.id }
+        }
+        modelContext.safeSave(context: "multi move to folder")
+        selectedMeetingIDs.removeAll()
+    }
+
+    private func deleteSelectedMeetings() {
+        for id in selectedMeetingIDs {
+            if let m = meetings.first(where: { $0.id == id }) { deleteMeeting(m) }
+        }
+        selectedMeetingIDs.removeAll()
+    }
 }
+
+// MARK: - Upcoming Day Group Card
+
+private struct UpcomingDayGroupCard: View {
+    @Environment(\.colorScheme) private var colorScheme
+    let dayDate: Date
+    let dayMeetings: [MeetingItem]
+    let selectedMeetingID: UUID?
+    var onSelect: (MeetingItem) -> Void
+    var onRecord: (MeetingItem) -> Void
+
+    private var dayNumber: String {
+        let f = DateFormatter()
+        f.dateFormat = "d"
+        return f.string(from: dayDate)
+    }
+
+    private var monthAbbrev: String {
+        let f = DateFormatter()
+        f.dateFormat = "MMM"
+        return f.string(from: dayDate)
+    }
+
+    private var dayAbbrev: String {
+        let f = DateFormatter()
+        f.dateFormat = "EEE"
+        return f.string(from: dayDate)
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 0) {
+            // Left date column
+            VStack(spacing: 1) {
+                Text(dayNumber)
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundStyle(OrinColor.primaryText(colorScheme))
+                Text(monthAbbrev)
+                    .font(.system(size: 11))
+                    .foregroundStyle(OrinColor.secondaryText(colorScheme))
+                Text(dayAbbrev)
+                    .font(.system(size: 11))
+                    .foregroundStyle(OrinColor.secondaryText(colorScheme))
+            }
+            .frame(width: 52)
+
+            // Vertical separator
+            Rectangle()
+                .fill(OrinColor.border(colorScheme))
+                .frame(width: 1)
+                .padding(.vertical, 2)
+
+            // Meetings list
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(dayMeetings, id: \.id) { meeting in
+                    UpcomingMeetingItemRow(
+                        meeting: meeting,
+                        isSelected: selectedMeetingID == meeting.id,
+                        onSelect: { onSelect(meeting) },
+                        onRecord: { onRecord(meeting) }
+                    )
+                }
+            }
+            .padding(.leading, 12)
+        }
+        .padding(14)
+        .background(OrinColor.cardBackground(colorScheme))
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(OrinColor.border(colorScheme), lineWidth: 1)
+        }
+    }
+}
+
+// MARK: - Upcoming Meeting Item Row
+
+private struct UpcomingMeetingItemRow: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var isHovered = false
+
+    let meeting: MeetingItem
+    let isSelected: Bool
+    var onSelect: () -> Void
+    var onRecord: () -> Void
+
+    private var isMeetingNow: Bool {
+        let now = Date()
+        let duration = max(meeting.durationSeconds, 3600)
+        return now >= meeting.date && now <= meeting.date.addingTimeInterval(duration)
+    }
+
+    private var timeString: String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm"
+        if isMeetingNow {
+            if meeting.durationSeconds > 0 {
+                let end = meeting.date.addingTimeInterval(meeting.durationSeconds)
+                return "Now · \(formatter.string(from: meeting.date))–\(formatter.string(from: end))"
+            }
+            return "Now · \(formatter.string(from: meeting.date))"
+        }
+        if meeting.durationSeconds > 0 {
+            let end = meeting.date.addingTimeInterval(meeting.durationSeconds)
+            return "\(formatter.string(from: meeting.date))–\(formatter.string(from: end))"
+        }
+        return formatter.string(from: meeting.date)
+    }
+
+    var body: some View {
+        Button(action: onSelect) {
+            HStack(spacing: 8) {
+                // Left color border
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(isMeetingNow ? Color.green : OrinColor.accent)
+                    .frame(width: 3, height: 36)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(meeting.title)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(isSelected ? OrinColor.accent : OrinColor.primaryText(colorScheme))
+                        .lineLimit(1)
+                    Text(timeString)
+                        .font(.system(size: 11))
+                        .foregroundStyle(isMeetingNow ? Color.green : OrinColor.secondaryText(colorScheme))
+                }
+
+                Spacer()
+
+                // Quick record button
+                Button(action: onRecord) {
+                    Image(systemName: "record.circle")
+                        .foregroundStyle(OrinColor.error)
+                        .font(.system(size: 16))
+                }
+                .buttonStyle(.plain)
+                .opacity(isHovered ? 1 : 0.4)
+            }
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovered = $0 }
+    }
+}
+
+// MARK: - Granola Folder Block View
+
+private struct GranolaFolderBlockView: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @Bindable var folder: MeetingFolderItem
+    let meetings: [MeetingItem]
+    let selectedMeetingID: UUID?
+    @Binding var selectedMeetingIDs: Set<UUID>
+    let folders: [MeetingFolderItem]
+    var onToggle: () -> Void
+    var onSelect: (MeetingItem) -> Void
+    var onRecord: (MeetingItem) -> Void
+    var onExport: (MeetingItem, MeetingExportFormat) -> Void
+    var onMoveToFolder: (MeetingItem, MeetingFolderItem?) -> Void
+    var onCreateFolder: () -> Void
+    var onDeleteFolder: () -> Void
+    var onDeleteMeeting: (MeetingItem) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            // Folder header row
+            HStack {
+                Button(action: onToggle) {
+                    HStack(spacing: 8) {
+                        Image(systemName: folder.isExpanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
+                        Image(systemName: "folder.fill")
+                            .foregroundStyle(OrinColor.accent)
+                        Text(folder.name)
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(OrinColor.primaryText(colorScheme))
+                        Text("\(meetings.count)")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(.secondary.opacity(0.15))
+                            .clipShape(Capsule())
+                        Spacer()
+                    }
+                }
+                .buttonStyle(.plain)
+
+                Menu {
+                    Button("Rename Folder") { /* trigger rename */ }
+                    Divider()
+                    Button(role: .destructive, action: onDeleteFolder) {
+                        Label("Delete Folder", systemImage: "trash")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.secondary)
+                }
+                .menuStyle(.button)
+            }
+            .padding(.vertical, 6)
+            .padding(.horizontal, 8)
+            .contentShape(Rectangle())
+
+            if folder.isExpanded {
+                ForEach(meetings, id: \.id) { meeting in
+                    PastMeetingRowView(
+                        meeting: meeting,
+                        isSelected: selectedMeetingID == meeting.id,
+                        selectedIDs: $selectedMeetingIDs,
+                        folders: folders,
+                        onSelect: { onSelect(meeting) },
+                        onRecord: { onRecord(meeting) },
+                        onExport: { onExport(meeting, $0) },
+                        onMoveToFolder: { onMoveToFolder(meeting, $0) },
+                        onCreateFolder: onCreateFolder,
+                        onDelete: { onDeleteMeeting(meeting) }
+                    )
+                }
+            }
+        }
+        .padding(.bottom, 4)
+    }
+}
+
+// MARK: - Past Meeting Row View
+
+private struct PastMeetingRowView: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var isHovered = false
+
+    let meeting: MeetingItem
+    let isSelected: Bool
+    @Binding var selectedIDs: Set<UUID>
+    let folders: [MeetingFolderItem]
+    var onSelect: () -> Void
+    var onRecord: () -> Void
+    var onExport: (MeetingExportFormat) -> Void
+    var onMoveToFolder: (MeetingFolderItem?) -> Void
+    var onCreateFolder: () -> Void
+    var onDelete: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            // Checkbox - visible on hover or when multi-select active
+            Button {
+                if selectedIDs.contains(meeting.id) {
+                    selectedIDs.remove(meeting.id)
+                } else {
+                    selectedIDs.insert(meeting.id)
+                }
+            } label: {
+                Image(systemName: selectedIDs.contains(meeting.id) ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(selectedIDs.contains(meeting.id) ? OrinColor.accent : .secondary)
+                    .font(.system(size: 16))
+            }
+            .buttonStyle(.plain)
+            .opacity(isHovered || !selectedIDs.isEmpty ? 1 : 0)
+
+            // Document icon
+            Image(systemName: "doc.text")
+                .foregroundStyle(.secondary)
+                .font(.system(size: 14))
+
+            // Title + participants
+            VStack(alignment: .leading, spacing: 2) {
+                Text(meeting.title)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(isSelected ? OrinColor.accent : OrinColor.primaryText(colorScheme))
+                    .lineLimit(1)
+                Text(meeting.participants.isEmpty
+                     ? "Me"
+                     : meeting.participants.prefix(2).joined(separator: ", "))
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            // Time
+            Text(meeting.date, format: .dateTime.hour().minute())
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+
+            // 3-dot menu
+            Menu {
+                Button("Start Recording") { onRecord() }
+                Menu("Export") {
+                    Button("Markdown") { onExport(.markdown) }
+                    Button("Text") { onExport(.text) }
+                    Button("JSON") { onExport(.json) }
+                }
+                Menu("Move to Folder") {
+                    Button("Remove from Folder") { onMoveToFolder(nil) }
+                    Divider()
+                    ForEach(folders) { folder in
+                        Button(folder.name) { onMoveToFolder(folder) }
+                    }
+                    Divider()
+                    Button("Create Folder") { onCreateFolder() }
+                }
+                Divider()
+                Button(role: .destructive, action: onDelete) {
+                    Label("Delete", systemImage: "trash")
+                }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+            }
+            .menuStyle(.button)
+            .opacity(isHovered ? 1 : 0.3)
+        }
+        .padding(.vertical, 8)
+        .padding(.horizontal, 8)
+        .background(
+            isSelected
+                ? OrinColor.accent.opacity(0.08)
+                : (isHovered ? OrinColor.backgroundSecondary(colorScheme) : Color.clear),
+            in: RoundedRectangle(cornerRadius: 8)
+        )
+        .contentShape(Rectangle())
+        .onHover { isHovered = $0 }
+        .onTapGesture { onSelect() }
+    }
+}
+
+// MARK: - Supporting Types
 
 private struct RecurringFolderSuggestion {
     let signature: String
@@ -398,182 +888,6 @@ private struct RecurringFolderSuggestion {
 
     var message: String {
         "Orin found \(meetingIDs.count) matching meetings named \"\(title)\"."
-    }
-}
-
-private struct MeetingSectionView<Content: View>: View {
-    let title: String
-    let isEmpty: Bool
-    var collapsedByDefault = false
-    @ViewBuilder let content: Content
-    @State private var isExpanded: Bool
-
-    init(title: String, isEmpty: Bool, collapsedByDefault: Bool = false, @ViewBuilder content: () -> Content) {
-        self.title = title
-        self.isEmpty = isEmpty
-        self.collapsedByDefault = collapsedByDefault
-        self.content = content()
-        _isExpanded = State(initialValue: !collapsedByDefault)
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Button {
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    isExpanded.toggle()
-                }
-            } label: {
-                HStack {
-                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                    Text(title)
-                        .font(OrinFont.sectionTitle)
-                    Spacer()
-                }
-            }
-            .buttonStyle(.plain)
-
-            if isExpanded {
-                if isEmpty {
-                    Text("No meetings here.")
-                        .font(OrinFont.body)
-                        .foregroundStyle(.secondary)
-                        .padding(.vertical, 8)
-                } else {
-                    content
-                }
-            }
-        }
-    }
-}
-
-private struct FolderBlockView: View {
-    @Bindable var folder: MeetingFolderItem
-    let meetings: [MeetingItem]
-    let selectedMeetingID: UUID?
-    let folders: [MeetingFolderItem]
-    var onToggle: () -> Void
-    var onSelect: (MeetingItem) -> Void
-    var onRecord: (MeetingItem) -> Void
-    var onExport: (MeetingItem, MeetingExportFormat) -> Void
-    var onMoveToFolder: (MeetingItem, MeetingFolderItem?) -> Void
-    var onDeleteFolder: () -> Void
-    var onDeleteMeeting: (MeetingItem) -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Button(action: onToggle) {
-                    Image(systemName: folder.isExpanded ? "chevron.down" : "chevron.right")
-                }
-                .buttonStyle(.plain)
-                Image(systemName: "folder")
-                Text(folder.name)
-                    .font(OrinFont.sectionTitle)
-                Text("\(meetings.count)")
-                    .font(OrinFont.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Menu {
-                    Button(role: .destructive, action: onDeleteFolder) {
-                        Label("Delete Folder", systemImage: "trash")
-                    }
-                } label: {
-                    Image(systemName: "ellipsis")
-                }
-                .menuStyle(.button)
-            }
-
-            if folder.isExpanded {
-                ForEach(meetings, id: \.id) { meeting in
-                    MeetingRowView(
-                        meeting: meeting,
-                        isSelected: selectedMeetingID == meeting.id,
-                        folders: folders,
-                        onSelect: { onSelect(meeting) },
-                        onRecord: { onRecord(meeting) },
-                        onExport: { onExport(meeting, $0) },
-                        onMoveToFolder: { onMoveToFolder(meeting, $0) },
-                        onCreateFolder: {},
-                        onDeleteMeeting: { onDeleteMeeting(meeting) }
-                    )
-                }
-            }
-        }
-    }
-}
-
-private struct MeetingRowView: View {
-    @Environment(\.colorScheme) private var colorScheme
-    let meeting: MeetingItem
-    let isSelected: Bool
-    let folders: [MeetingFolderItem]
-    var onSelect: () -> Void
-    var onRecord: () -> Void
-    var onExport: (MeetingExportFormat) -> Void
-    var onMoveToFolder: (MeetingFolderItem?) -> Void
-    var onCreateFolder: () -> Void
-    var onDeleteMeeting: () -> Void
-
-    var body: some View {
-        Button(action: onSelect) {
-            HStack(spacing: 12) {
-                RoundedRectangle(cornerRadius: 2)
-                    .fill(meeting.date >= Date() ? OrinColor.accent : OrinColor.border(colorScheme))
-                    .frame(width: 4, height: 44)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(meeting.title)
-                        .font(OrinFont.cardTitle)
-                        .foregroundStyle(OrinColor.primaryText(colorScheme))
-                        .lineLimit(1)
-                    Text(meeting.date.formatted(date: .abbreviated, time: .shortened))
-                        .font(OrinFont.caption)
-                        .foregroundStyle(OrinColor.secondaryText(colorScheme))
-                }
-                Spacer()
-                Button(action: onRecord) {
-                    Image(systemName: "record.circle")
-                        .font(.system(size: 18, weight: .medium))
-                        .foregroundStyle(OrinColor.error)
-                }
-                .buttonStyle(.plain)
-                .help("Start Recording")
-                rowMenu
-            }
-            .padding(12)
-            .background(isSelected ? OrinColor.accent.opacity(0.14) : OrinColor.cardBackground(colorScheme))
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(isSelected ? OrinColor.accent.opacity(0.35) : OrinColor.border(colorScheme), lineWidth: 1)
-            }
-        }
-        .buttonStyle(.plain)
-    }
-
-    private var rowMenu: some View {
-        Menu {
-            Menu("Export") {
-                Button("JSON") { onExport(.json) }
-                Button("Markdown") { onExport(.markdown) }
-                Button("Text") { onExport(.text) }
-            }
-            Menu("Move to Folder") {
-                Button("Remove from Folder") { onMoveToFolder(nil) }
-                Divider()
-                ForEach(folders) { folder in
-                    Button(folder.name) { onMoveToFolder(folder) }
-                }
-                Divider()
-                Button("Create Folder") { onCreateFolder() }
-            }
-            Button(role: .destructive, action: onDeleteMeeting) {
-                Label("Delete Meeting", systemImage: "trash")
-            }
-        } label: {
-            Image(systemName: "ellipsis.circle")
-        }
-        .buttonStyle(.plain)
-        .menuStyle(.button)
     }
 }
 

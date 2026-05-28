@@ -233,7 +233,7 @@ final class VaultServiceTests: XCTestCase {
 
     func testFiveFailuresTriggersLockout() {
         vault.storeVerificationToken(for: SymmetricKey(size: .bits256))
-        let badKey = String(repeating: "00", count: 64)
+        let badKey = String(repeating: "00", count: 32)  // 64 hex chars = valid format, wrong key
         for _ in 0..<5 {
             _ = vault.verifyAndParseRecoveryKey(badKey)
         }
@@ -243,7 +243,7 @@ final class VaultServiceTests: XCTestCase {
     func testLockedVaultRejectsCorrectKey() {
         let key = SymmetricKey(size: .bits256)
         vault.storeVerificationToken(for: key)
-        let badKey = String(repeating: "00", count: 64)
+        let badKey = String(repeating: "00", count: 32)  // 64 hex chars = valid format, wrong key
         for _ in 0..<5 {
             _ = vault.verifyAndParseRecoveryKey(badKey)
         }
@@ -255,7 +255,7 @@ final class VaultServiceTests: XCTestCase {
 
     func testLockoutUntilIsFutureDate() {
         vault.storeVerificationToken(for: SymmetricKey(size: .bits256))
-        let badKey = String(repeating: "00", count: 64)
+        let badKey = String(repeating: "00", count: 32)  // 64 hex chars = valid format, wrong key
         for _ in 0..<5 { _ = vault.verifyAndParseRecoveryKey(badKey) }
         if let until = vault.recoveryLockoutUntil {
             XCTAssertGreaterThan(until, Date())
@@ -267,7 +267,7 @@ final class VaultServiceTests: XCTestCase {
     func testSuccessfulRecoveryResetsFailCount() {
         let key = SymmetricKey(size: .bits256)
         vault.storeVerificationToken(for: key)
-        let badKey = String(repeating: "00", count: 64)
+        let badKey = String(repeating: "00", count: 32)  // 64 hex chars = valid format, wrong key
         // Use 4 out of 5 allowed attempts
         for _ in 0..<4 { _ = vault.verifyAndParseRecoveryKey(badKey) }
         XCTAssertFalse(vault.isRecoveryLocked)
@@ -278,7 +278,7 @@ final class VaultServiceTests: XCTestCase {
 
     func testResetVaultClearsLockoutState() {
         vault.storeVerificationToken(for: SymmetricKey(size: .bits256))
-        let badKey = String(repeating: "00", count: 64)
+        let badKey = String(repeating: "00", count: 32)  // 64 hex chars = valid format, wrong key
         for _ in 0..<5 { _ = vault.verifyAndParseRecoveryKey(badKey) }
         XCTAssertTrue(vault.isRecoveryLocked)
         vault.resetVault()
@@ -344,7 +344,7 @@ final class VaultServiceTests: XCTestCase {
     /// the next and causing a spurious lockout immediately after a reset.
     func testResetVaultRestoresBruteForceCounterForNewVault() {
         vault.storeVerificationToken(for: SymmetricKey(size: .bits256))
-        let badKey = String(repeating: "00", count: 64)
+        let badKey = String(repeating: "00", count: 32)  // 64 hex chars = valid format, wrong key
         for _ in 0..<4 { _ = vault.verifyAndParseRecoveryKey(badKey) }
         XCTAssertEqual(vault.remainingRecoveryAttempts, 1, "Precondition: one attempt left")
 
@@ -463,7 +463,7 @@ final class VaultServiceTests: XCTestCase {
     func testVerifyRecoveryKeyWorksWhenRecoveryIsLocked() {
         let realKey = SymmetricKey(size: .bits256)
         vault.storeVerificationToken(for: realKey)
-        let badKey = String(repeating: "00", count: 64)
+        let badKey = String(repeating: "00", count: 32)  // 64 hex chars = valid format, wrong key
 
         // Trigger lockout via the real recovery path.
         for _ in 0..<5 { _ = vault.verifyAndParseRecoveryKey(badKey) }

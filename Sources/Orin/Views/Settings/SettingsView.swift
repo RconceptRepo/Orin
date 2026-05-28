@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct SettingsView: View {
@@ -11,6 +12,10 @@ struct SettingsView: View {
     @AppStorage("orin.meetings.autoAnalyze") private var autoAnalyze = true
     @AppStorage("orin.meetings.minDurationMinutes") private var minDurationMinutes = 1
 
+    // MARK: - Environment
+
+    @Environment(\.modelContext) private var modelContext
+
     // MARK: - Services
 
     @State private var aiTester         = ServiceContainer.shared.resolve(AIProviderTestService.self)
@@ -18,6 +23,7 @@ struct SettingsView: View {
     @State private var ollamaInstaller  = ServiceContainer.shared.resolve(OllamaInstallerService.self)
     @State private var vaultService     = ServiceContainer.shared.resolve(VaultService.self)
     @State private var calendarService  = ServiceContainer.shared.resolve(CalendarService.self)
+    private let dataService             = ServiceContainer.shared.resolve(MeetingDataService.self)
 
     // MARK: - Sheet / Dialog state
 
@@ -43,6 +49,11 @@ struct SettingsView: View {
     @State private var anthropicSavedFlash = false
     @State private var geminiSavedFlash    = false
 
+    // MARK: - Data management state
+
+    @State private var exportProgress    = false
+    @State private var dataActionStatus: String?
+
     // MARK: - Calendar sync state
 
     @State private var isSyncingCalendar = false
@@ -55,6 +66,7 @@ struct SettingsView: View {
             aiSection
             calendarSection
             meetingsSection
+            dataSection
             vaultSection
             privacySection
             troubleshootingSection
@@ -423,6 +435,73 @@ struct SettingsView: View {
             Text("Recordings shorter than the minimum are discarded automatically.")
                 .font(OrinFont.caption)
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - Data Section
+
+    private var dataSection: some View {
+        Section("Data") {
+            Button {
+                exportFullApp()
+            } label: {
+                HStack {
+                    Label("Export Full App Data", systemImage: "square.and.arrow.up")
+                    if exportProgress {
+                        Spacer()
+                        ProgressView().scaleEffect(0.7)
+                    }
+                }
+            }
+            .disabled(exportProgress)
+
+            Button {
+                importFullApp()
+            } label: {
+                Label("Import Orin Backup", systemImage: "square.and.arrow.down")
+            }
+
+            if let status = dataActionStatus {
+                Text(status)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func exportFullApp() {
+        exportProgress = true
+        dataActionStatus = nil
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "Orin Export \(Date().formatted(date: .abbreviated, time: .omitted)).json"
+        panel.canCreateDirectories = true
+        panel.begin { [self] response in
+            defer { Task { @MainActor in exportProgress = false } }
+            guard response == .OK, let url = panel.url else { return }
+            do {
+                let data = try self.dataService.exportFullApp(context: self.modelContext)
+                try data.write(to: url, options: .atomic)
+                Task { @MainActor in dataActionStatus = "Exported to \(url.lastPathComponent)." }
+            } catch {
+                Task { @MainActor in dataActionStatus = "Export failed: \(error.localizedDescription)" }
+            }
+        }
+    }
+
+    private func importFullApp() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseFiles = true
+        panel.allowedContentTypes = [.json]
+        panel.begin { [self] response in
+            guard response == .OK, let url = panel.url else { return }
+            do {
+                let data = try Data(contentsOf: url)
+                try self.dataService.importPackage(from: data, context: self.modelContext)
+                Task { @MainActor in dataActionStatus = "Import complete." }
+            } catch {
+                Task { @MainActor in dataActionStatus = "Import failed: \(error.localizedDescription)" }
+            }
         }
     }
 

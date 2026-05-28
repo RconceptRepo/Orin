@@ -81,8 +81,10 @@ final class VaultService: Service {
 
     func currentState(hasVaultItems: Bool) -> VaultState {
         if sessionKey != nil, Date() < sessionExpiry { return .unlocked }
+        // No keychain item AND no verification token = never set up
+        if !hasVerificationToken && !hasKeychainItem() { return .locked }  // treat as locked (will self-initialize on first unlock)
         if hasVaultItems && !hasVerificationToken { return .corrupted }
-        if hasVaultItems && !hasKeychainItem() { return .recoveryRequired }
+        if !hasKeychainItem() { return .recoveryRequired }
         return .locked
     }
 
@@ -136,17 +138,15 @@ final class VaultService: Service {
 
     /// Validates a user-entered recovery key string.
     /// Returns the SymmetricKey on success, nil on failure.
-    /// Increments the brute-force counter on every invalid attempt.
+    /// Increments the brute-force counter only for semantically valid but wrong keys.
     func verifyAndParseRecoveryKey(_ input: String) -> SymmetricKey? {
         guard !isRecoveryLocked else { return nil }
-        guard let keyData = parseRecoveryKeyData(input) else {
-            recordFailedAttempt()
-            return nil
-        }
+        // Parse failures (wrong format, length) are not brute-force attempts
+        guard let keyData = parseRecoveryKeyData(input) else { return nil }
         let candidate = SymmetricKey(data: keyData)
         guard computeToken(for: candidate) ==
               UserDefaults.standard.string(forKey: verificationTokenUDKey) else {
-            recordFailedAttempt()
+            recordFailedAttempt()  // Only count semantically valid but wrong keys
             return nil
         }
         resetFailCount()
@@ -242,29 +242,33 @@ final class VaultService: Service {
         logger.warning("Vault reset started")
         let effectiveContext = context ?? sessionContext
 
+        // Attempt 1: Try with the cached evaluation context (silent if valid).
         var deleteQuery: [String: Any] = [
             kSecClass as String:       kSecClassGenericPassword,
             kSecAttrService as String: keychainServiceKey
         ]
         if let ctx = effectiveContext {
-            // Supplying the already-evaluated context lets the Keychain daemon
-            // skip its own authentication prompt and complete the delete silently.
             deleteQuery[kSecUseAuthenticationContext as String] = ctx
         }
 
-        let deleteStatus = SecItemDelete(deleteQuery as CFDictionary)
+        var deleteStatus = SecItemDelete(deleteQuery as CFDictionary)
 
-        // errSecSuccess (-0):      Item found and deleted.
-        // errSecItemNotFound (-25300): Nothing to delete — treat as success.
-        // errSecInteractionNotAllowed (-25308): Context cannot authorise silently.
-        // errSecAuthFailed (-25293): Context authentication was rejected.
-        // Any other status: surface to the caller unchanged.
+        // Attempt 2: If context-based delete failed, try with UI allowed (will show auth dialog).
+        if deleteStatus != errSecSuccess && deleteStatus != errSecItemNotFound {
+            logger.warning("Vault reset attempt 1 failed (status=\(deleteStatus)); trying with UI")
+            let uiQuery: [String: Any] = [
+                kSecClass as String:               kSecClassGenericPassword,
+                kSecAttrService as String:         keychainServiceKey,
+                kSecUseAuthenticationUI as String: kSecUseAuthenticationUIAllow
+            ]
+            deleteStatus = SecItemDelete(uiQuery as CFDictionary)
+        }
+
         guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
             logger.error("Vault keychain delete failed status=\(deleteStatus)")
             return .failure(.keychainError(deleteStatus))
         }
 
-        // Keychain item is gone (or was never there); wipe all associated state.
         UserDefaults.standard.removeObject(forKey: verificationTokenUDKey)
         resetFailCount()
         clearSession()
@@ -417,6 +421,15 @@ final class VaultService: Service {
             logger.error("Vault keychain read failed status=\(status)")
             throw VaultError.keychainError(status)
         }
+
+        // If a verification token exists, the vault was previously set up but the
+        // keychain item is gone. Signal recovery is needed instead of silently
+        // creating a new incompatible key.
+        if hasVerificationToken {
+            logger.warning("Vault keychain item missing but verification token exists — recovery required")
+            throw VaultError.keychainError(errSecItemNotFound)
+        }
+
         return try createMasterKey(context: context)
     }
 
