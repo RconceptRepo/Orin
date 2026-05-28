@@ -37,7 +37,9 @@ APP_PRODUCTS="$BUILD_ROOT/Build/Products/Debug"
 STAGING_DIR="$BUILD_ROOT/dmg-staging-qa"
 TIMESTAMP=$(date +"%Y-%m-%d-%H%M")
 DMG_NAME="Orin-${TIMESTAMP}.dmg"
-DMG_PATH="$BUILD_ROOT/$DMG_NAME"
+# Output to Desktop — avoids "malformed URL format" Finder error that occurs
+# when the DMG is nested inside a path containing date-like folder names.
+DMG_PATH="$HOME/Desktop/$DMG_NAME"
 
 # ── Flags ────────────────────────────────────────────────────────────────────
 
@@ -183,13 +185,7 @@ rm -rf "$STAGING_DIR"
 
 [[ -f "$DMG_PATH" ]] || die "DMG was not created at: $DMG_PATH"
 
-DMG_COUNT=$(find "$BUILD_ROOT" -maxdepth 1 -name "*.dmg" 2>/dev/null | wc -l | tr -d ' ')
-if [[ "$DMG_COUNT" -ne 1 ]]; then
-    warn "$DMG_COUNT .dmg files found in build-xcode/ (expected exactly 1)"
-    find "$BUILD_ROOT" -maxdepth 1 -name "*.dmg" | while read -r f; do
-        warn "  $(basename "$f")"
-    done
-fi
+DMG_COUNT=$(find "$HOME/Desktop" -maxdepth 1 -name "Orin-*.dmg" 2>/dev/null | wc -l | tr -d ' ')
 
 # ── 5. Report ────────────────────────────────────────────────────────────────
 
