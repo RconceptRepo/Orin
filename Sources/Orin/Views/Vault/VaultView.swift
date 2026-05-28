@@ -14,6 +14,7 @@ struct VaultView: View {
     @State private var revealedSecret = ""
     @State private var isAddingItem = false
     @State private var isUnlocking = false
+    @State private var vaultState: VaultState = .locked
 
     // Recovery key onboarding (first unlock)
     @State private var showingRecoveryKey = false
@@ -43,7 +44,10 @@ struct VaultView: View {
                 recoveryBanner
             }
 
-            if vaultKey == nil {
+            if vaultState == .resetting {
+                ProgressView("Resetting vault…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if vaultKey == nil {
                 lockedContent
             } else {
                 unlockedContent
@@ -94,6 +98,9 @@ struct VaultView: View {
                 }
             )
         }
+        .onAppear {
+            vaultState = vaultService.currentState(hasVaultItems: !vaultItems.isEmpty)
+        }
     }
 
     // MARK: - Sub-views
@@ -105,7 +112,12 @@ struct VaultView: View {
                     .font(.title2.weight(.semibold))
                 Text(vaultKey == nil ? "Locked" : "Unlocked")
                     .font(.subheadline)
-                    .foregroundStyle(vaultKey == nil ? Color.secondary : Color.green)
+                    .foregroundStyle(vaultState == .corrupted ? Color.orange : (vaultKey == nil ? Color.secondary : Color.green))
+                if vaultState == .corrupted || vaultState == .recoveryRequired {
+                    Text(vaultState == .corrupted ? "Recovery setup needs attention" : "Recovery key required")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
             }
 
             Spacer()
@@ -147,9 +159,11 @@ struct VaultView: View {
     private var lockedContent: some View {
         VStack(spacing: 12) {
             ContentUnavailableView(
-                "Vault Locked",
-                systemImage: "lock.shield",
-                description: Text(vaultService.canUseBiometrics
+                vaultState == .recoveryRequired ? "Vault Recovery Required" : "Vault Locked",
+                systemImage: vaultState == .recoveryRequired ? "key.horizontal" : "lock.shield",
+                description: Text(vaultState == .recoveryRequired
+                    ? "The local keychain item is missing or stale. Use your recovery key to relink the vault."
+                    : vaultService.canUseBiometrics
                     ? "Tap Unlock to authenticate with Touch ID. Your password is used as a fallback if Touch ID is unavailable."
                     : "Tap Unlock and enter your device password to access the vault.")
             )
@@ -225,6 +239,7 @@ struct VaultView: View {
         switch await vaultService.unlockVault() {
         case .success(let key):
             vaultKey = key
+            vaultState = .unlocked
             // Register verification token for vaults created before this feature
             if !vaultService.hasVerificationToken {
                 vaultService.storeVerificationToken(for: key)
@@ -249,6 +264,7 @@ struct VaultView: View {
         selectedItemID = nil
         revealedSecret = ""
         unlockedViaRecovery = false
+        vaultState = vaultService.currentState(hasVaultItems: !vaultItems.isEmpty)
     }
 
     private func reveal(_ item: VaultItem?) {
@@ -283,20 +299,21 @@ struct VaultView: View {
     }
 
     private func performVaultReset() {
-        // Attempt the keychain delete first, using the cached session context so the
-        // Keychain daemon does not re-prompt for authentication. SwiftData items are
-        // only removed after the key is confirmed gone — keeping them encrypted but
-        // intact if the keychain operation fails, so the user can retry or recover.
-        switch vaultService.resetVault() {
-        case .success:
+        vaultState = .resetting
+        switch vaultService.resetAndRegenerateVault() {
+        case .success(let regenerated):
             for item in vaultItems { modelContext.delete(item) }
             modelContext.safeSave(context: "vault reset")
             recoveryKeyShown = false
-            vaultKey = nil
+            vaultKey = regenerated.key
             selectedItemID = nil
             revealedSecret = ""
             unlockedViaRecovery = false
+            recoveryKeyString = regenerated.recoveryKey
+            showingRecoveryKey = true
+            vaultState = .unlocked
         case .failure(let error):
+            vaultState = vaultService.currentState(hasVaultItems: !vaultItems.isEmpty)
             if case .keychainError(let status) = error {
                 ErrorManager.shared.report(.vaultKeychainFailed(status: status))
             }

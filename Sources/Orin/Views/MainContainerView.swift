@@ -4,6 +4,7 @@ import SwiftUI
 struct MainContainerView: View {
     @AppStorage("orin.theme.mode") private var themeModeRawValue = OrinThemeMode.system.rawValue
     @AppStorage("orin.calendar.backgroundSync") private var calendarBackgroundSync = true
+    @AppStorage("orin.sidebar.collapsed") private var isSidebarCollapsed = true
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.modelContext) private var modelContext
     @State private var selectedModule: SidebarModule = .today
@@ -12,6 +13,7 @@ struct MainContainerView: View {
     @State private var calendarService = ServiceContainer.shared.resolve(CalendarService.self)
     @State private var systemAudioService = ServiceContainer.shared.resolve(SystemAudioCaptureService.self)
     @State private var transcriptStore = ServiceContainer.shared.resolve(TranscriptStore.self)
+    @State private var notificationService = ServiceContainer.shared.resolve(MeetingNotificationService.self)
     @State private var activeRecordingMeeting: MeetingItem?
 
     enum SidebarModule: Hashable, CaseIterable {
@@ -53,10 +55,10 @@ struct MainContainerView: View {
             ZStack(alignment: .bottomTrailing) {
                 HStack(spacing: 0) {
                     sidebar
-                        .frame(width: max(280, proxy.size.width * 0.3))
+                        .frame(width: sidebarWidth(for: proxy.size.width))
 
                     detail
-                        .frame(width: proxy.size.width * 0.7)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                         .background(OrinColor.backgroundPrimary(colorScheme))
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -67,50 +69,13 @@ struct MainContainerView: View {
                             appName: appName,
                             onStart: {
                                 Task { @MainActor in
-                                    let formatter = DateFormatter()
-                                    formatter.dateStyle = .short
-                                    formatter.timeStyle = .short
-
-                                    let meeting = MeetingItem(
-                                        title: "Meeting — \(formatter.string(from: Date()))",
-                                        date: Date()
-                                    )
-
-                                    modelContext.insert(meeting)
-
-                                    // Save first so SwiftData can fire any pending @Query
-                                    // notifications while TodayView is still fully alive.
-                                    modelContext.safeSave(context: "meeting")
-
-                                    activeRecordingMeeting = meeting
-
-                                    // Yield before navigating away. This gives SwiftUI one
-                                    // pass to process the @Query update for TodayView while
-                                    // TodayView is still in the hierarchy — guaranteeing the
-                                    // EmbeddedDynamicPropertyBox.update() completes before the
-                                    // view is torn down, which prevents the EXC_BAD_ACCESS 0x1e
-                                    // use-after-free on the freed @Query storage.
-                                    await Task.yield()
-
-                                    selectedModule = .meetings
-                                    meetingDetector.dismissPrompt()
-
-                                    await recordingService.startRecording(for: meeting.id)
-                                    // Start system audio capture alongside mic (graceful if Screen
-                                    // Recording permission denied — mic-only fallback applies)
-                                    await systemAudioService.startCapturing(for: meeting.id)
+                                    await startRecordingFromDetectedMeeting()
                                 }
                             },
                             onDismiss: {
                                 meetingDetector.dismissPrompt()
                             }
                         )
-                    }
-
-                    if recordingService.isRecording || recordingService.errorMessage != nil {
-                        RecordingWidgetView(recordingService: recordingService) {
-                            recordingService.stopRecording()
-                        }
                     }
 
                 }
@@ -122,7 +87,11 @@ struct MainContainerView: View {
         .preferredColorScheme(OrinThemeMode(rawValue: themeModeRawValue)?.colorScheme)
         .errorHandlingOverlay()
         .onAppear {
+            notificationService.configure()
             meetingDetector.startMonitoring()
+            meetingDetector.onMeetingDetected = { appName in
+                notificationService.notifyMeetingDetected(appName: appName)
+            }
 
             // Part 3 — auto-stop: when the meeting disappears from the detection
             // window, wait up to 4 s (one fast-poll miss) then stop recording.
@@ -153,6 +122,10 @@ struct MainContainerView: View {
                 // ── Recording started ─────────────────────────────────────────
                 print("[Recording] MainContainerView: recording started — fast poll + system audio + TranscriptStore session")
                 meetingDetector.enableFastPoll()
+                notificationService.notifyRecordingActive()
+                FloatingRecordingWidgetWindowManager.shared.show(recordingService: recordingService) {
+                    recordingService.stopRecording()
+                }
 
                 // Start system audio capture for participant labeling (if not already started
                 // by the onStart handler above). Guard inside startCapturing prevents double-start.
@@ -176,6 +149,7 @@ struct MainContainerView: View {
                 print("[Recording] MainContainerView: recording stopped — disabling fast poll + finalizing")
                 meetingDetector.disableFastPoll()
                 systemAudioService.stopCapturing()
+                FloatingRecordingWidgetWindowManager.shared.hide()
 
                 let elapsed = TimeInterval(recordingService.elapsedSeconds)
                 let audioURL = recordingService.recordingURL
@@ -204,6 +178,49 @@ struct MainContainerView: View {
                 calendarService.stopBackgroundSync()
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .orinNotificationStartRecording)) { _ in
+            Task { @MainActor in
+                await startRecordingFromDetectedMeeting()
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .orinNotificationDismissMeeting)) { _ in
+            meetingDetector.dismissPrompt()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .orinNotificationStopRecording)) { _ in
+            recordingService.stopRecording()
+        }
+    }
+
+    private func sidebarWidth(for totalWidth: CGFloat) -> CGFloat {
+        if isSidebarCollapsed {
+            return max(72, totalWidth * 0.05)
+        }
+        return max(240, totalWidth * 0.2)
+    }
+
+    @MainActor
+    private func startRecordingFromDetectedMeeting() async {
+        guard !recordingService.isRecording else { return }
+        let formatter = DateFormatter()
+        formatter.dateStyle = .short
+        formatter.timeStyle = .short
+
+        let meeting = MeetingItem(
+            title: "Meeting — \(formatter.string(from: Date()))",
+            date: Date()
+        )
+
+        modelContext.insert(meeting)
+        modelContext.safeSave(context: "meeting")
+        activeRecordingMeeting = meeting
+
+        await Task.yield()
+
+        selectedModule = .meetings
+        meetingDetector.dismissPrompt()
+
+        await recordingService.startRecording(for: meeting.id)
+        await systemAudioService.startCapturing(for: meeting.id)
     }
 
     private var sidebar: some View {
@@ -212,16 +229,29 @@ struct MainContainerView: View {
                 Image(systemName: "bolt.shield.fill")
                     .font(.system(size: 24, weight: .semibold))
                     .foregroundStyle(OrinColor.accent)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Orin")
-                        .font(.system(size: 22, weight: .semibold))
-                        .foregroundStyle(OrinColor.primaryText(colorScheme))
-                    Text("Think Less. Do Better.")
-                        .font(OrinFont.caption)
-                        .foregroundStyle(OrinColor.secondaryText(colorScheme))
+                if !isSidebarCollapsed {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Orin")
+                            .font(.system(size: 22, weight: .semibold))
+                            .foregroundStyle(OrinColor.primaryText(colorScheme))
+                        Text("Think Less. Do Better.")
+                            .font(OrinFont.caption)
+                            .foregroundStyle(OrinColor.secondaryText(colorScheme))
+                    }
                 }
+                Spacer()
+                Button {
+                    withAnimation(.easeInOut(duration: 0.22)) {
+                        isSidebarCollapsed.toggle()
+                    }
+                } label: {
+                    Image(systemName: isSidebarCollapsed ? "sidebar.left" : "sidebar.leading")
+                        .font(.system(size: 14, weight: .medium))
+                }
+                .buttonStyle(.plain)
+                .help(isSidebarCollapsed ? "Expand Sidebar" : "Collapse Sidebar")
             }
-            .padding(.horizontal, 20)
+            .padding(.horizontal, isSidebarCollapsed ? 14 : 20)
             .padding(.top, 20)
 
             VStack(spacing: 6) {
@@ -229,6 +259,7 @@ struct MainContainerView: View {
                     SidebarItem(
                         module: module,
                         isSelected: selectedModule == module,
+                        isCollapsed: isSidebarCollapsed,
                         action: { selectedModule = module }
                     )
                 }
@@ -270,6 +301,7 @@ private struct SidebarItem: View {
     @Environment(\.colorScheme) private var colorScheme
     let module: MainContainerView.SidebarModule
     let isSelected: Bool
+    let isCollapsed: Bool
     let action: () -> Void
 
     var body: some View {
@@ -283,17 +315,20 @@ private struct SidebarItem: View {
                 Image(systemName: module.iconName)
                     .frame(width: 22)
 
-                Text(module.title)
-                    .font(OrinFont.body.weight(isSelected ? .semibold : .regular))
+                if !isCollapsed {
+                    Text(module.title)
+                        .font(OrinFont.body.weight(isSelected ? .semibold : .regular))
 
-                Spacer()
+                    Spacer()
+                }
             }
             .foregroundStyle(isSelected ? OrinColor.accent : OrinColor.primaryText(colorScheme))
             .frame(height: 48)
-            .padding(.trailing, 12)
+            .padding(.trailing, isCollapsed ? 0 : 12)
             .background(isSelected ? OrinColor.accent.opacity(0.1) : Color.clear)
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         }
         .buttonStyle(.plain)
+        .help(module.title)
     }
 }

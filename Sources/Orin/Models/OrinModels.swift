@@ -121,6 +121,12 @@ final class MeetingItem {
     var actionItems: [String]
     var suggestedTaskTitles: [String]
     var acceptedSuggestedTaskTitles: [String]
+    var tags: [String]
+    var folderID: UUID?
+    var externalEventIdentifier: String?
+    var recordingDeletedAt: Date?
+    var transcriptDeletedAt: Date?
+    var deletedAt: Date?
     /// Path to the locally-recorded audio file for this meeting, if any.
     var audioFilePath: String?
 
@@ -141,6 +147,26 @@ final class MeetingItem {
         actionItems = []
         suggestedTaskTitles = []
         acceptedSuggestedTaskTitles = []
+        tags = []
+    }
+}
+
+@Model
+final class MeetingFolderItem {
+    @Attribute(.unique) var id: UUID
+    var name: String
+    var createdAt: Date
+    var updatedAt: Date
+    var isExpanded: Bool
+    var sortIndex: Int
+
+    init(name: String, sortIndex: Int = 0) {
+        id = UUID()
+        self.name = name
+        createdAt = Date()
+        updatedAt = Date()
+        isExpanded = true
+        self.sortIndex = sortIndex
     }
 }
 

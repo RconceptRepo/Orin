@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import LocalAuthentication
+import OSLog
 import Security
 
 enum VaultError: Error {
@@ -10,6 +11,14 @@ enum VaultError: Error {
     case authenticationFailed
     /// A Security framework error occurred during keychain access.
     case keychainError(OSStatus)
+}
+
+enum VaultState: String {
+    case locked
+    case unlocked
+    case resetting
+    case corrupted
+    case recoveryRequired
 }
 
 final class VaultService: Service {
@@ -23,6 +32,7 @@ final class VaultService: Service {
     private let maxAttempts             = 5
     private let lockoutDuration: TimeInterval = 1800   // 30 minutes
     private let sessionDuration: TimeInterval = 300    // 5 minutes
+    private let logger = Logger(subsystem: "com.clavrit.orin", category: "Vault")
 
     // MARK: - Session (in-process RAM only; CryptoKit zeroes on dealloc)
 
@@ -44,6 +54,7 @@ final class VaultService: Service {
 
     /// Clears the in-process session. Call when the user explicitly locks the vault.
     func clearSession() {
+        logger.info("Vault session cleared")
         sessionKey = nil
         sessionExpiry = .distantPast
         sessionContext = nil
@@ -52,15 +63,27 @@ final class VaultService: Service {
     /// Authenticates the user and returns the vault master key.
     /// Returns a cached session key within the 5-minute window.
     func unlockVault() async -> Result<SymmetricKey, VaultError> {
+        logger.info("Vault unlock attempt")
         if let key = sessionKey, Date() < sessionExpiry {
+            logger.info("Vault unlock used cached session")
             return .success(key)
         }
         let result = await authenticate()
         if case .success(let key) = result {
             sessionKey = key
             sessionExpiry = Date().addingTimeInterval(sessionDuration)
+            logger.info("Vault unlock succeeded")
+        } else {
+            logger.error("Vault unlock failed")
         }
         return result
+    }
+
+    func currentState(hasVaultItems: Bool) -> VaultState {
+        if sessionKey != nil, Date() < sessionExpiry { return .unlocked }
+        if hasVaultItems && !hasVerificationToken { return .corrupted }
+        if hasVaultItems && !hasKeychainItem() { return .recoveryRequired }
+        return .locked
     }
 
     // MARK: - Recovery key lifecycle
@@ -91,6 +114,7 @@ final class VaultService: Service {
     /// the key without revealing it. Safe to store without protection.
     func storeVerificationToken(for key: SymmetricKey) {
         UserDefaults.standard.set(computeToken(for: key), forKey: verificationTokenUDKey)
+        logger.info("Vault recovery verification token stored")
     }
 
     /// Cryptographically checks whether a user-entered recovery key string is
@@ -215,6 +239,7 @@ final class VaultService: Service {
     ///   can surface the error and let the user retry without data loss.
     @discardableResult
     func resetVault(context: LAContext? = nil) -> Result<Void, VaultError> {
+        logger.warning("Vault reset started")
         let effectiveContext = context ?? sessionContext
 
         var deleteQuery: [String: Any] = [
@@ -235,6 +260,7 @@ final class VaultService: Service {
         // errSecAuthFailed (-25293): Context authentication was rejected.
         // Any other status: surface to the caller unchanged.
         guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
+            logger.error("Vault keychain delete failed status=\(deleteStatus)")
             return .failure(.keychainError(deleteStatus))
         }
 
@@ -242,7 +268,32 @@ final class VaultService: Service {
         UserDefaults.standard.removeObject(forKey: verificationTokenUDKey)
         resetFailCount()
         clearSession()
+        logger.warning("Vault reset cleared keychain and recovery state")
         return .success(())
+    }
+
+    func resetAndRegenerateVault() -> Result<(key: SymmetricKey, recoveryKey: String), VaultError> {
+        switch resetVault() {
+        case .failure(let error):
+            return .failure(error)
+        case .success:
+            let key = SymmetricKey(size: .bits256)
+            do {
+                try storeMasterKey(key, context: nil)
+                storeVerificationToken(for: key)
+                sessionKey = key
+                sessionExpiry = Date().addingTimeInterval(sessionDuration)
+                let recoveryKey = recoveryKeyString(from: key)
+                logger.warning("Vault reset regenerated clean key and recovery key")
+                return .success((key, recoveryKey))
+            } catch let vaultError as VaultError {
+                logger.error("Vault reset key regeneration failed")
+                return .failure(vaultError)
+            } catch {
+                logger.error("Vault reset key regeneration failed with unknown error")
+                return .failure(.authenticationFailed)
+            }
+        }
     }
 
     // MARK: - Encryption (AES-GCM, 256-bit)
@@ -284,6 +335,7 @@ final class VaultService: Service {
         if biometricsAvailable {
             return await tryBiometrics(context: context)
         }
+        logger.info("Vault biometrics unavailable; using device password")
         return await tryPassword(context: context, lockedOut: false)
     }
 
@@ -295,19 +347,25 @@ final class VaultService: Service {
             )
             let key = try masterKey(context: context)
             sessionContext = context   // cache for later use by resetVault()
+            logger.info("Vault Touch ID authentication succeeded")
             return .success(key)
         } catch let laError as LAError {
             switch laError.code {
             case .userCancel, .appCancel, .systemCancel:
+                logger.info("Vault Touch ID cancelled")
                 return .failure(.userCancelled)
             case .biometryLockout:
+                logger.warning("Vault Touch ID locked out; falling back to password")
                 return await tryPassword(context: LAContext(), lockedOut: true)
             default:
+                logger.error("Vault Touch ID failed: \(laError.localizedDescription)")
                 return .failure(.authenticationFailed)
             }
         } catch let vaultError as VaultError {
+            logger.error("Vault Touch ID keychain failure")
             return .failure(vaultError)
         } catch {
+            logger.error("Vault Touch ID unknown failure")
             return .failure(.authenticationFailed)
         }
     }
@@ -320,15 +378,19 @@ final class VaultService: Service {
             try await context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason)
             let key = try masterKey(context: context)
             sessionContext = context   // cache for later use by resetVault()
+            logger.info("Vault password authentication succeeded")
             return .success(key)
         } catch let laError as LAError {
             switch laError.code {
             case .userCancel, .appCancel, .systemCancel:
+                logger.info("Vault password authentication cancelled")
                 return .failure(.userCancelled)
             default:
+                logger.error("Vault password authentication failed: \(laError.localizedDescription)")
                 return .failure(.authenticationFailed)
             }
         } catch let vaultError as VaultError {
+            logger.error("Vault password keychain failure")
             return .failure(vaultError)
         } catch {
             return .failure(.authenticationFailed)
@@ -352,6 +414,7 @@ final class VaultService: Service {
             return SymmetricKey(data: keyData)
         }
         guard status == errSecItemNotFound else {
+            logger.error("Vault keychain read failed status=\(status)")
             throw VaultError.keychainError(status)
         }
         return try createMasterKey(context: context)
@@ -359,6 +422,14 @@ final class VaultService: Service {
 
     private func createMasterKey(context: LAContext) throws -> SymmetricKey {
         let key = SymmetricKey(size: .bits256)
+        try storeMasterKey(key, context: context)
+        // Store verification token immediately so recovery works from first unlock.
+        storeVerificationToken(for: key)
+        logger.info("Vault master key created")
+        return key
+    }
+
+    private func storeMasterKey(_ key: SymmetricKey, context: LAContext?) throws {
         let keyData = key.withUnsafeBytes { Data($0) }
 
         guard let access = SecAccessControlCreateWithFlags(
@@ -370,21 +441,34 @@ final class VaultService: Service {
             throw VaultError.keychainError(errSecParam)
         }
 
-        let addQuery: [String: Any] = [
-            kSecClass as String:                    kSecClassGenericPassword,
-            kSecAttrService as String:              keychainServiceKey,
-            kSecValueData as String:                keyData,
-            kSecAttrAccessControl as String:        access,
-            kSecUseAuthenticationContext as String: context
+        var addQuery: [String: Any] = [
+            kSecClass as String:             kSecClassGenericPassword,
+            kSecAttrService as String:       keychainServiceKey,
+            kSecValueData as String:         keyData,
+            kSecAttrAccessControl as String: access
         ]
+        if let context {
+            addQuery[kSecUseAuthenticationContext as String] = context
+        }
 
         let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
         guard addStatus == errSecSuccess else {
+            logger.error("Vault keychain add failed status=\(addStatus)")
             throw VaultError.keychainError(addStatus)
         }
-        // Store verification token immediately so recovery works from first unlock.
-        storeVerificationToken(for: key)
-        return key
+        logger.info("Vault master key stored in keychain")
+    }
+
+    private func hasKeychainItem() -> Bool {
+        let query: [String: Any] = [
+            kSecClass as String:       kSecClassGenericPassword,
+            kSecAttrService as String: keychainServiceKey,
+            kSecReturnAttributes as String: true,
+            kSecUseAuthenticationUI as String: kSecUseAuthenticationUISkip
+        ]
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        return status == errSecSuccess || status == errSecInteractionNotAllowed
     }
 
     // MARK: - Recovery helpers (private)

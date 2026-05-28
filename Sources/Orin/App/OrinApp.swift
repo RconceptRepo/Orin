@@ -22,6 +22,7 @@ struct OrinApp: App {
             TaskItem.self,
             SubTaskItem.self,
             MeetingItem.self,
+            MeetingFolderItem.self,
             CommitmentItem.self,
             VaultItem.self,
             AISuggestionItem.self,
@@ -55,6 +56,8 @@ struct OrinApp: App {
         services.register(WhisperTranscriptionService(), for: WhisperTranscriptionService.self)
         services.register(SystemAudioCaptureService(), for: SystemAudioCaptureService.self)
         services.register(TranscriptStore(), for: TranscriptStore.self)
+        services.register(MeetingNotificationService(), for: MeetingNotificationService.self)
+        services.register(MeetingDataService(), for: MeetingDataService.self)
 
         let retentionService = MeetingRetentionService()
         services.register(retentionService, for: MeetingRetentionService.self)
