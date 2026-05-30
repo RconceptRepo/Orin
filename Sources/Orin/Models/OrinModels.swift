@@ -143,6 +143,9 @@ final class MeetingItem {
     /// JSON-encoded [ActionItemRecord] — structured action items with owner/priority/due.
     /// Nil when no structured analysis has been run.
     var structuredActionItemsJSON: String?
+    /// JSON-encoded MeetingKnowledgeSnapshot — compact representation for folder intelligence.
+    /// Updated every time analysis completes. Used instead of raw transcript in folder summaries.
+    var meetingKnowledgeJSON: String?
 
     @Relationship(deleteRule: .cascade)
     var commitments: [CommitmentItem] = []
@@ -156,6 +159,14 @@ final class MeetingItem {
               let items = try? JSONDecoder().decode([ActionItemRecord].self, from: data)
         else { return [] }
         return items
+    }
+
+    /// Decodes and returns the compact knowledge snapshot used by folder intelligence.
+    var decodedKnowledgeSnapshot: MeetingKnowledgeSnapshot? {
+        guard let json = meetingKnowledgeJSON,
+              let data = json.data(using: .utf8)
+        else { return nil }
+        return try? JSONDecoder().decode(MeetingKnowledgeSnapshot.self, from: data)
     }
 
     /// Effective end date for meeting classification.
@@ -244,6 +255,52 @@ struct ActionItemRecord: Codable, Identifiable {
         self.priority = priority
         self.dueDateText = dueDateText
         self.rawText = rawText
+    }
+}
+
+// MARK: - MeetingKnowledgeSnapshot
+//
+// Compact, pre-structured representation of a meeting's analysis results.
+// Built from MeetingItem fields after analysis completes and stored as JSON
+// in MeetingItem.meetingKnowledgeJSON.
+//
+// Used by FolderSummaryService instead of raw transcripts, which reduces:
+//   - Token usage (structured data is 10-50× more compact than transcript)
+//   - API latency (less text to send)
+//   - Hallucination risk (AI sees structured facts, not raw speech)
+
+struct MeetingKnowledgeSnapshot: Codable {
+    var meetingId: UUID
+    var title: String
+    var date: Date
+    var meetingType: String
+    var summary: String
+    var decisions: [String]
+    var openQuestions: [String]
+    var risks: [String]
+    var dependencies: [String]
+    var commitments: [String]
+    var actionItems: [String]                       // flat strings
+    var structuredActionItems: [ActionItemRecord]
+    var durationSeconds: TimeInterval
+    var participants: [String]
+
+    /// Creates a snapshot from the current state of a MeetingItem.
+    init(from meeting: MeetingItem) {
+        meetingId             = meeting.id
+        title                 = meeting.title
+        date                  = meeting.date
+        meetingType           = meeting.meetingType
+        summary               = meeting.summary
+        decisions             = meeting.decisions
+        openQuestions         = meeting.openQuestions
+        risks                 = meeting.risks
+        dependencies          = meeting.dependencies
+        commitments           = meeting.commitments.map(\.title)
+        actionItems           = meeting.actionItems
+        structuredActionItems = meeting.structuredActionItems
+        durationSeconds       = meeting.durationSeconds
+        participants          = meeting.participants
     }
 }
 

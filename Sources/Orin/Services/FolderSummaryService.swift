@@ -81,36 +81,69 @@ final class FolderSummaryService: Service {
     private func buildPrompt(folderName: String, meetings: [MeetingItem]) -> String {
         var parts = ["MEETING FOLDER: \(folderName) (\(meetings.count) meetings)"]
         parts.append("")
-        parts.append("=== MEETING SUMMARIES ===")
+        parts.append("=== MEETING KNOWLEDGE ===")
 
         for meeting in meetings {
-            let dateStr  = meeting.date.formatted(date: .abbreviated, time: .omitted)
-            let typeTag  = meeting.meetingType.isEmpty ? "" : " [\(meeting.meetingType)]"
-            parts.append("\(dateStr): \(meeting.title)\(typeTag)")
-            if !meeting.summary.isEmpty { parts.append(meeting.summary) }
-            if !meeting.decisions.isEmpty {
-                parts.append("Decisions: " + meeting.decisions.prefix(3).joined(separator: "; "))
+            // Prefer compact knowledge snapshot when available — much more token-efficient
+            // than building the entry from individual fields.
+            if let snapshot = meeting.decodedKnowledgeSnapshot {
+                parts.append(snapshotEntry(snapshot))
+            } else {
+                parts.append(legacyEntry(meeting))
             }
-            if !meeting.risks.isEmpty {
-                parts.append("Risks: " + meeting.risks.prefix(2).joined(separator: "; "))
-            }
-            parts.append("")
         }
 
-        if meetings.flatMap(\.decisions).count > 0 {
+        let allDecisions   = meetings.flatMap(\.decisions)
+        let allActionItems = meetings.flatMap(\.actionItems)
+
+        if !allDecisions.isEmpty {
+            parts.append("")
             parts.append("=== ALL DECISIONS ===")
-            for d in meetings.flatMap(\.decisions).prefix(20) { parts.append("• \(d)") }
-            parts.append("")
+            allDecisions.prefix(20).forEach { parts.append("• \($0)") }
         }
-
-        if meetings.flatMap(\.actionItems).count > 0 {
+        if !allActionItems.isEmpty {
+            parts.append("")
             parts.append("=== ALL ACTION ITEMS ===")
-            for a in meetings.flatMap(\.actionItems).prefix(20) { parts.append("• \(a)") }
-            parts.append("")
+            allActionItems.prefix(20).forEach { parts.append("• \($0)") }
         }
 
+        parts.append("")
         parts.append("Based on these \(meetings.count) meetings, write a concise paragraph (3-5 sentences) summarising the recurring themes, ongoing progress, and key patterns across this meeting series.")
         return parts.joined(separator: "\n")
+    }
+
+    /// Compact prompt entry built from a pre-existing knowledge snapshot.
+    /// Typically 3-8× smaller than a full meeting summary entry.
+    private func snapshotEntry(_ s: MeetingKnowledgeSnapshot) -> String {
+        let dateStr  = s.date.formatted(date: .abbreviated, time: .omitted)
+        let typeTag  = s.meetingType.isEmpty ? "" : " [\(s.meetingType)]"
+        var lines    = ["\(dateStr): \(s.title)\(typeTag)"]
+        if !s.summary.isEmpty { lines.append(s.summary) }
+        if !s.decisions.isEmpty {
+            lines.append("Decisions: " + s.decisions.prefix(3).joined(separator: "; "))
+        }
+        if !s.risks.isEmpty {
+            lines.append("Risks: " + s.risks.prefix(2).joined(separator: "; "))
+        }
+        if !s.actionItems.isEmpty {
+            lines.append("Actions: \(s.actionItems.count) items")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// Legacy entry built from MeetingItem fields (for meetings without a snapshot).
+    private func legacyEntry(_ meeting: MeetingItem) -> String {
+        let dateStr = meeting.date.formatted(date: .abbreviated, time: .omitted)
+        let typeTag = meeting.meetingType.isEmpty ? "" : " [\(meeting.meetingType)]"
+        var lines   = ["\(dateStr): \(meeting.title)\(typeTag)"]
+        if !meeting.summary.isEmpty { lines.append(meeting.summary) }
+        if !meeting.decisions.isEmpty {
+            lines.append("Decisions: " + meeting.decisions.prefix(3).joined(separator: "; "))
+        }
+        if !meeting.risks.isEmpty {
+            lines.append("Risks: " + meeting.risks.prefix(2).joined(separator: "; "))
+        }
+        return lines.joined(separator: "\n")
     }
 
     private func buildFallbackSummary(folderName: String, meetings: [MeetingItem]) -> String {

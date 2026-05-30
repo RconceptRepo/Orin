@@ -279,7 +279,22 @@ struct MainContainerView: View {
             meeting.structuredActionItemsJSON = json
         }
         modelContext.safeSave(context: "auto-analysis")
+        // Build and persist knowledge snapshot for folder intelligence
+        persistKnowledgeSnapshot(for: meeting)
         print("[AutoAnalysis] complete — summary chars=\(analysis.summary.count) decisions=\(analysis.decisions.count) actions=\(analysis.actionItems.count)")
+    }
+
+    // MARK: - Knowledge snapshot
+
+    /// Builds a `MeetingKnowledgeSnapshot` from the meeting's current analysis fields
+    /// and persists it as JSON.  Called after every successful analysis so folder
+    /// intelligence can use compact structured data instead of raw transcripts.
+    private func persistKnowledgeSnapshot(for meeting: MeetingItem) {
+        let snapshot = MeetingKnowledgeSnapshot(from: meeting)
+        guard let data = try? JSONEncoder().encode(snapshot),
+              let json = String(data: data, encoding: .utf8) else { return }
+        meeting.meetingKnowledgeJSON = json
+        modelContext.safeSave(context: "meeting knowledge snapshot")
     }
 
     // MARK: - Pending notification action (background recording start)

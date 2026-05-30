@@ -2023,6 +2023,12 @@ private struct MeetingDetailView: View {
             meeting.structuredActionItemsJSON = json
         }
         modelContext.safeSave(context: "meeting analysis")
+        // Persist knowledge snapshot for folder intelligence
+        if let snapshotData = try? JSONEncoder().encode(MeetingKnowledgeSnapshot(from: meeting)),
+           let snapshotJSON = String(data: snapshotData, encoding: .utf8) {
+            meeting.meetingKnowledgeJSON = snapshotJSON
+            modelContext.safeSave(context: "meeting knowledge snapshot")
+        }
         isAnalyzing = false
     }
 

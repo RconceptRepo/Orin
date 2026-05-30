@@ -67,36 +67,113 @@ final class MeetingIntelligenceService: Service {
 
     func analyze(title: String, transcript: String) async -> MeetingAnalysis {
         let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            return emptyAnalysis()
-        }
+        guard !trimmed.isEmpty else { return emptyAnalysis() }
 
         // Step 1: Detect meeting type (local — no AI)
         let meetingType = MeetingIntelligenceService.detectMeetingType(title: title, transcript: trimmed)
 
-        // Step 2: Build comprehensive structured prompt
-        let prompt = buildComprehensivePrompt(title: title, transcript: trimmed, meetingType: meetingType)
+        // Route: long transcripts → chunked hierarchical analysis
+        if trimmed.count > TranscriptChunker.singleCallThreshold {
+            log.info("long transcript chars=\(trimmed.count) — using chunked analysis")
+            return await analyzeChunked(title: title, transcript: trimmed, meetingType: meetingType)
+        }
 
-        // Step 3: Single AI call
+        return await analyzeSingleCall(title: title, transcript: trimmed, meetingType: meetingType)
+    }
+
+    // MARK: - Chunked Hierarchical Analysis (Tasks 2+3)
+    //
+    // For transcripts longer than TranscriptChunker.singleCallThreshold:
+    //   1. Split into 5000-char overlapping chunks
+    //   2. Extract structured data from each chunk (sequential AI calls)
+    //   3. Merge + deduplicate all extracted data
+    //   4. Synthesize executive summary from key points
+
+    private func analyzeChunked(
+        title: String,
+        transcript: String,
+        meetingType: String
+    ) async -> MeetingAnalysis {
+        let chunks = TranscriptChunker.chunks(of: transcript)
+        log.info("chunked analysis: \(chunks.count) chunks for title='\(title)'")
+
+        // Phase 1: Extract from each chunk
+        var chunkAnalyses: [ChunkAnalysis] = []
+        for (i, chunk) in chunks.enumerated() {
+            let ca = await TranscriptChunker.analyzeChunk(
+                chunk, index: i, totalChunks: chunks.count,
+                meetingType: meetingType, aiService: aiService
+            )
+            chunkAnalyses.append(ca)
+        }
+
+        // Phase 2: Merge and deduplicate
+        let allDecisions      = TranscriptChunker.deduplicateStrings(chunkAnalyses.flatMap(\.decisions))
+        let allOpenQuestions  = TranscriptChunker.deduplicateStrings(chunkAnalyses.flatMap(\.openQuestions))
+        let allRisks          = TranscriptChunker.deduplicateStrings(chunkAnalyses.flatMap(\.risks))
+        let allDependencies   = TranscriptChunker.deduplicateStrings(chunkAnalyses.flatMap(\.dependencies))
+        let allCommitments    = TranscriptChunker.deduplicateStrings(chunkAnalyses.flatMap(\.commitments))
+        let allStructured     = TranscriptChunker.deduplicateActionItems(chunkAnalyses.flatMap(\.structuredActionItems))
+        let allActionItems    = allStructured.isEmpty
+            ? TranscriptChunker.deduplicateStrings(chunkAnalyses.flatMap(\.actionItems))
+            : allStructured.map { "[\($0.owner)] \($0.task)" }
+
+        // Phase 3: Synthesize executive summary
+        let summary = await TranscriptChunker.synthesize(
+            chunks: chunkAnalyses, title: title, meetingType: meetingType, aiService: aiService
+        )
+
+        let suggestedTasks = buildSuggestedTasks(
+            title: title, commitments: allCommitments,
+            actionItems: allActionItems, structuredItems: allStructured
+        )
+
+        log.info("chunked analysis complete: summary=\(summary.count)chars decisions=\(allDecisions.count) actions=\(allStructured.count) risks=\(allRisks.count)")
+
+        return MeetingAnalysis(
+            summary:               summary,
+            meetingType:           meetingType,
+            decisions:             allDecisions,
+            openQuestions:         allOpenQuestions,
+            risks:                 allRisks,
+            dependencies:          allDependencies,
+            commitments:           allCommitments,
+            actionItems:           allActionItems,
+            structuredActionItems: allStructured,
+            suggestedTasks:        suggestedTasks
+        )
+    }
+
+    // MARK: - Single-Call Analysis (transcripts ≤ singleCallThreshold)
+
+    private func analyzeSingleCall(
+        title: String,
+        transcript: String,
+        meetingType: String
+    ) async -> MeetingAnalysis {
+        // Step 1: Build comprehensive structured prompt
+        let prompt = buildComprehensivePrompt(title: title, transcript: transcript, meetingType: meetingType)
+
+        // Step 2: Single AI call
         let result = await aiService.generate(prompt: prompt, maxTokens: 1500)
 
         if result.fallbackUsed || result.text.isEmpty {
             log.warning("AI unavailable — using keyword fallback")
-            return keywordFallback(title: title, transcript: trimmed, meetingType: meetingType)
+            return keywordFallback(title: title, transcript: transcript, meetingType: meetingType)
         }
 
-        // Step 4: Parse structured response
+        // Step 3: Parse structured response
         let parsed = parseComprehensiveResponse(result.text)
 
         // If parsing produced almost nothing, run keyword fallback for missing sections
         let decisions     = parsed.decisions.isEmpty
-            ? extractLines(from: trimmed, matching: ["decided", "decision", "agreed", "approved", "will proceed", "confirmed"])
+            ? extractLines(from: transcript, matching: ["decided", "decision", "agreed", "approved", "will proceed", "confirmed"])
             : parsed.decisions
         let commitments   = parsed.commitments.isEmpty
-            ? extractLines(from: trimmed, matching: ["i will", "i'll", "we will", "i'll", "will send", "will prepare", "will schedule"])
+            ? extractLines(from: transcript, matching: ["i will", "i'll", "we will", "will send", "will prepare", "will schedule"])
             : parsed.commitments
         let actionItems   = parsed.structuredActionItems.isEmpty
-            ? extractLines(from: trimmed, matching: ["action", "todo", "to do", "next step", "follow up", "need to", "should"])
+            ? extractLines(from: transcript, matching: ["action", "todo", "to do", "next step", "follow up", "need to", "should"])
             : parsed.structuredActionItems.map { "[\($0.owner)] \($0.task)" }
         let suggestedTasks = buildSuggestedTasks(
             title: title,
@@ -108,7 +185,7 @@ final class MeetingIntelligenceService: Service {
         log.info("analysis complete type='\(meetingType)' decisions=\(decisions.count) actions=\(parsed.structuredActionItems.count) questions=\(parsed.openQuestions.count) risks=\(parsed.risks.count)")
 
         return MeetingAnalysis(
-            summary:               parsed.summary.isEmpty ? fallbackSummary(trimmed) : parsed.summary,
+            summary:               parsed.summary.isEmpty ? fallbackSummary(transcript) : parsed.summary,
             meetingType:           meetingType,
             decisions:             decisions,
             openQuestions:         parsed.openQuestions,
@@ -184,11 +261,9 @@ final class MeetingIntelligenceService: Service {
     private func buildComprehensivePrompt(title: String, transcript: String, meetingType: String) -> String {
         let typeContext = Self.typeSpecificContext(for: meetingType)
 
-        // Trim transcript to fit context window
-        let maxChars = 6000
-        let trimmedTranscript = transcript.count > maxChars
-            ? String(transcript.prefix(maxChars)) + "\n[...transcript continues...]"
-            : transcript
+        // Single-call path only reaches here for transcripts ≤ singleCallThreshold (12 000 chars).
+        // No truncation needed — the routing in analyze() guarantees this.
+        let trimmedTranscript = transcript
 
         return """
         You are analyzing a meeting recording. Respond with ONLY the structured sections below.
