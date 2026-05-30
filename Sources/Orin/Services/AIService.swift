@@ -61,43 +61,46 @@ final class AIService: Service {
         return nil
     }
 
-    // MARK: - Summary generation with priority-ordered fallback chain
+    // MARK: - Generic prompt completion (preferred for structured analysis)
+    //
+    // Sends `prompt` to providers without wrapping it in `summaryPrompt`.
+    // Use this when callers control the full prompt (e.g. MeetingIntelligenceService).
+    // Returns (text, fallbackUsed: true) when all providers fail.
+
+    func generate(prompt: String, maxTokens: Int = 1500) async -> (text: String, fallbackUsed: Bool) {
+        let endpoint = resolvedOllamaEndpoint()
+
+        if await isOllamaAvailable(endpoint: endpoint) {
+            if let result = await callOllama(prompt: prompt, maxTokens: maxTokens) {
+                return (result, false)
+            }
+        }
+        if let key = AIKeychainService.load(account: Self.openAIAccount),
+           let result = await callOpenAI(prompt: prompt, key: key, maxTokens: maxTokens) {
+            return (result, false)
+        }
+        if let key = AIKeychainService.load(account: Self.anthropicAccount),
+           let result = await callAnthropic(prompt: prompt, key: key, maxTokens: maxTokens) {
+            return (result, false)
+        }
+        if let key = AIKeychainService.load(account: Self.geminiAccount),
+           let result = await callGemini(prompt: prompt, key: key, maxTokens: maxTokens) {
+            return (result, false)
+        }
+        return ("", true)
+    }
+
+    // MARK: - Summary generation (legacy — wraps prompt in summaryPrompt)
 
     /// Tries providers in fixed priority order: Ollama → OpenAI → Claude → Gemini.
     /// Returns (text, fallbackUsed: true) when all providers fail so callers can
     /// substitute local text extraction.
     func generateSummary(for transcript: String) async -> (text: String, fallbackUsed: Bool) {
-        let endpoint = resolvedOllamaEndpoint()
-
-        // Priority 1: Ollama (local, always preferred)
-        if await isOllamaAvailable(endpoint: endpoint) {
-            if let result = await generateOllamaSummary(transcript: transcript) {
-                return (result, false)
-            }
+        let result = await generate(prompt: summaryPrompt(for: transcript), maxTokens: 512)
+        if result.fallbackUsed && result.text.isEmpty {
+            return ("No AI provider available. Start Ollama locally or add an API key in Settings → AI.", true)
         }
-
-        // Priority 2: OpenAI
-        if let key = AIKeychainService.load(account: Self.openAIAccount),
-           let result = await generateOpenAISummary(transcript: transcript, key: key) {
-            return (result, false)
-        }
-
-        // Priority 3: Claude (Anthropic)
-        if let key = AIKeychainService.load(account: Self.anthropicAccount),
-           let result = await generateAnthropicSummary(transcript: transcript, key: key) {
-            return (result, false)
-        }
-
-        // Priority 4: Gemini
-        if let key = AIKeychainService.load(account: Self.geminiAccount),
-           let result = await generateGeminiSummary(transcript: transcript, key: key) {
-            return (result, false)
-        }
-
-        return (
-            "No AI provider available. Start Ollama locally or add an API key in Settings → AI.",
-            true
-        )
+        return result
     }
 
     // MARK: - Ollama availability check
@@ -116,20 +119,21 @@ final class AIService: Service {
         }
     }
 
-    // MARK: - Ollama (local)
+    // MARK: - Provider implementations (generic prompt)
 
-    private func generateOllamaSummary(transcript: String) async -> String? {
+    private func callOllama(prompt: String, maxTokens: Int) async -> String? {
         let endpoint = resolvedOllamaEndpoint()
         guard let url = URL(string: "\(endpoint)/api/generate") else { return nil }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 30
+        request.timeoutInterval = 60  // longer for comprehensive analysis
 
         let payload: [String: Any] = [
             "model": "llama3",
-            "prompt": summaryPrompt(for: transcript),
-            "stream": false
+            "prompt": prompt,
+            "stream": false,
+            "options": ["num_predict": maxTokens]
         ]
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: payload)
@@ -138,25 +142,23 @@ final class AIService: Service {
             let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
             return (json?["response"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         } catch {
-            aiLogger.warning("Ollama summary request failed: \(error) — trying next provider")
+            aiLogger.warning("Ollama request failed: \(error) — trying next provider")
             return nil
         }
     }
 
-    // MARK: - OpenAI
-
-    private func generateOpenAISummary(transcript: String, key: String) async -> String? {
+    private func callOpenAI(prompt: String, key: String, maxTokens: Int) async -> String? {
         guard let url = URL(string: "https://api.openai.com/v1/chat/completions") else { return nil }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-        request.timeoutInterval = 30
+        request.timeoutInterval = 45
 
         let body: [String: Any] = [
             "model": "gpt-4o-mini",
-            "messages": [["role": "user", "content": summaryPrompt(for: transcript)]],
-            "max_tokens": 512
+            "messages": [["role": "user", "content": prompt]],
+            "max_tokens": maxTokens
         ]
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -167,26 +169,24 @@ final class AIService: Service {
             let message = choices?.first?["message"] as? [String: Any]
             return (message?["content"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         } catch {
-            aiLogger.warning("OpenAI summary request failed: \(error) — trying next provider")
+            aiLogger.warning("OpenAI request failed: \(error) — trying next provider")
             return nil
         }
     }
 
-    // MARK: - Anthropic (Claude)
-
-    private func generateAnthropicSummary(transcript: String, key: String) async -> String? {
+    private func callAnthropic(prompt: String, key: String, maxTokens: Int) async -> String? {
         guard let url = URL(string: "https://api.anthropic.com/v1/messages") else { return nil }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(key, forHTTPHeaderField: "x-api-key")
         request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        request.timeoutInterval = 30
+        request.timeoutInterval = 45
 
         let body: [String: Any] = [
             "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 512,
-            "messages": [["role": "user", "content": summaryPrompt(for: transcript)]]
+            "max_tokens": maxTokens,
+            "messages": [["role": "user", "content": prompt]]
         ]
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -196,23 +196,22 @@ final class AIService: Service {
             let content = json?["content"] as? [[String: Any]]
             return (content?.first?["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         } catch {
-            aiLogger.warning("Anthropic summary request failed: \(error) — trying next provider")
+            aiLogger.warning("Anthropic request failed: \(error) — trying next provider")
             return nil
         }
     }
 
-    // MARK: - Gemini
-
-    private func generateGeminiSummary(transcript: String, key: String) async -> String? {
+    private func callGemini(prompt: String, key: String, maxTokens: Int) async -> String? {
         let urlString = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=\(key)"
         guard let url = URL(string: urlString) else { return nil }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 30
+        request.timeoutInterval = 45
 
         let body: [String: Any] = [
-            "contents": [["parts": [["text": summaryPrompt(for: transcript)]]]]
+            "contents": [["parts": [["text": prompt]]]],
+            "generationConfig": ["maxOutputTokens": maxTokens]
         ]
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -224,7 +223,7 @@ final class AIService: Service {
             let parts = content?["parts"] as? [[String: Any]]
             return (parts?.first?["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         } catch {
-            aiLogger.warning("Gemini summary request failed: \(error) — all providers exhausted")
+            aiLogger.warning("Gemini request failed: \(error) — all providers exhausted")
             return nil
         }
     }

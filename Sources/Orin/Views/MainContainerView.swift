@@ -264,10 +264,20 @@ struct MainContainerView: View {
         print("[AutoAnalysis] starting for '\(meeting.title)' elapsed=\(Int(elapsed))s")
         let analysis = await intelligence.analyze(title: meeting.title, transcript: meeting.transcript)
         meeting.summary              = analysis.summary
+        meeting.meetingType          = analysis.meetingType
         meeting.decisions            = analysis.decisions
+        meeting.openQuestions        = analysis.openQuestions
+        meeting.risks                = analysis.risks
+        meeting.dependencies         = analysis.dependencies
         meeting.actionItems          = analysis.actionItems
         meeting.suggestedTaskTitles  = analysis.suggestedTasks
         meeting.commitments          = analysis.commitments.map { CommitmentItem(title: $0) }
+        // Persist structured action items as JSON
+        if !analysis.structuredActionItems.isEmpty,
+           let data = try? JSONEncoder().encode(analysis.structuredActionItems),
+           let json = String(data: data, encoding: .utf8) {
+            meeting.structuredActionItemsJSON = json
+        }
         modelContext.safeSave(context: "auto-analysis")
         print("[AutoAnalysis] complete — summary chars=\(analysis.summary.count) decisions=\(analysis.decisions.count) actions=\(analysis.actionItems.count)")
     }

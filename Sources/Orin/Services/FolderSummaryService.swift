@@ -51,13 +51,24 @@ final class FolderSummaryService: Service {
             ? buildFallbackSummary(folderName: folderName, meetings: promptMeetings)
             : summaryResult.text
 
-        // Recurring decisions / action items from ALL meetings (keyword-based)
-        item.recurringDecisions    = findRecurring(in: meetings.flatMap(\.decisions),
-                                                   minOccurrences: max(2, meetings.count / 3))
-        item.recurringActionItems  = findRecurring(in: meetings.flatMap(\.actionItems),
-                                                   minOccurrences: max(2, meetings.count / 3))
+        let minOccurrences = max(2, meetings.count / 3)
 
-        // Recurring topics (keyword frequency across all transcripts + summaries)
+        // Recurring decisions / action items from ALL meetings
+        item.recurringDecisions   = findRecurring(in: meetings.flatMap(\.decisions),
+                                                  minOccurrences: minOccurrences)
+        item.recurringActionItems = findRecurring(in: meetings.flatMap(\.actionItems),
+                                                  minOccurrences: minOccurrences)
+
+        // NEW: Recurring blockers (from risks + open questions that repeat)
+        let allBlockerCandidates  = meetings.flatMap(\.risks) + meetings.flatMap(\.openQuestions)
+        item.recurringBlockers    = findRecurring(in: allBlockerCandidates,
+                                                  minOccurrences: minOccurrences)
+
+        // NEW: Recurring risks from structured risk fields
+        item.recurringRisks       = findRecurring(in: meetings.flatMap(\.risks),
+                                                  minOccurrences: minOccurrences)
+
+        // Recurring topics (keyword frequency across all content)
         item.recurringTopics = extractTopics(from: meetings, topN: 8)
 
         item.generatedAt = Date()
@@ -73,11 +84,15 @@ final class FolderSummaryService: Service {
         parts.append("=== MEETING SUMMARIES ===")
 
         for meeting in meetings {
-            let dateStr = meeting.date.formatted(date: .abbreviated, time: .omitted)
-            parts.append("\(dateStr): \(meeting.title)")
+            let dateStr  = meeting.date.formatted(date: .abbreviated, time: .omitted)
+            let typeTag  = meeting.meetingType.isEmpty ? "" : " [\(meeting.meetingType)]"
+            parts.append("\(dateStr): \(meeting.title)\(typeTag)")
             if !meeting.summary.isEmpty { parts.append(meeting.summary) }
             if !meeting.decisions.isEmpty {
                 parts.append("Decisions: " + meeting.decisions.prefix(3).joined(separator: "; "))
+            }
+            if !meeting.risks.isEmpty {
+                parts.append("Risks: " + meeting.risks.prefix(2).joined(separator: "; "))
             }
             parts.append("")
         }

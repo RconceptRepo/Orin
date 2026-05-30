@@ -130,10 +130,33 @@ final class MeetingItem {
     /// Path to the locally-recorded audio file for this meeting, if any.
     var audioFilePath: String?
 
+    // MARK: - AI analysis fields (added in AI pipeline upgrade)
+
+    /// Detected meeting type (e.g. "Standup", "Sales Call"). Empty = unclassified.
+    var meetingType: String = ""
+    /// Unresolved questions raised during the meeting.
+    var openQuestions: [String] = []
+    /// Risks or concerns identified.
+    var risks: [String] = []
+    /// External dependencies or blockers mentioned.
+    var dependencies: [String] = []
+    /// JSON-encoded [ActionItemRecord] — structured action items with owner/priority/due.
+    /// Nil when no structured analysis has been run.
+    var structuredActionItemsJSON: String?
+
     @Relationship(deleteRule: .cascade)
     var commitments: [CommitmentItem] = []
 
     var tasks: [TaskItem] = []
+
+    /// Decodes and returns structured action items from `structuredActionItemsJSON`.
+    var structuredActionItems: [ActionItemRecord] {
+        guard let json = structuredActionItemsJSON,
+              let data = json.data(using: .utf8),
+              let items = try? JSONDecoder().decode([ActionItemRecord].self, from: data)
+        else { return [] }
+        return items
+    }
 
     /// Effective end date for meeting classification.
     ///
@@ -162,6 +185,65 @@ final class MeetingItem {
         suggestedTaskTitles = []
         acceptedSuggestedTaskTitles = []
         tags = []
+    }
+}
+
+// MARK: - MeetingType
+
+/// Classifiable meeting categories used for context-aware AI analysis.
+/// Raw values are human-readable labels shown in the UI.
+enum MeetingType: String, CaseIterable, Codable {
+    case salesCall       = "Sales Call"
+    case discoveryCall   = "Discovery Call"
+    case standup         = "Standup"
+    case sprintPlanning  = "Sprint Planning"
+    case interview       = "Interview"
+    case customerSupport = "Customer Support"
+    case productReview   = "Product Review"
+    case executiveReview = "Executive Review"
+    case general         = "General Meeting"
+
+    /// SF Symbol name for displaying the meeting type in the UI.
+    var icon: String {
+        switch self {
+        case .salesCall:       "chart.line.uptrend.xyaxis"
+        case .discoveryCall:   "magnifyingglass"
+        case .standup:         "person.3"
+        case .sprintPlanning:  "calendar.badge.plus"
+        case .interview:       "person.crop.square"
+        case .customerSupport: "headphones"
+        case .productReview:   "checkmark.rectangle"
+        case .executiveReview: "building.2"
+        case .general:         "video"
+        }
+    }
+}
+
+// MARK: - ActionItemRecord
+
+/// Structured action item extracted from a meeting transcript by AI.
+/// Stored as JSON in `MeetingItem.structuredActionItemsJSON`.
+struct ActionItemRecord: Codable, Identifiable {
+    var id: UUID
+    /// Person responsible — "Team" when no specific assignee is mentioned.
+    var owner: String
+    /// Clear imperative description of the task.
+    var task: String
+    /// Urgency level: "High", "Medium", "Low", or "Unknown".
+    var priority: String
+    /// Natural-language due date ("Friday", "End of week") or "" when not mentioned.
+    var dueDateText: String
+    /// Original line(s) from the transcript that this item was extracted from.
+    var rawText: String
+
+    init(owner: String, task: String, priority: String = "Medium",
+         dueDateText: String = "", rawText: String = "") {
+        id           = UUID()
+        self.owner   = owner
+        self.task    = task
+        self.priority = priority
+        self.dueDateText = dueDateText
+        self.rawText = rawText
     }
 }
 
@@ -293,6 +375,10 @@ final class FolderSummaryItem {
     var recurringActionItems: [String]
     /// Recurring topics extracted from all meeting content.
     var recurringTopics: [String]
+    /// Blockers or impediments that recur across meetings.
+    var recurringBlockers: [String]
+    /// Risks that surface repeatedly across the folder's meetings.
+    var recurringRisks: [String]
     /// Number of meetings included in this summary.
     var meetingCount: Int
     var generatedAt: Date
@@ -304,6 +390,8 @@ final class FolderSummaryItem {
         recurringDecisions = []
         recurringActionItems = []
         recurringTopics = []
+        recurringBlockers = []
+        recurringRisks = []
         meetingCount = 0
         generatedAt = Date()
     }

@@ -1299,9 +1299,14 @@ private struct FolderDetailView: View {
                     if !summary.recurringDecisions.isEmpty {
                         InsightCard(title: "Recurring Decisions", items: summary.recurringDecisions)
                     }
-
                     if !summary.recurringActionItems.isEmpty {
                         InsightCard(title: "Recurring Action Items", items: summary.recurringActionItems)
+                    }
+                    if !summary.recurringBlockers.isEmpty {
+                        InsightCard(title: "Recurring Blockers", items: summary.recurringBlockers)
+                    }
+                    if !summary.recurringRisks.isEmpty {
+                        InsightCard(title: "Recurring Risks", items: summary.recurringRisks)
                     }
                 } else {
                     OrinCard {
@@ -1584,11 +1589,16 @@ private struct MeetingDetailView: View {
                     meetingQuickStats       // at-a-glance summary of meeting health
                     transcriptCard          // primary content — moved before summary
                     summaryCard
+                    // Structured action items (when AI analysis has run)
+                    structuredActionItemsCard
+                    // Decisions / open questions / risks / dependencies
                     InsightCard(title: "Decisions", items: meeting.decisions)
-                    InsightCard(title: "Action Items", items: meeting.actionItems)
+                    InsightCard(title: "Open Questions", items: meeting.openQuestions)
+                    InsightCard(title: "Risks", items: meeting.risks)
+                    InsightCard(title: "Dependencies", items: meeting.dependencies)
                     commitmentsCard
                     suggestedTasksCard
-                    participantsCard   // ← moved to bottom (less critical than content)
+                    participantsCard   // moved to bottom (less critical than content)
                 }
                 .padding(.trailing, 8)
             }
@@ -1655,9 +1665,15 @@ private struct MeetingDetailView: View {
                 Text(meeting.title)
                     .font(OrinFont.pageTitle)
                     .foregroundStyle(OrinColor.primaryText(colorScheme))
-                Text(meeting.date.formatted(date: .abbreviated, time: .shortened))
-                    .font(OrinFont.body)
-                    .foregroundStyle(OrinColor.secondaryText(colorScheme))
+                HStack(spacing: 8) {
+                    Text(meeting.date.formatted(date: .abbreviated, time: .shortened))
+                        .font(OrinFont.body)
+                        .foregroundStyle(OrinColor.secondaryText(colorScheme))
+                    // Meeting type badge — shown when type has been detected
+                    if !meeting.meetingType.isEmpty && meeting.meetingType != MeetingType.general.rawValue {
+                        MeetingTypeBadge(meetingType: meeting.meetingType)
+                    }
+                }
             }
             Spacer()
             Button {
@@ -1941,6 +1957,28 @@ private struct MeetingDetailView: View {
         }
     }
 
+    // MARK: - Structured Action Items Card
+
+    @ViewBuilder
+    private var structuredActionItemsCard: some View {
+        let items = meeting.structuredActionItems
+        if !items.isEmpty {
+            OrinCard {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Action Items").font(OrinFont.cardTitle)
+                    ForEach(items) { item in
+                        StructuredActionItemRow(item: item)
+                        if item.id != items.last?.id {
+                            Divider().opacity(0.4)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        // When no structured items, the flat InsightCard("Action Items") falls back
+    }
+
     private func startRecording() {
         Task {
             await recordingService.startRecording(for: meeting.id)
@@ -1971,10 +2009,19 @@ private struct MeetingDetailView: View {
             analysis = await intelligence.analyze(title: meeting.title, transcript: meeting.transcript)
         }
         meeting.summary              = analysis.summary
+        meeting.meetingType          = analysis.meetingType
         meeting.decisions            = analysis.decisions
+        meeting.openQuestions        = analysis.openQuestions
+        meeting.risks                = analysis.risks
+        meeting.dependencies         = analysis.dependencies
         meeting.actionItems          = analysis.actionItems
         meeting.suggestedTaskTitles  = analysis.suggestedTasks
         meeting.commitments          = analysis.commitments.map { CommitmentItem(title: $0) }
+        if !analysis.structuredActionItems.isEmpty,
+           let data = try? JSONEncoder().encode(analysis.structuredActionItems),
+           let json = String(data: data, encoding: .utf8) {
+            meeting.structuredActionItemsJSON = json
+        }
         modelContext.safeSave(context: "meeting analysis")
         isAnalyzing = false
     }
@@ -2044,6 +2091,81 @@ private struct MeetingDetailView: View {
     private func deleteFullMeeting() {
         modelContext.deleteMeetingFully(meeting)
         modelContext.safeSave(context: "meeting full delete")
+    }
+}
+
+// MARK: - Meeting Type Badge
+
+private struct MeetingTypeBadge: View {
+    let meetingType: String
+
+    private var typeEnum: MeetingType? {
+        MeetingType(rawValue: meetingType)
+    }
+
+    var body: some View {
+        if let type_ = typeEnum {
+            HStack(spacing: 4) {
+                Image(systemName: type_.icon)
+                    .font(.system(size: 9, weight: .medium))
+                Text(meetingType)
+                    .font(.system(size: 10, weight: .medium))
+            }
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(OrinColor.accent.opacity(0.10))
+            .foregroundStyle(OrinColor.accent)
+            .clipShape(Capsule())
+        }
+    }
+}
+
+// MARK: - Structured Action Item Row
+
+private struct StructuredActionItemRow: View {
+    @Environment(\.colorScheme) private var colorScheme
+    let item: ActionItemRecord
+
+    private var priorityColor: Color {
+        switch item.priority.lowercased() {
+        case "high":   return .red
+        case "medium": return .orange
+        default:       return .secondary
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(alignment: .top, spacing: 8) {
+                // Priority indicator
+                Circle()
+                    .fill(priorityColor)
+                    .frame(width: 7, height: 7)
+                    .padding(.top, 5)
+
+                Text(item.task)
+                    .font(.system(size: 13))
+                    .foregroundStyle(OrinColor.primaryText(colorScheme))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack(spacing: 10) {
+                if !item.owner.isEmpty && item.owner != "Team" {
+                    Label(item.owner, systemImage: "person")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                if !item.dueDateText.isEmpty {
+                    Label(item.dueDateText, systemImage: "calendar")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                Label(item.priority, systemImage: "flag")
+                    .font(.system(size: 10))
+                    .foregroundStyle(priorityColor.opacity(0.8))
+            }
+            .padding(.leading, 15)
+        }
     }
 }
 
