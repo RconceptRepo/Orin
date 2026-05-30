@@ -15,6 +15,32 @@ final class MeetingIntelligenceService: Service {
         self.aiService = aiService
     }
 
+    // MARK: - Segments-based analysis (preferred when timeline is available)
+
+    /// Analyzes a meeting using its conversation timeline.
+    ///
+    /// Formats segments into a conversation-style transcript string before
+    /// calling the string-based `analyze(title:transcript:)`.  The formatted
+    /// string includes speaker labels and time offsets, which may improve AI
+    /// summary quality vs. the flat "Me: … Participant: …" format.
+    ///
+    /// Falls back to `analyze(title:transcript:)` with the raw `fallbackTranscript`
+    /// when no segments are provided.
+    func analyze(
+        title: String,
+        segments: [TranscriptSegment],
+        meetingStart: Date? = nil,
+        fallbackTranscript: String = ""
+    ) async -> MeetingAnalysis {
+        guard !segments.isEmpty else {
+            return await analyze(title: title, transcript: fallbackTranscript)
+        }
+        let timelineText = ConversationTimelineBuilder.formatted(segments, meetingStart: meetingStart)
+        return await analyze(title: title, transcript: timelineText)
+    }
+
+    // MARK: - String-based analysis (legacy + fallback)
+
     func analyze(title: String, transcript: String) async -> MeetingAnalysis {
         let trimmedTranscript = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedTranscript.isEmpty else {

@@ -98,9 +98,13 @@ final class CalendarService: Service {
 
     /// Starts a 15-minute repeating timer that calls `syncEvents()` automatically.
     /// Safe to call multiple times — subsequent calls are no-ops.
+    /// Fires an **immediate** sync on first call so `calendarService.events` is
+    /// populated before the first 15-minute tick.
     @MainActor
     func startBackgroundSync() {
         guard backgroundSyncTimer == nil else { return }
+        // Immediate sync so events are available right away.
+        Task { @MainActor [weak self] in await self?.syncEvents() }
         backgroundSyncTimer = Timer.scheduledTimer(
             withTimeInterval: Self.backgroundSyncInterval,
             repeats: true

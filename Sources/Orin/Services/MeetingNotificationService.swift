@@ -9,12 +9,25 @@ extension Notification.Name {
     static let orinNotificationStopRecording = Notification.Name("orin.notification.stopRecording")
 }
 
+// MARK: - MeetingNotificationService
+//
+// Conforms to NotificationProvider for new-code injection while preserving the
+// existing singleton pattern used by MainContainerView.
+
 final class MeetingNotificationService: NSObject, Service, UNUserNotificationCenterDelegate {
     private let logger = Logger(subsystem: "com.clavrit.orin", category: "MeetingNotifications")
     private let center = UNUserNotificationCenter.current()
     private var configured = false
     private var activeMeetingKeys: [String: Date] = [:]
     private let cooldown: TimeInterval = 180
+
+    // NotificationProvider: action routing closure called on the main actor.
+    var onAction: ((NotificationAction) -> Void)?
+
+    // UserDefaults key for persisting a "start recording" action that arrived
+    // while the app was backgrounded or not running.
+    // MainContainerView consumes this flag on next scene activation.
+    static let pendingStartRecordingKey = "orin.pending.startRecording"
 
     private enum Action {
         static let start = "ORIN_START_RECORDING"
@@ -116,6 +129,14 @@ final class MeetingNotificationService: NSObject, Service, UNUserNotificationCen
         ))
     }
 
+    /// Call when recording stops to remove the persistent "Recording in Progress"
+    /// banner.  Without this, the notification lingers in Notification Center.
+    func notifyRecordingStopped() {
+        center.removeDeliveredNotifications(withIdentifiers: ["orin.recording.active"])
+        center.removePendingNotificationRequests(withIdentifiers: ["orin.recording.active"])
+        logger.info("Removed active-recording notification")
+    }
+
     func clearMeetingDedupe() {
         activeMeetingKeys.removeAll()
         center.removeDeliveredNotifications(withIdentifiers: ["orin.recording.active"])
@@ -135,14 +156,33 @@ final class MeetingNotificationService: NSObject, Service, UNUserNotificationCen
         await MainActor.run {
             switch response.actionIdentifier {
             case Action.start, UNNotificationDefaultActionIdentifier:
+                // Post to NotificationCenter for apps that are currently active.
                 NotificationCenter.default.post(name: .orinNotificationStartRecording, object: nil)
+                // Write UserDefaults flag so the action survives if the app was
+                // not in memory when the notification arrived.  MainContainerView
+                // consumes the flag on the next scene-active transition.
+                UserDefaults.standard.set(true, forKey: Self.pendingStartRecordingKey)
+                onAction?(.startRecording)
+
             case Action.dismiss, UNNotificationDismissActionIdentifier:
                 NotificationCenter.default.post(name: .orinNotificationDismissMeeting, object: nil)
+                onAction?(.dismissMeeting)
+
             case Action.stop:
                 NotificationCenter.default.post(name: .orinNotificationStopRecording, object: nil)
+                onAction?(.stopRecording)
+
             default:
                 break
             }
         }
     }
+}
+
+// MARK: - NotificationProvider conformance
+
+extension MeetingNotificationService: NotificationProvider {
+    // All required methods are already implemented on the class.
+    // This extension makes the conformance explicit so MeetingNotificationService
+    // can be injected anywhere a `NotificationProvider` is expected.
 }

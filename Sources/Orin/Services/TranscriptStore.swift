@@ -62,6 +62,18 @@ final class TranscriptStore: Service {
     /// Meeting ID being recorded (`nil` between sessions).
     private(set) var activeMeetingID: UUID?
 
+    /// Wall-clock time of the most recent `updateMic` or `updateParticipant`
+    /// call that produced new content.  Used by the auto-stop watchdog to
+    /// determine audio inactivity: if this is nil or older than the configured
+    /// threshold, the mic/system audio are considered silent.
+    private(set) var lastUpdateTime: Date?
+
+    /// Seconds since the most recent audio update, or `nil` if no update has
+    /// occurred in this session.
+    var secondsSinceLastUpdate: TimeInterval? {
+        lastUpdateTime.map { Date().timeIntervalSince($0) }
+    }
+
     // MARK: - Private — in-memory buffers
 
     /// Latest speaker-labeled mic text, e.g. "Me: hello world".
@@ -154,21 +166,33 @@ final class TranscriptStore: Service {
 
     // MARK: - Transcript updates (called from view onChange handlers)
 
+    // Minimum character growth to trigger an immediate TranscriptChunk write.
+    // Prevents write storms from rapid SFSpeechRecognizer partial results
+    // while still persisting meaningful increments between 3-second checkpoints.
+    private static let chunkWriteThreshold = 10
+
     /// Applies the latest speaker-labeled mic transcript chunk.
     ///
     /// **Empty-overwrite rule**: if `labeledText` is empty and the buffer
     /// already contains content, the update is silently discarded.  This
     /// prevents the `RecordingService.transcript = ""` reset that fires at
     /// `startRecording()` from clearing a meeting's existing transcript.
+    ///
+    /// **TranscriptChunk persistence**: when content grows by ≥ 10 characters
+    /// vs. the last mic chunk, a `TranscriptChunk` is written to SwiftData
+    /// immediately (not waiting for the 3-second checkpoint timer).
     func updateMic(_ labeledText: String) {
         guard activeMeetingID != nil else { return }
         guard !labeledText.isEmpty || micLabeledText.isEmpty else {
             log.debug("updateMic skipped — empty chunk, micChars=\(self.micLabeledText.count) protected")
             return
         }
+        let previousLength = micLabeledText.count
         micLabeledText = labeledText
         log.debug("updateMic micChars=\(labeledText.count)")
         recomputeLive()
+        lastUpdateTime = Date()
+        persistChunkIfNeeded(speaker: "mic", text: labeledText, previousLength: previousLength)
     }
 
     /// Applies the latest speaker-labeled participant transcript chunk.
@@ -180,9 +204,30 @@ final class TranscriptStore: Service {
             log.debug("updateParticipant skipped — empty chunk, participantChars=\(self.participantLabeledText.count) protected")
             return
         }
+        let previousLength = participantLabeledText.count
         participantLabeledText = labeledText
         log.debug("updateParticipant participantChars=\(labeledText.count)")
         recomputeLive()
+        lastUpdateTime = Date()
+        persistChunkIfNeeded(speaker: "participant", text: labeledText, previousLength: previousLength)
+    }
+
+    /// Writes a `TranscriptChunk` to SwiftData when content has grown by at
+    /// least `chunkWriteThreshold` characters since the last chunk.
+    ///
+    /// This provides crash-safe granular persistence between 3-second checkpoints.
+    private func persistChunkIfNeeded(speaker: String, text: String, previousLength: Int) {
+        guard let meeting = activeMeeting,
+              let context = activeContext,
+              text.count - previousLength >= Self.chunkWriteThreshold else { return }
+        let chunk = TranscriptChunk(meetingId: meeting.id, speaker: speaker, text: text)
+        context.insert(chunk)
+        do {
+            try context.save()
+        } catch {
+            log.warning("TranscriptChunk save failed (non-fatal): \(error)")
+        }
+        log.debug("TranscriptChunk written speaker=\(speaker) chars=\(text.count)")
     }
 
     // MARK: - Persistence
@@ -292,7 +337,60 @@ final class TranscriptStore: Service {
             log.info("finalize complete chars=\(postSaveLen) duration=\(elapsed)s audioURL=\(audioURL?.lastPathComponent ?? "nil")")
         }
 
+        // Build conversation timeline from TranscriptChunks.
+        // Captures the meeting ID before endSession() clears activeMeeting.
+        buildTimelineSegments(for: meeting, context: context)
+
         endSession()
+    }
+
+    // MARK: - Conversation timeline
+
+    /// Fetches all `TranscriptChunk` records for `meeting`, builds `TranscriptSegment`
+    /// values via `ConversationTimelineBuilder`, and inserts them into `context`.
+    ///
+    /// Called at the end of `finalize()` — after the transcript string is committed —
+    /// so all chunks written during the session are available.
+    ///
+    /// Idempotent when chunks exist but segments are already present: segments are
+    /// built and inserted fresh each time (duplicate detection is left to the caller
+    /// if re-finalization ever occurs).
+    ///
+    /// No-op when no chunks exist (e.g., very short recordings or first-run without chunks).
+    private func buildTimelineSegments(for meeting: MeetingItem, context: ModelContext) {
+        let meetingID = meeting.id
+
+        var chunkDescriptor = FetchDescriptor<TranscriptChunk>(
+            sortBy: [SortDescriptor(\.timestamp, order: .forward)]
+        )
+        chunkDescriptor.fetchLimit = 10_000  // guard against runaway fetches
+
+        guard let allChunks = try? context.fetch(chunkDescriptor) else {
+            log.warning("timeline: failed to fetch chunks for meetingID=\(meetingID)")
+            return
+        }
+
+        let chunks = allChunks.filter { $0.meetingId == meetingID }
+        guard !chunks.isEmpty else {
+            log.debug("timeline: no chunks for meetingID=\(meetingID) — skipping segment build")
+            return
+        }
+
+        let rawSegments  = ConversationTimelineBuilder.buildSegments(from: chunks, meetingId: meetingID)
+        let merged       = ConversationTimelineBuilder.mergeConsecutive(rawSegments)
+
+        guard !merged.isEmpty else {
+            log.debug("timeline: no segments produced for meetingID=\(meetingID)")
+            return
+        }
+
+        for segment in merged { context.insert(segment) }
+        do {
+            try context.save()
+            log.info("timeline: built segments=\(merged.count) from chunks=\(chunks.count) meetingID=\(meetingID)")
+        } catch {
+            log.warning("timeline: segment save failed (non-fatal): \(error)")
+        }
     }
 
     // MARK: - Orphan recovery
@@ -300,6 +398,10 @@ final class TranscriptStore: Service {
     /// Called once at app launch.  If the previous session was interrupted (crash,
     /// force-quit, SIGKILL), restores the most recent checkpoint text to the
     /// meeting model if it is longer than what was last committed to SQLite.
+    ///
+    /// Recovery candidates (best-of-N, longest wins):
+    /// 1. `UserDefaults` orphan backup (written every 3 s by checkpoint timer)
+    /// 2. `TranscriptChunk` records in SwiftData (written on every ≥10-char update)
     ///
     /// - Parameter context: The app's main `ModelContext`.
     func recoverOrphan(in context: ModelContext) {
@@ -320,14 +422,22 @@ final class TranscriptStore: Service {
             return
         }
 
-        let modelChars = meeting.transcript.count
+        // --- Candidate 1: UserDefaults backup ---
+        let orphanText = UserDefaults.standard.string(forKey: kOrphanText) ?? ""
 
-        if let orphanText = UserDefaults.standard.string(forKey: kOrphanText),
-           !orphanText.isEmpty,
-           orphanText.count > modelChars {
-            meeting.transcript = orphanText
+        // --- Candidate 2: TranscriptChunk reconstruction ---
+        let chunkText = rebuildFromChunks(meetingID: meetingID, context: context)
+
+        // Best-of-N: pick the longest non-empty candidate vs. model
+        let candidates = [orphanText, chunkText, meeting.transcript]
+            .filter { !$0.isEmpty }
+        let bestText = candidates.max(by: { $0.count < $1.count }) ?? ""
+
+        let modelChars = meeting.transcript.count
+        if bestText.count > modelChars {
+            meeting.transcript = bestText
             context.safeSave(context: "orphan transcript recovery")
-            log.info("ORPHAN RECOVERY: restored chars=\(orphanText.count) (gained \(orphanText.count - modelChars) over model) meeting='\(meeting.title)'")
+            log.info("ORPHAN RECOVERY: restored chars=\(bestText.count) (gained \(bestText.count - modelChars)) meeting='\(meeting.title)'")
         } else {
             log.info("ORPHAN RECOVERY: model transcript chars=\(modelChars) sufficient — no restore needed")
         }
@@ -335,6 +445,25 @@ final class TranscriptStore: Service {
         UserDefaults.standard.removeObject(forKey: kOrphanMeetingID)
         UserDefaults.standard.removeObject(forKey: kOrphanText)
         log.info("ORPHAN RECOVERY: complete meeting='\(meeting.title)'")
+    }
+
+    /// Reconstructs a transcript from `TranscriptChunk` records for `meetingID`.
+    ///
+    /// Fetches the most recent "mic" and "participant" chunks and merges them.
+    /// Returns `""` if no chunks exist (e.g., meeting just started before first chunk).
+    private func rebuildFromChunks(meetingID: UUID, context: ModelContext) -> String {
+        let chunkDescriptor = FetchDescriptor<TranscriptChunk>(
+            predicate: #Predicate { $0.meetingId == meetingID },
+            sortBy: [SortDescriptor(\.timestamp, order: .reverse)]
+        )
+        guard let chunks = try? context.fetch(chunkDescriptor), !chunks.isEmpty else {
+            return ""
+        }
+        let latestMic = chunks.first { $0.speaker == "mic" }?.text ?? ""
+        let latestParticipant = chunks.first { $0.speaker == "participant" }?.text ?? ""
+        let rebuilt = TranscriptStore.mergeTranscripts(mic: latestMic, participant: latestParticipant)
+        log.info("ORPHAN RECOVERY: rebuilt from \(chunks.count) chunks → chars=\(rebuilt.count)")
+        return rebuilt
     }
 
     // MARK: - Testing support
@@ -357,14 +486,15 @@ final class TranscriptStore: Service {
     /// Resets all session state; call in test setUp/tearDown.
     func _testReset() {
         stopCheckpointTimer()
-        activeMeetingID    = nil
-        activeMeeting      = nil
-        activeContext      = nil
-        micLabeledText     = ""
+        activeMeetingID        = nil
+        activeMeeting          = nil
+        activeContext          = nil
+        micLabeledText         = ""
         participantLabeledText = ""
-        liveTranscript     = ""
-        lastPersistedText  = ""
-        persistedLength    = 0
+        liveTranscript         = ""
+        lastPersistedText      = ""
+        persistedLength        = 0
+        lastUpdateTime         = nil
         UserDefaults.standard.removeObject(forKey: kOrphanMeetingID)
         UserDefaults.standard.removeObject(forKey: kOrphanText)
     }

@@ -40,16 +40,10 @@ final class MeetingRetentionService: Service {
             predicate: #Predicate<MeetingItem> { $0.date < cutoff }
         )
         let expired = try context.fetch(descriptor)
+        // Use deleteMeetingFully so TranscriptChunk, TranscriptSegment, and
+        // FolderSummaryItem records are also cleaned up for each expired meeting.
         for meeting in expired {
-            // Remove associated local audio file if present — best-effort, non-blocking
-            if let path = meeting.audioFilePath {
-                do {
-                    try FileManager.default.removeItem(atPath: path)
-                } catch {
-                    retentionLogger.warning("Could not remove expired audio file at \(path): \(error)")
-                }
-            }
-            context.delete(meeting)
+            context.deleteMeetingFully(meeting)
         }
         if !expired.isEmpty {
             try context.save()

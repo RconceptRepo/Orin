@@ -1,4 +1,5 @@
 import AppKit
+import EventKit
 import SwiftData
 import SwiftUI
 import UniformTypeIdentifiers
@@ -10,25 +11,47 @@ struct MeetingsView: View {
     private var allMeetings: [MeetingItem]
     @Query(sort: \MeetingFolderItem.sortIndex, order: .forward)
     private var folders: [MeetingFolderItem]
+    @Query(sort: \TranscriptSegment.timestamp, order: .forward)
+    private var allSegments: [TranscriptSegment]
+    @Query private var allFolderSummaries: [FolderSummaryItem]
 
     @State private var selectedMeetingID: UUID?
+    @State private var selectedFolderID: UUID?       // when set → FolderDetailView shown
     @State private var isCreatingMeeting = false
     @State private var isCreatingFolder = false
     @State private var newFolderName = ""
     @State private var importStatus: String?
-    @State private var noActiveMeetingError = false
-    @State private var recurringSuggestion: RecurringFolderSuggestion?
+    // Legacy single-suggestion removed — replaced by recurringPatterns list
+    @State private var recurringPatterns: [RecurringPattern] = []
 
     @State private var selectedMeetingIDs: Set<UUID> = []
     @State private var isPastExpanded = false
     @State private var isUpcomingExpanded = true
+    @State private var renamingFolder: MeetingFolderItem?   // triggers rename sheet
+    @State private var renameText = ""
 
     @State private var recordingService = ServiceContainer.shared.resolve(RecordingService.self)
     @State private var meetingDetector = ServiceContainer.shared.resolve(MeetingDetectorService.self)
     @State private var systemAudioService = ServiceContainer.shared.resolve(SystemAudioCaptureService.self)
     @State private var transcriptStore = ServiceContainer.shared.resolve(TranscriptStore.self)
+    @State private var calendarService = ServiceContainer.shared.resolve(CalendarService.self)
 
-    private let dataService = ServiceContainer.shared.resolve(MeetingDataService.self)
+    private let dataService            = ServiceContainer.shared.resolve(MeetingDataService.self)
+    private let recurringService       = ServiceContainer.shared.resolve(RecurringMeetingService.self)
+    private let folderSummaryService   = ServiceContainer.shared.resolve(FolderSummaryService.self)
+    private let aiService              = ServiceContainer.shared.resolve(AIService.self)
+
+    // Convenience: folder selected for detail view
+    private var selectedFolder: MeetingFolderItem? {
+        guard let id = selectedFolderID else { return nil }
+        return folders.first { $0.id == id }
+    }
+
+    // Convenience: summary for selected folder (most recent generation)
+    private var selectedFolderSummary: FolderSummaryItem? {
+        guard let id = selectedFolderID else { return nil }
+        return allFolderSummaries.filter { $0.folderID == id }.max(by: { $0.generatedAt < $1.generatedAt })
+    }
 
     private var meetings: [MeetingItem] {
         allMeetings.filter { $0.deletedAt == nil }
@@ -47,10 +70,24 @@ struct MeetingsView: View {
             meetingList
                 .frame(minWidth: 360, idealWidth: 420, maxWidth: 520, maxHeight: .infinity)
 
-            if let selectedMeeting {
+            if let folder = selectedFolder {
+                FolderDetailView(
+                    folder: folder,
+                    meetings: meetings.filter { $0.folderID == folder.id }
+                                      .sorted { $0.date > $1.date },
+                    folderSummary: selectedFolderSummary,
+                    onGenerateSummary: { await generateFolderSummary(for: folder) },
+                    onSelectMeeting: { m in
+                        selectedFolderID = nil
+                        selectedMeetingID = m.id
+                    }
+                )
+                .frame(minWidth: 620, maxHeight: .infinity)
+            } else if let selectedMeeting {
                 MeetingDetailView(
                     meeting: selectedMeeting,
                     folders: folders,
+                    segments: allSegments.filter { $0.meetingId == selectedMeeting.id },
                     onExport: { export(meeting: selectedMeeting, format: $0) },
                     onMoveToFolder: { folder in move(selectedMeeting, to: folder) }
                 )
@@ -59,7 +96,7 @@ struct MeetingsView: View {
                 ContentUnavailableView(
                     "No Meeting Selected",
                     systemImage: "video",
-                    description: Text("Create or select a meeting to capture transcript, commitments, and tasks.")
+                    description: Text("Select a meeting or folder to see details.")
                 )
                 .frame(minWidth: 620, maxHeight: .infinity)
             }
@@ -78,27 +115,23 @@ struct MeetingsView: View {
             folderSheet
         }
         .onAppear {
-            refreshRecurringSuggestion()
+            refreshRecurringPatterns()
         }
         .onChange(of: allMeetings.count) { _, _ in
-            refreshRecurringSuggestion()
+            refreshRecurringPatterns()
         }
-        .alert(
-            "Create recurring meeting folder?",
-            isPresented: Binding(
-                get: { recurringSuggestion != nil },
-                set: { if !$0 { recurringSuggestion = nil } }
+        // Rename folder sheet
+        .sheet(item: $renamingFolder) { folder in
+            RenameFolderSheet(
+                currentName: folder.name,
+                onSave: { newName in
+                    folder.name = newName
+                    folder.updatedAt = Date()
+                    modelContext.safeSave(context: "folder rename")
+                    renamingFolder = nil
+                },
+                onCancel: { renamingFolder = nil }
             )
-        ) {
-            Button("Create Folder") { acceptRecurringSuggestion() }
-            Button("Dismiss", role: .cancel) {
-                if let recurringSuggestion {
-                    UserDefaults.standard.set(true, forKey: recurringSuggestion.dismissedKey)
-                }
-                recurringSuggestion = nil
-            }
-        } message: {
-            Text(recurringSuggestion?.message ?? "")
         }
     }
 
@@ -140,14 +173,28 @@ struct MeetingsView: View {
                     .padding(.bottom, 8)
             }
 
-            ScrollView {
-                LazyVStack(spacing: 2) {
-                    comingUpSection
-                    folderBlocksSection
-                    pastSection
+            if meetings.isEmpty && folders.isEmpty {
+                EmptyMeetingsState(onCreateMeeting: { isCreatingMeeting = true })
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 2) {
+                        // Recurring meeting suggestion banners — up to 3 at once
+                        ForEach(recurringPatterns.prefix(3)) { pattern in
+                            RecurringSuggestionBanner(
+                                pattern: pattern,
+                                onAccept: { acceptPattern(pattern) },
+                                onDismiss: { dismissPattern(pattern) }
+                            )
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 2)
+                        }
+                        comingUpSection
+                        folderBlocksSection
+                        pastSection
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, selectedMeetingIDs.isEmpty ? 20 : 72)
                 }
-                .padding(.horizontal, 16)
-                .padding(.bottom, selectedMeetingIDs.isEmpty ? 20 : 72)
             }
 
             if !selectedMeetingIDs.isEmpty {
@@ -161,7 +208,6 @@ struct MeetingsView: View {
 
     private var comingUpSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            // Section header
             Button {
                 withAnimation(.easeInOut(duration: 0.2)) {
                     isUpcomingExpanded.toggle()
@@ -184,13 +230,15 @@ struct MeetingsView: View {
 
             if isUpcomingExpanded {
                 let upcomingMeetings = upcomingUnfiled
-                if upcomingMeetings.isEmpty {
+                let calendarEvents   = calendarOnlyUpcomingEvents
+                if upcomingMeetings.isEmpty && calendarEvents.isEmpty {
                     Text("No upcoming meetings.")
                         .font(.system(size: 13))
                         .foregroundStyle(OrinColor.secondaryText(colorScheme))
                         .padding(.horizontal, 8)
                         .padding(.vertical, 8)
                 } else {
+                    // Orin MeetingItem rows grouped by day
                     let groups = groupByDay(upcomingMeetings)
                     ForEach(groups, id: \.date) { group in
                         UpcomingDayGroupCard(
@@ -201,6 +249,32 @@ struct MeetingsView: View {
                             onRecord: { startManualRecording(for: $0) }
                         )
                         .padding(.bottom, 4)
+                    }
+                    // Calendar-only events (no Orin MeetingItem yet)
+                    if !calendarEvents.isEmpty {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("From Calendar")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(OrinColor.secondaryText(colorScheme))
+                                .padding(.horizontal, 8)
+                                .padding(.top, 4)
+                            ForEach(calendarEvents, id: \.eventIdentifier) { event in
+                                CalendarOnlyEventRow(
+                                    event: event,
+                                    onCreate: {
+                                        let m = MeetingItem(
+                                            title: event.title ?? "Meeting",
+                                            date: event.startDate,
+                                            durationSeconds: event.endDate.timeIntervalSince(event.startDate)
+                                        )
+                                        m.externalEventIdentifier = event.eventIdentifier
+                                        modelContext.insert(m)
+                                        modelContext.safeSave(context: "meeting from calendar")
+                                        selectedMeetingID = m.id
+                                    }
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -223,12 +297,23 @@ struct MeetingsView: View {
                     folder.updatedAt = Date()
                     modelContext.safeSave(context: "meeting folder")
                 },
-                onSelect: { selectedMeetingID = $0.id },
+                onSelectFolder: {
+                    selectedMeetingID = nil
+                    selectedFolderID  = folder.id
+                },
+                onSelect: {
+                    selectedFolderID  = nil
+                    selectedMeetingID = $0.id
+                },
                 onRecord: { startManualRecording(for: $0) },
                 onExport: { export(meeting: $0, format: $1) },
                 onMoveToFolder: { move($0, to: $1) },
                 onCreateFolder: { isCreatingFolder = true },
                 onDeleteFolder: { deleteFolder(folder) },
+                onRenameFolder: {
+                    renameText    = folder.name
+                    renamingFolder = folder
+                },
                 onDeleteMeeting: { deleteMeeting($0) }
             )
         }
@@ -259,7 +344,7 @@ struct MeetingsView: View {
             .buttonStyle(.plain)
 
             if isPastExpanded {
-                let pastMeetings = pastUnfiled
+                let pastMeetings = pastUnfiled  // already sorted newest-first
                 if pastMeetings.isEmpty {
                     Text("No past meetings.")
                         .font(.system(size: 13))
@@ -267,7 +352,9 @@ struct MeetingsView: View {
                         .padding(.horizontal, 8)
                         .padding(.vertical, 8)
                 } else {
-                    let groups = groupByDay(pastMeetings.reversed())
+                    // pastUnfiled is sorted descending; groupByDay then sorts group keys
+                    // ascending — override to show most-recent groups first.
+                    let groups = groupByDay(pastMeetings, descending: true)
                     ForEach(groups, id: \.date) { group in
                         VStack(alignment: .leading, spacing: 2) {
                             Text(dayHeaderString(group.date))
@@ -370,18 +457,36 @@ struct MeetingsView: View {
 
     // MARK: - Computed Helpers
 
+    /// Meetings that have NOT fully ended yet (endDate > now).
+    /// Includes in-progress meetings so they stay in "Coming Up" until they finish.
     private var upcomingUnfiled: [MeetingItem] {
-        let today = Calendar.current.startOfDay(for: Date())
+        let now = Date()
         return unfiledMeetings
-            .filter { $0.date >= today }
+            .filter { $0.endDate > now }
             .sorted { $0.date < $1.date }
     }
 
+    /// Meetings that have fully ended (endDate ≤ now).
+    /// Sorted most-recent-first so the latest past meeting is at the top.
     private var pastUnfiled: [MeetingItem] {
-        let today = Calendar.current.startOfDay(for: Date())
+        let now = Date()
         return unfiledMeetings
-            .filter { $0.date < today }
-            .sorted { $0.date < $1.date }
+            .filter { $0.endDate <= now }
+            .sorted { $0.date > $1.date }
+    }
+
+    /// EKEvent entries from CalendarService that start in the future and have no
+    /// corresponding MeetingItem (matched via externalEventIdentifier).
+    /// Shown in the "Coming Up" section alongside MeetingItems.
+    private var calendarOnlyUpcomingEvents: [EKEvent] {
+        let now = Date()
+        let knownIdentifiers = Set(allMeetings.compactMap { $0.externalEventIdentifier })
+        return calendarService.events
+            .filter { event in
+                event.startDate > now &&
+                !knownIdentifiers.contains(event.eventIdentifier ?? "")
+            }
+            .sorted { $0.startDate < $1.startDate }
     }
 
     // MARK: - Day grouping
@@ -391,15 +496,21 @@ struct MeetingsView: View {
         let meetings: [MeetingItem]
     }
 
-    private func groupByDay(_ items: [MeetingItem]) -> [DayGroup] {
+    private func groupByDay(_ items: [MeetingItem], descending: Bool = false) -> [DayGroup] {
         let cal = Calendar.current
         var result: [Date: [MeetingItem]] = [:]
         for item in items {
             let day = cal.startOfDay(for: item.date)
             result[day, default: []].append(item)
         }
-        return result.keys.sorted().map { day in
-            DayGroup(date: day, meetings: result[day]!.sorted { $0.date < $1.date })
+        let sortedKeys = result.keys.sorted(by: descending ? (>) : (<))
+        return sortedKeys.map { day in
+            DayGroup(
+                date: day,
+                meetings: result[day]!.sorted(by: descending
+                    ? { $0.date > $1.date }
+                    : { $0.date < $1.date })
+            )
         }
     }
 
@@ -420,19 +531,13 @@ struct MeetingsView: View {
     }
 
     private func startManualRecording(for meeting: MeetingItem) {
-        guard meetingDetector.detectedMeetingApp != nil else {
-            noActiveMeetingError = true
-            importStatus = "No active meeting detected. Open a Meet, Teams, Zoom, or browser meeting first."
-            return
-        }
-        noActiveMeetingError = false
         selectedMeetingID = meeting.id
-        transcriptStore.beginSession(meetingID: meeting.id, meeting: meeting, context: modelContext)
         Task {
             await recordingService.startRecording(for: meeting.id)
-            if recordingService.isRecording {
-                await systemAudioService.startCapturing(for: meeting.id)
-            }
+            guard recordingService.isRecording else { return }
+            // Begin TranscriptStore session AFTER recording is confirmed running.
+            transcriptStore.beginSession(meetingID: meeting.id, meeting: meeting, context: modelContext)
+            await systemAudioService.startCapturing(for: meeting.id)
         }
     }
 
@@ -459,58 +564,52 @@ struct MeetingsView: View {
     }
 
     private func deleteMeeting(_ meeting: MeetingItem) {
-        removeRecordingFile(for: meeting)
-        modelContext.delete(meeting)
         if selectedMeetingID == meeting.id { selectedMeetingID = nil }
+        if selectedFolderID == meeting.folderID    { /* keep folder open */ }
+        modelContext.deleteMeetingFully(meeting)
         modelContext.safeSave(context: "meeting delete")
     }
 
-    private func refreshRecurringSuggestion() {
-        guard recurringSuggestion == nil else { return }
-        let grouped = Dictionary(grouping: unfiledMeetings) { meeting in
-            recurringSignature(for: meeting)
-        }
-        guard let candidate = grouped
-            .filter({ !$0.key.isEmpty && $0.value.count >= 2 })
-            .sorted(by: { $0.value.count > $1.value.count })
-            .first
-        else { return }
+    // MARK: - Recurring Pattern Management
 
-        let title = candidate.value.first?.title ?? "Recurring Meeting"
-        let dismissedKey = "orin.recurringFolderSuggestion.dismissed.\(candidate.key)"
-        guard !UserDefaults.standard.bool(forKey: dismissedKey) else { return }
-        guard !folders.contains(where: { $0.name.caseInsensitiveCompare(title) == .orderedSame }) else { return }
-
-        recurringSuggestion = RecurringFolderSuggestion(
-            signature: candidate.key,
-            title: title,
-            meetingIDs: candidate.value.map(\.id),
-            dismissedKey: dismissedKey
+    private func refreshRecurringPatterns() {
+        let folderNames = folders.map(\.name)
+        recurringPatterns = recurringService.detectPatterns(
+            in: meetings,
+            existingFolderNames: folderNames
         )
     }
 
-    private func acceptRecurringSuggestion() {
-        guard let suggestion = recurringSuggestion else { return }
-        let folder = MeetingFolderItem(name: suggestion.title, sortIndex: folders.count)
+    private func acceptPattern(_ pattern: RecurringPattern) {
+        let folder = MeetingFolderItem(name: pattern.suggestedFolderName, sortIndex: folders.count)
         modelContext.insert(folder)
-        for meeting in meetings where suggestion.meetingIDs.contains(meeting.id) {
+        for meeting in meetings where pattern.meetingIDs.contains(meeting.id) {
             meeting.folderID = folder.id
         }
         modelContext.safeSave(context: "recurring meeting folder")
-        recurringSuggestion = nil
+        // Remove the accepted pattern from the list
+        recurringPatterns.removeAll { $0.id == pattern.id }
+        refreshRecurringPatterns()
     }
 
-    private func recurringSignature(for meeting: MeetingItem) -> String {
-        let normalizedTitle = meeting.title
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        let normalizedParticipants = meeting.participants
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
-            .filter { !$0.isEmpty }
-            .sorted()
-            .joined(separator: "|")
-        guard !normalizedTitle.isEmpty else { return "" }
-        return "\(normalizedTitle)#\(normalizedParticipants)"
+    private func dismissPattern(_ pattern: RecurringPattern) {
+        UserDefaults.standard.set(true, forKey: pattern.dismissedKey)
+        recurringPatterns.removeAll { $0.id == pattern.id }
+    }
+
+    // MARK: - Folder Summary Generation
+
+    @MainActor
+    private func generateFolderSummary(for folder: MeetingFolderItem) async {
+        let folderMeetings = meetings.filter { $0.folderID == folder.id }
+        let summary = await folderSummaryService.generate(
+            folderName: folder.name,
+            folderID:   folder.id,
+            meetings:   folderMeetings,
+            aiService:  aiService
+        )
+        modelContext.insert(summary)
+        modelContext.safeSave(context: "folder summary")
     }
 
     private func export(meeting: MeetingItem, format: MeetingExportFormat) {
@@ -704,24 +803,33 @@ private struct GranolaFolderBlockView: View {
     @Binding var selectedMeetingIDs: Set<UUID>
     let folders: [MeetingFolderItem]
     var onToggle: () -> Void
+    var onSelectFolder: () -> Void    // tap folder name → show FolderDetailView
     var onSelect: (MeetingItem) -> Void
     var onRecord: (MeetingItem) -> Void
     var onExport: (MeetingItem, MeetingExportFormat) -> Void
     var onMoveToFolder: (MeetingItem, MeetingFolderItem?) -> Void
     var onCreateFolder: () -> Void
     var onDeleteFolder: () -> Void
+    var onRenameFolder: () -> Void    // triggers rename sheet
     var onDeleteMeeting: (MeetingItem) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             // Folder header row
             HStack {
+                // Expand/collapse toggle (chevron only)
                 Button(action: onToggle) {
+                    Image(systemName: folder.isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 16)
+                }
+                .buttonStyle(.plain)
+
+                // Folder name → opens FolderDetailView
+                Button(action: onSelectFolder) {
                     HStack(spacing: 8) {
-                        Image(systemName: folder.isExpanded ? "chevron.down" : "chevron.right")
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(.secondary)
-                        Image(systemName: "folder.fill")
+                        Image(systemName: folder.icon)
                             .foregroundStyle(OrinColor.accent)
                         Text(folder.name)
                             .font(.system(size: 14, weight: .medium))
@@ -739,7 +847,7 @@ private struct GranolaFolderBlockView: View {
                 .buttonStyle(.plain)
 
                 Menu {
-                    Button("Rename Folder") { /* trigger rename */ }
+                    Button("Rename Folder", action: onRenameFolder)
                     Divider()
                     Button(role: .destructive, action: onDeleteFolder) {
                         Label("Delete Folder", systemImage: "trash")
@@ -810,13 +918,13 @@ private struct PastMeetingRowView: View {
             .buttonStyle(.plain)
             .opacity(isHovered || !selectedIDs.isEmpty ? 1 : 0)
 
-            // Document icon
-            Image(systemName: "doc.text")
-                .foregroundStyle(.secondary)
+            // Status icon: recorded vs. unrecorded
+            Image(systemName: meeting.audioFilePath != nil ? "waveform" : "doc.text")
+                .foregroundStyle(meeting.audioFilePath != nil ? OrinColor.accent.opacity(0.7) : .secondary)
                 .font(.system(size: 14))
 
-            // Title + participants
-            VStack(alignment: .leading, spacing: 2) {
+            // Title + participants + metadata badges
+            VStack(alignment: .leading, spacing: 3) {
                 Text(meeting.title)
                     .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(isSelected ? OrinColor.accent : OrinColor.primaryText(colorScheme))
@@ -826,6 +934,8 @@ private struct PastMeetingRowView: View {
                      : meeting.participants.prefix(2).joined(separator: ", "))
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
+                // Metadata badges: only shown when non-trivial
+                MeetingMetaBadgeRow(meeting: meeting)
             }
 
             Spacer()
@@ -842,6 +952,7 @@ private struct PastMeetingRowView: View {
                     Button("Markdown") { onExport(.markdown) }
                     Button("Text") { onExport(.text) }
                     Button("JSON") { onExport(.json) }
+                    Button("CSV") { onExport(.csv) }
                 }
                 Menu("Move to Folder") {
                     Button("Remove from Folder") { onMoveToFolder(nil) }
@@ -880,16 +991,549 @@ private struct PastMeetingRowView: View {
 
 // MARK: - Supporting Types
 
-private struct RecurringFolderSuggestion {
-    let signature: String
-    let title: String
-    let meetingIDs: [UUID]
-    let dismissedKey: String
+// MARK: - Meeting Metadata Badge Row
+//
+// Compact set of status badges shown below the meeting title in PastMeetingRowView.
+// Only non-trivial data is shown (zero values are hidden to avoid noise).
 
-    var message: String {
-        "Orin found \(meetingIDs.count) matching meetings named \"\(title)\"."
+private struct MeetingMetaBadgeRow: View {
+    let meeting: MeetingItem
+
+    private var durationText: String? {
+        guard meeting.durationSeconds > 60 else { return nil }
+        let m = Int(meeting.durationSeconds) / 60
+        return m >= 60 ? "\(m / 60)h \(m % 60)m" : "\(m)m"
+    }
+
+    var body: some View {
+        let hasDuration     = durationText != nil
+        let hasActions      = !meeting.actionItems.isEmpty
+        let hasSummary      = !meeting.summary.isEmpty
+        let hasTranscript   = !meeting.transcript.isEmpty
+
+        // Only render the row if there's at least one badge to show
+        if hasDuration || hasActions || hasSummary || hasTranscript {
+            HStack(spacing: 6) {
+                if let dur = durationText {
+                    MetaBadge(icon: "clock", label: dur, color: .secondary)
+                }
+                if hasSummary {
+                    MetaBadge(icon: "sparkles", label: "Analyzed", color: .green)
+                }
+                if hasActions {
+                    MetaBadge(icon: "checklist", label: "\(meeting.actionItems.count)", color: .blue)
+                }
+                if hasTranscript && !hasSummary {
+                    MetaBadge(icon: "text.bubble", label: "Transcript", color: .secondary)
+                }
+            }
+        }
     }
 }
+
+private struct MetaBadge: View {
+    let icon: String
+    let label: String
+    let color: Color
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: icon)
+                .font(.system(size: 9, weight: .medium))
+            Text(label)
+                .font(.system(size: 10, weight: .medium))
+        }
+        .foregroundStyle(color.opacity(0.85))
+        .padding(.horizontal, 5)
+        .padding(.vertical, 2)
+        .background(color.opacity(0.10))
+        .clipShape(Capsule())
+    }
+}
+
+// MARK: - Empty Meetings State
+
+private struct EmptyMeetingsState: View {
+    @Environment(\.colorScheme) private var colorScheme
+    var onCreateMeeting: () -> Void
+
+    var body: some View {
+        VStack(spacing: 20) {
+            Spacer()
+            Image(systemName: "video.slash")
+                .font(.system(size: 52, weight: .light))
+                .foregroundStyle(OrinColor.secondaryText(colorScheme))
+
+            VStack(spacing: 8) {
+                Text("No Meetings Yet")
+                    .font(.title2.weight(.semibold))
+                    .foregroundStyle(OrinColor.primaryText(colorScheme))
+                Text("Orin will detect and prompt to record your meetings automatically.\nYou can also start a recording manually.")
+                    .font(.body)
+                    .foregroundStyle(OrinColor.secondaryText(colorScheme))
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 360)
+            }
+
+            HStack(spacing: 10) {
+                Button(action: onCreateMeeting) {
+                    Label("New Meeting", systemImage: "plus")
+                }
+                .buttonStyle(OrinPrimaryButtonStyle())
+            }
+            Spacer()
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 40)
+    }
+}
+
+// MARK: - Recurring Suggestion Banner
+
+/// Inline card shown at the top of the meeting list when a recurring pattern is detected.
+/// Shows Accept / Dismiss actions without blocking the UI.
+private struct RecurringSuggestionBanner: View {
+    @Environment(\.colorScheme) private var colorScheme
+    let pattern: RecurringPattern
+    var onAccept: () -> Void
+    var onDismiss: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .foregroundStyle(OrinColor.accent)
+                .font(.system(size: 16))
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Create \"\(pattern.suggestedFolderName)\" folder?")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(OrinColor.primaryText(colorScheme))
+                Text(pattern.summaryLine)
+                    .font(.system(size: 11))
+                    .foregroundStyle(OrinColor.secondaryText(colorScheme))
+            }
+
+            Spacer()
+
+            Button("Dismiss") { onDismiss() }
+                .buttonStyle(OrinSecondaryButtonStyle())
+                .font(.system(size: 11))
+
+            Button("Create") { onAccept() }
+                .buttonStyle(OrinPrimaryButtonStyle())
+                .font(.system(size: 11))
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(OrinColor.accent.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(OrinColor.accent.opacity(0.2), lineWidth: 1)
+        }
+    }
+}
+
+// MARK: - Rename Folder Sheet
+
+private struct RenameFolderSheet: View {
+    @State private var name: String
+    var onSave: (String) -> Void
+    var onCancel: () -> Void
+
+    init(currentName: String, onSave: @escaping (String) -> Void, onCancel: @escaping () -> Void) {
+        _name    = State(initialValue: currentName)
+        self.onSave   = onSave
+        self.onCancel = onCancel
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Rename Folder")
+                .font(.title2.weight(.semibold))
+            TextField("Folder name", text: $name)
+                .textFieldStyle(.roundedBorder)
+            HStack {
+                Spacer()
+                Button("Cancel", action: onCancel)
+                Button("Save") {
+                    let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmed.isEmpty else { return }
+                    onSave(trimmed)
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(22)
+        .frame(width: 360)
+    }
+}
+
+// MARK: - Folder Detail View
+
+private enum FolderDetailTab: String, CaseIterable {
+    case meetings    = "Meetings"
+    case intelligence = "Intelligence"
+}
+
+private struct FolderDetailView: View {
+    @Environment(\.modelContext) private var modelContext
+    @Environment(\.colorScheme) private var colorScheme
+    @Bindable var folder: MeetingFolderItem
+    let meetings: [MeetingItem]
+    let folderSummary: FolderSummaryItem?
+    var onGenerateSummary: () async -> Void
+    var onSelectMeeting: (MeetingItem) -> Void
+
+    @State private var activeTab: FolderDetailTab = .meetings
+    @State private var isGenerating = false
+
+    private var folderColor: Color {
+        switch folder.color {
+        case "green":  return .green
+        case "red":    return .red
+        case "orange": return .orange
+        case "purple": return .purple
+        case "gray":   return .gray
+        default:       return OrinColor.accent
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            // Header
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: folder.icon)
+                    .font(.system(size: 32, weight: .medium))
+                    .foregroundStyle(folderColor)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(folder.name)
+                        .font(OrinFont.pageTitle)
+                        .foregroundStyle(OrinColor.primaryText(colorScheme))
+                    Text("\(meetings.count) meeting\(meetings.count == 1 ? "" : "s")" + (meetings.first.map { " · Last: \($0.date.formatted(date: .abbreviated, time: .omitted))" } ?? ""))
+                        .font(OrinFont.body)
+                        .foregroundStyle(OrinColor.secondaryText(colorScheme))
+                    if !folder.folderDescription.isEmpty {
+                        Text(folder.folderDescription)
+                            .font(OrinFont.caption)
+                            .foregroundStyle(OrinColor.secondaryText(colorScheme))
+                    }
+                }
+                Spacer()
+            }
+
+            // Tab picker
+            Picker("", selection: $activeTab) {
+                ForEach(FolderDetailTab.allCases, id: \.self) {
+                    Text($0.rawValue).tag($0)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 320)
+
+            // Tab content
+            switch activeTab {
+            case .meetings:
+                meetingsTab
+            case .intelligence:
+                intelligenceTab
+            }
+
+            Spacer()
+        }
+        .padding(24)
+        .background(OrinColor.backgroundPrimary(colorScheme))
+    }
+
+    // MARK: - Meetings Tab
+
+    private var meetingsTab: some View {
+        ScrollView {
+            LazyVStack(spacing: 2) {
+                if meetings.isEmpty {
+                    Text("No meetings in this folder yet.")
+                        .foregroundStyle(OrinColor.secondaryText(colorScheme))
+                        .padding(.top, 20)
+                } else {
+                    ForEach(meetings, id: \.id) { meeting in
+                        FolderMeetingRow(meeting: meeting, onSelect: { onSelectMeeting(meeting) })
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - Intelligence Tab
+
+    private var intelligenceTab: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                if let summary = folderSummary {
+                    OrinCard {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("Overall Summary").font(OrinFont.cardTitle)
+                                Spacer()
+                                Text(summary.generatedAt.formatted(date: .abbreviated, time: .omitted))
+                                    .font(OrinFont.caption)
+                                    .foregroundStyle(OrinColor.secondaryText(colorScheme))
+                            }
+                            Text(summary.overallSummary.isEmpty ? "No summary available." : summary.overallSummary)
+                                .font(OrinFont.body)
+                                .foregroundStyle(summary.overallSummary.isEmpty
+                                    ? OrinColor.secondaryText(colorScheme)
+                                    : OrinColor.primaryText(colorScheme))
+                        }
+                    }
+
+                    if !summary.recurringTopics.isEmpty {
+                        OrinCard {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Recurring Topics").font(OrinFont.cardTitle)
+                                FlowTagView(tags: summary.recurringTopics)
+                            }
+                        }
+                    }
+
+                    if !summary.recurringDecisions.isEmpty {
+                        InsightCard(title: "Recurring Decisions", items: summary.recurringDecisions)
+                    }
+
+                    if !summary.recurringActionItems.isEmpty {
+                        InsightCard(title: "Recurring Action Items", items: summary.recurringActionItems)
+                    }
+                } else {
+                    OrinCard {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text("Folder Intelligence").font(OrinFont.cardTitle)
+                            Text("Generate a cross-meeting summary, recurring topics, and action item patterns for all meetings in this folder.")
+                                .font(OrinFont.body)
+                                .foregroundStyle(OrinColor.secondaryText(colorScheme))
+                            Button {
+                                Task {
+                                    isGenerating = true
+                                    await onGenerateSummary()
+                                    isGenerating = false
+                                }
+                            } label: {
+                                Label(isGenerating ? "Analyzing…" : "Generate Summary", systemImage: "sparkles")
+                            }
+                            .buttonStyle(OrinPrimaryButtonStyle())
+                            .disabled(isGenerating || meetings.isEmpty)
+                        }
+                    }
+                }
+
+                if folderSummary != nil && !meetings.isEmpty {
+                    Button {
+                        Task {
+                            isGenerating = true
+                            await onGenerateSummary()
+                            isGenerating = false
+                        }
+                    } label: {
+                        Label(isGenerating ? "Analyzing…" : "Regenerate", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(OrinSecondaryButtonStyle())
+                    .disabled(isGenerating)
+                }
+            }
+            .padding(.trailing, 8)
+        }
+    }
+}
+
+// MARK: - Folder Meeting Row
+
+private struct FolderMeetingRow: View {
+    @Environment(\.colorScheme) private var colorScheme
+    let meeting: MeetingItem
+    var onSelect: () -> Void
+
+    var body: some View {
+        Button(action: onSelect) {
+            HStack(spacing: 10) {
+                Image(systemName: meeting.transcript.isEmpty ? "doc" : "doc.text.fill")
+                    .foregroundStyle(meeting.transcript.isEmpty ? Color.secondary : OrinColor.accent)
+                    .font(.system(size: 14))
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(meeting.title)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(OrinColor.primaryText(colorScheme))
+                        .lineLimit(1)
+                    Text(meeting.date.formatted(date: .abbreviated, time: .shortened))
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if !meeting.summary.isEmpty {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                        .font(.system(size: 12))
+                }
+            }
+            .padding(.vertical, 8)
+            .padding(.horizontal, 8)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Flow Tag View (for recurring topics)
+
+private struct FlowTagView: View {
+    let tags: [String]
+    var body: some View {
+        // Simple wrapping layout using nested HStacks
+        VStack(alignment: .leading, spacing: 4) {
+            let rows = chunked(tags, size: 3)
+            ForEach(rows.indices, id: \.self) { i in
+                HStack(spacing: 6) {
+                    ForEach(rows[i], id: \.self) { tag in
+                        Text(tag)
+                            .font(.system(size: 11, weight: .medium))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(OrinColor.accent.opacity(0.12))
+                            .foregroundStyle(OrinColor.accent)
+                            .clipShape(Capsule())
+                    }
+                    Spacer()
+                }
+            }
+        }
+    }
+
+    private func chunked(_ items: [String], size: Int) -> [[String]] {
+        stride(from: 0, to: items.count, by: size).map {
+            Array(items[$0 ..< min($0 + size, items.count)])
+        }
+    }
+}
+
+// MARK: - Conversation Timeline View
+
+/// Displays transcript segments as an ordered conversation timeline.
+/// Each segment shows a time offset, speaker label, and the spoken text.
+///
+///   [00:03] Me: Hello everyone.
+///   [00:10] Participant: Good morning.
+///   [00:18] Me: Let's get started.
+///
+/// Replaces the flat `TextEditor` when timeline segments are available.
+/// The user can switch back to Full Transcript via the mode picker.
+private struct ConversationTimelineView: View {
+    @Environment(\.colorScheme) private var colorScheme
+    let segments: [TranscriptSegment]
+    let meetingStart: Date
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 10) {
+                ForEach(segments) { segment in
+                    TimelineSegmentRow(
+                        segment: segment,
+                        meetingStart: meetingStart
+                    )
+                }
+            }
+            .padding(.vertical, 4)
+        }
+        .frame(minHeight: 220)
+        .background(OrinColor.backgroundSecondary(colorScheme))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+}
+
+private struct TimelineSegmentRow: View {
+    @Environment(\.colorScheme) private var colorScheme
+    let segment: TranscriptSegment
+    let meetingStart: Date
+
+    private var isMic: Bool { segment.source == "mic" }
+
+    private var timeOffset: String {
+        let s = max(0, Int(segment.timestamp.timeIntervalSince(meetingStart)))
+        let m = s / 60, sec = s % 60
+        return String(format: "%02d:%02d", m, sec)
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            // Time offset badge
+            Text(timeOffset)
+                .font(.system(size: 10, weight: .medium).monospaced())
+                .foregroundStyle(OrinColor.secondaryText(colorScheme))
+                .frame(width: 42, alignment: .trailing)
+                .padding(.top, 2)
+
+            // Speaker indicator bar
+            RoundedRectangle(cornerRadius: 2)
+                .fill(isMic ? OrinColor.accent : Color.secondary.opacity(0.5))
+                .frame(width: 3)
+                .padding(.top, 3)
+                .padding(.bottom, 3)
+
+            // Speaker label + text
+            VStack(alignment: .leading, spacing: 2) {
+                Text(segment.speakerLabel)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(isMic ? OrinColor.accent : OrinColor.secondaryText(colorScheme))
+                Text(segment.text)
+                    .font(.system(size: 13))
+                    .foregroundStyle(OrinColor.primaryText(colorScheme))
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 4)
+    }
+}
+
+// MARK: - Calendar-only Event Row
+
+/// Shows an EKEvent that has no corresponding MeetingItem yet.
+/// Tapping "Open" creates a MeetingItem linked to this event.
+private struct CalendarOnlyEventRow: View {
+    @Environment(\.colorScheme) private var colorScheme
+    let event: EKEvent
+    var onCreate: () -> Void
+
+    private var timeString: String {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        return "\(f.string(from: event.startDate))–\(f.string(from: event.endDate))"
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            RoundedRectangle(cornerRadius: 3)
+                .fill(Color(cgColor: event.calendar.cgColor))
+                .frame(width: 3, height: 32)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(event.title ?? "Meeting")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(OrinColor.primaryText(colorScheme))
+                    .lineLimit(1)
+                Text(timeString)
+                    .font(.system(size: 11))
+                    .foregroundStyle(OrinColor.secondaryText(colorScheme))
+            }
+            Spacer()
+            Button("Open") { onCreate() }
+                .buttonStyle(OrinSecondaryButtonStyle())
+                .font(.system(size: 11))
+        }
+        .padding(.vertical, 6)
+        .padding(.horizontal, 8)
+    }
+}
+
+// RecurringFolderSuggestion removed — replaced by RecurringPattern from RecurringMeetingService.
 
 private enum MeetingDeleteTarget {
     case transcript
@@ -897,26 +1541,39 @@ private enum MeetingDeleteTarget {
     case meeting
 }
 
+// MARK: - Transcript view mode
+
+private enum TranscriptViewMode: String, CaseIterable {
+    case timeline  = "Timeline"
+    case legacy    = "Full Transcript"
+}
+
 private struct MeetingDetailView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.colorScheme) private var colorScheme
     @Bindable var meeting: MeetingItem
     let folders: [MeetingFolderItem]
+    /// TranscriptSegments for this meeting (pre-filtered by the parent).
+    let segments: [TranscriptSegment]
     var onExport: (MeetingExportFormat) -> Void
     var onMoveToFolder: (MeetingFolderItem?) -> Void
 
     @State private var isAnalyzing = false
     @State private var isImportingTranscript = false
     @State private var recordingService = ServiceContainer.shared.resolve(RecordingService.self)
-    @State private var meetingDetector = ServiceContainer.shared.resolve(MeetingDetectorService.self)
     @State private var systemAudioService = ServiceContainer.shared.resolve(SystemAudioCaptureService.self)
     @State private var transcriptStore = ServiceContainer.shared.resolve(TranscriptStore.self)
     @State private var wasRecordingThisMeeting = false
     @State private var noActiveMeetingError = false
     @State private var pendingDelete: MeetingDeleteTarget?
     @State private var showingDeleteConfirm = false
+    /// Defaults to timeline when segments exist; falls back to legacy automatically.
+    @State private var transcriptViewMode: TranscriptViewMode = .timeline
 
     private let intelligence = ServiceContainer.shared.resolve(MeetingIntelligenceService.self)
+
+    /// True when transcript segments are available for this meeting.
+    private var hasTimeline: Bool { !segments.isEmpty }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -924,13 +1581,14 @@ private struct MeetingDetailView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     recordingCard
-                    participantsCard
-                    transcriptCard
+                    meetingQuickStats       // at-a-glance summary of meeting health
+                    transcriptCard          // primary content — moved before summary
                     summaryCard
                     InsightCard(title: "Decisions", items: meeting.decisions)
                     InsightCard(title: "Action Items", items: meeting.actionItems)
                     commitmentsCard
                     suggestedTasksCard
+                    participantsCard   // ← moved to bottom (less critical than content)
                 }
                 .padding(.trailing, 8)
             }
@@ -964,6 +1622,8 @@ private struct MeetingDetailView: View {
             let audioURL = recordingService.recordingURL
             Task { @MainActor in
                 await transcriptStore.finalize(elapsed: elapsed, audioURL: audioURL)
+                // Auto-analysis for recordings started from MeetingDetailView.
+                await autoAnalyzeIfEnabled(elapsed: elapsed)
             }
         }
         .fileImporter(
@@ -1020,6 +1680,7 @@ private struct MeetingDetailView: View {
                     Button("JSON") { onExport(.json) }
                     Button("Markdown") { onExport(.markdown) }
                     Button("Text") { onExport(.text) }
+                    Button("CSV") { onExport(.csv) }
                 }
                 Menu("Move to Folder") {
                     Button("Remove from Folder") { onMoveToFolder(nil) }
@@ -1117,17 +1778,89 @@ private struct MeetingDetailView: View {
         }
     }
 
+    // MARK: - Quick Stats Bar
+    //
+    // At-a-glance meeting health summary shown directly below the recording card.
+    // Eliminates the need to scroll through all cards to understand a meeting's state.
+
+    @ViewBuilder
+    private var meetingQuickStats: some View {
+        let hasTranscript  = !meeting.transcript.isEmpty
+        let hasSummary     = !meeting.summary.isEmpty
+        let hasRecording   = meeting.audioFilePath != nil
+        let actionCount    = meeting.actionItems.count
+        let participantCount = meeting.participants.count
+        let durationSecs   = meeting.durationSeconds
+
+        if hasTranscript || hasSummary || hasRecording || durationSecs > 0 {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 12) {
+                    if durationSecs > 60 {
+                        QuickStatChip(
+                            icon: "clock",
+                            label: durationSecs >= 3600
+                                ? String(format: "%dh %dm", Int(durationSecs) / 3600, (Int(durationSecs) % 3600) / 60)
+                                : "\(Int(durationSecs) / 60)m",
+                            active: true,
+                            accent: false
+                        )
+                    }
+                    if participantCount > 0 {
+                        QuickStatChip(icon: "person.2", label: "\(participantCount)", active: true, accent: false)
+                    }
+                    QuickStatChip(icon: "waveform",      label: "Recording",  active: hasRecording,  accent: hasRecording)
+                    QuickStatChip(icon: "text.bubble",   label: "Transcript", active: hasTranscript, accent: hasTranscript)
+                    QuickStatChip(icon: "sparkles",      label: "Analyzed",   active: hasSummary,    accent: hasSummary)
+                    if actionCount > 0 {
+                        QuickStatChip(icon: "checklist", label: "\(actionCount) action\(actionCount == 1 ? "" : "s")", active: true, accent: true)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+            }
+            .background(OrinColor.backgroundSecondary(colorScheme))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        }
+    }
+
     private var transcriptCard: some View {
         OrinCard {
             VStack(alignment: .leading, spacing: 10) {
-                Text("Transcript").font(OrinFont.cardTitle)
-                TextEditor(text: $meeting.transcript)
-                    .font(.body.monospaced())
-                    .frame(minHeight: 220)
-                    .scrollContentBackground(.hidden)
-                    .background(OrinColor.backgroundSecondary(colorScheme))
-                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                HStack {
+                    Text("Transcript").font(OrinFont.cardTitle)
+                    Spacer()
+                    if hasTimeline {
+                        Picker("", selection: $transcriptViewMode) {
+                            ForEach(TranscriptViewMode.allCases, id: \.self) {
+                                Text($0.rawValue).tag($0)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(maxWidth: 220)
+                    }
+                }
+
+                if hasTimeline && transcriptViewMode == .timeline {
+                    ConversationTimelineView(
+                        segments: segments,
+                        meetingStart: meeting.date
+                    )
+                } else {
+                    TextEditor(text: $meeting.transcript)
+                        .font(.body.monospaced())
+                        .frame(minHeight: 220)
+                        .scrollContentBackground(.hidden)
+                        .background(OrinColor.backgroundSecondary(colorScheme))
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                }
             }
+        }
+        .onAppear {
+            // Default to legacy when no timeline segments are available
+            if !hasTimeline { transcriptViewMode = .legacy }
+        }
+        .onChange(of: segments.count) { _, count in
+            if count > 0 { transcriptViewMode = .timeline }
         }
     }
 
@@ -1209,31 +1942,52 @@ private struct MeetingDetailView: View {
     }
 
     private func startRecording() {
-        guard meetingDetector.detectedMeetingApp != nil else {
-            noActiveMeetingError = true
-            return
-        }
-        noActiveMeetingError = false
-        wasRecordingThisMeeting = true
-        transcriptStore.beginSession(meetingID: meeting.id, meeting: meeting, context: modelContext)
         Task {
             await recordingService.startRecording(for: meeting.id)
-            if recordingService.isRecording {
-                await systemAudioService.startCapturing(for: meeting.id)
+            guard recordingService.isRecording else {
+                noActiveMeetingError = false
+                return
             }
+            // Begin TranscriptStore session AFTER recording is confirmed running.
+            noActiveMeetingError = false
+            wasRecordingThisMeeting = true
+            transcriptStore.beginSession(meetingID: meeting.id, meeting: meeting, context: modelContext)
+            await systemAudioService.startCapturing(for: meeting.id)
         }
     }
 
     private func analyze() async {
         isAnalyzing = true
-        let analysis = await intelligence.analyze(title: meeting.title, transcript: meeting.transcript)
-        meeting.summary = analysis.summary
-        meeting.decisions = analysis.decisions
-        meeting.actionItems = analysis.actionItems
-        meeting.suggestedTaskTitles = analysis.suggestedTasks
-        meeting.commitments = analysis.commitments.map { CommitmentItem(title: $0) }
+        // Prefer segment-based analysis (conversation timeline) when available.
+        let analysis: MeetingAnalysis
+        if !segments.isEmpty {
+            analysis = await intelligence.analyze(
+                title: meeting.title,
+                segments: segments,
+                meetingStart: meeting.date,
+                fallbackTranscript: meeting.transcript
+            )
+        } else {
+            analysis = await intelligence.analyze(title: meeting.title, transcript: meeting.transcript)
+        }
+        meeting.summary              = analysis.summary
+        meeting.decisions            = analysis.decisions
+        meeting.actionItems          = analysis.actionItems
+        meeting.suggestedTaskTitles  = analysis.suggestedTasks
+        meeting.commitments          = analysis.commitments.map { CommitmentItem(title: $0) }
         modelContext.safeSave(context: "meeting analysis")
         isAnalyzing = false
+    }
+
+    /// Runs analysis automatically after recording stops if the `orin.meetings.autoAnalyze`
+    /// setting is enabled and the elapsed time meets the minimum duration threshold.
+    @MainActor
+    private func autoAnalyzeIfEnabled(elapsed: TimeInterval) async {
+        guard UserDefaults.standard.bool(forKey: "orin.meetings.autoAnalyze") else { return }
+        let minMinutes = max(1, UserDefaults.standard.integer(forKey: "orin.meetings.minDurationMinutes"))
+        guard elapsed >= TimeInterval(minMinutes * 60) else { return }
+        guard !meeting.transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        await analyze()
     }
 
     private func acceptSuggestedTask(_ title: String) {
@@ -1269,6 +2023,12 @@ private struct MeetingDetailView: View {
     private func deleteTranscript() {
         meeting.transcript = ""
         meeting.transcriptDeletedAt = Date()
+        // Also remove TranscriptChunk + TranscriptSegment records so storage is freed
+        let mid = meeting.id
+        let chunks = (try? modelContext.fetch(FetchDescriptor<TranscriptChunk>())) ?? []
+        chunks.filter { $0.meetingId == mid }.forEach { modelContext.delete($0) }
+        let segs = (try? modelContext.fetch(FetchDescriptor<TranscriptSegment>())) ?? []
+        segs.filter { $0.meetingId == mid }.forEach { modelContext.delete($0) }
         modelContext.safeSave(context: "meeting transcript delete")
     }
 
@@ -1282,9 +2042,36 @@ private struct MeetingDetailView: View {
     }
 
     private func deleteFullMeeting() {
-        deleteRecording()
-        modelContext.delete(meeting)
+        modelContext.deleteMeetingFully(meeting)
         modelContext.safeSave(context: "meeting full delete")
+    }
+}
+
+// MARK: - Quick Stat Chip
+
+private struct QuickStatChip: View {
+    let icon: String
+    let label: String
+    let active: Bool
+    let accent: Bool  // when true, uses accent colour instead of secondary
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: icon)
+                .font(.system(size: 10, weight: .medium))
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+        }
+        .foregroundStyle(active ? (accent ? OrinColor.accent : Color.primary) : Color.secondary.opacity(0.5))
+        .opacity(active ? 1 : 0.5)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(
+            active
+                ? (accent ? OrinColor.accent.opacity(0.12) : Color.secondary.opacity(0.1))
+                : Color.secondary.opacity(0.05)
+        )
+        .clipShape(Capsule())
     }
 }
 

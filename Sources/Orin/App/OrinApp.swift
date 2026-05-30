@@ -27,7 +27,10 @@ struct OrinApp: App {
             VaultItem.self,
             AISuggestionItem.self,
             DailyBriefItem.self,
-            FocusPatternItem.self
+            FocusPatternItem.self,
+            TranscriptChunk.self,
+            TranscriptSegment.self,
+            FolderSummaryItem.self
         ])
 
         // Build a container with automatic migration-failure recovery.
@@ -51,13 +54,30 @@ struct OrinApp: App {
         services.register(VoiceCommandService(), for: VoiceCommandService.self)
         services.register(OllamaInstallerService(), for: OllamaInstallerService.self)
         services.register(AIProviderTestService(), for: AIProviderTestService.self)
-        services.register(MeetingDetectorService(calendarService: calendarService), for: MeetingDetectorService.self)
+
+        // --- Provider layer (architecture requirement) ---
+        // Build concrete macOS provider implementations and inject them into
+        // MeetingDetectorService.  All coupling to EventKit, CGWindowList, and
+        // AVCaptureDevice lives in these providers; the detector sees only protocols.
+        let calendarProvider     = EventKitCalendarProvider(calendarService: calendarService)
+        let accessibilityProvider = macOSAccessibilityProvider()
+        let audioActivityProvider = AVAudioActivityProvider()
+
+        let meetingDetector = MeetingDetectorService(calendarService: calendarService)
+        meetingDetector.calendarProvider     = calendarProvider
+        meetingDetector.accessibilityProvider = accessibilityProvider
+        meetingDetector.audioActivityProvider = audioActivityProvider
+        services.register(meetingDetector, for: MeetingDetectorService.self)
+
         services.register(LoginItemService(), for: LoginItemService.self)
         services.register(WhisperTranscriptionService(), for: WhisperTranscriptionService.self)
-        services.register(SystemAudioCaptureService(), for: SystemAudioCaptureService.self)
+        let systemAudioCaptureService = SystemAudioCaptureService()
+        services.register(systemAudioCaptureService, for: SystemAudioCaptureService.self)
         services.register(TranscriptStore(), for: TranscriptStore.self)
         services.register(MeetingNotificationService(), for: MeetingNotificationService.self)
         services.register(MeetingDataService(), for: MeetingDataService.self)
+        services.register(RecurringMeetingService(), for: RecurringMeetingService.self)
+        services.register(FolderSummaryService(), for: FolderSummaryService.self)
 
         let retentionService = MeetingRetentionService()
         services.register(retentionService, for: MeetingRetentionService.self)

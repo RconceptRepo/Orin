@@ -1,4 +1,5 @@
 import AppKit
+import SwiftData
 import SwiftUI
 
 struct SettingsView: View {
@@ -446,7 +447,7 @@ struct SettingsView: View {
                 exportFullApp()
             } label: {
                 HStack {
-                    Label("Export Full App Data", systemImage: "square.and.arrow.up")
+                    Label("Export Full App Data (JSON)", systemImage: "square.and.arrow.up")
                     if exportProgress {
                         Spacer()
                         ProgressView().scaleEffect(0.7)
@@ -454,6 +455,12 @@ struct SettingsView: View {
                 }
             }
             .disabled(exportProgress)
+
+            Button {
+                exportMeetingsZip()
+            } label: {
+                Label("Export All Meetings (ZIP)", systemImage: "archivebox")
+            }
 
             Button {
                 importFullApp()
@@ -484,6 +491,28 @@ struct SettingsView: View {
                 Task { @MainActor in dataActionStatus = "Exported to \(url.lastPathComponent)." }
             } catch {
                 Task { @MainActor in dataActionStatus = "Export failed: \(error.localizedDescription)" }
+            }
+        }
+    }
+
+    private func exportMeetingsZip() {
+        dataActionStatus = nil
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "Orin Meetings \(Date().formatted(date: .abbreviated, time: .omitted)).zip"
+        panel.canCreateDirectories = true
+        panel.begin { [self] response in
+            guard response == .OK, let url = panel.url else { return }
+            do {
+                let meetings = try self.modelContext.fetch(FetchDescriptor<MeetingItem>())
+                let data = try self.dataService.exportMeetingsZip(meetings: meetings)
+                try data.write(to: url, options: .atomic)
+                Task { @MainActor in
+                    dataActionStatus = "Exported \(meetings.count) meetings to \(url.lastPathComponent)."
+                }
+            } catch {
+                Task { @MainActor in
+                    dataActionStatus = "ZIP export failed: \(error.localizedDescription)"
+                }
             }
         }
     }

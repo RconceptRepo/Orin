@@ -7,6 +7,7 @@ struct MainContainerView: View {
     @AppStorage("orin.sidebar.collapsed") private var isSidebarCollapsed = true
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.scenePhase) private var scenePhase
     @State private var selectedModule: SidebarModule = .today
     @State private var recordingService = ServiceContainer.shared.resolve(RecordingService.self)
     @State private var meetingDetector = ServiceContainer.shared.resolve(MeetingDetectorService.self)
@@ -15,6 +16,7 @@ struct MainContainerView: View {
     @State private var transcriptStore = ServiceContainer.shared.resolve(TranscriptStore.self)
     @State private var notificationService = ServiceContainer.shared.resolve(MeetingNotificationService.self)
     @State private var activeRecordingMeeting: MeetingItem?
+    private let intelligence = ServiceContainer.shared.resolve(MeetingIntelligenceService.self)
 
     enum SidebarModule: Hashable, CaseIterable {
         case today
@@ -93,21 +95,41 @@ struct MainContainerView: View {
                 notificationService.notifyMeetingDetected(appName: appName)
             }
 
-            // Part 3 — auto-stop: when the meeting disappears from the detection
-            // window, wait up to 4 s (one fast-poll miss) then stop recording.
-            // The closure is set once; re-appearing re-registers (last writer wins,
-            // which is always this same closure so there are no semantic differences).
+            // Auto-stop: when the meeting disappears from the detection window,
+            // stop recording only when BOTH conditions are met:
+            //   1. Meeting no longer detected (this closure fires)
+            //   2. Audio has been inactive for at least audioInactivityThreshold seconds
+            //
+            // This prevents a brief network blip or process hiccup from stopping an
+            // active recording.  The closure is set once; re-appearing re-registers
+            // (last writer wins — always the same closure).
             meetingDetector.onMeetingEnded = {
                 Task { @MainActor in
                     guard recordingService.isRecording else { return }
-                    // 1.5 s grace period — combined with 3 s fast-poll gives ≤ 4.5 s max auto-stop.
-                    print("[AutoStop] meeting ended while recording — waiting 1.5 s grace before stop")
+
+                    // Grace period 1 — allow the meeting to re-enter the detection window
+                    // (e.g., Zoom briefly restarting its process, Chrome tab reload).
+                    // Combined with the 3 s fast-poll this gives ≤ 4.5 s before reaching
+                    // the audio-inactivity check.
+                    print("[AutoStop] meeting ended while recording — 1.5 s initial grace")
                     try? await Task.sleep(nanoseconds: 1_500_000_000)
                     guard recordingService.isRecording else {
-                        print("[AutoStop] recording already stopped during grace period — no action")
+                        print("[AutoStop] recording stopped during grace — no action")
                         return
                     }
-                    print("[AutoStop] auto-stopping recording (meeting gone for ≥ 1.5 s)")
+
+                    // Grace period 2 — audio-inactivity check.
+                    // Configurable threshold (default 30 s).  If new transcript text arrived
+                    // within the threshold, the mic/system audio is still active and we defer
+                    // the stop by re-scheduling the next poll cycle instead of stopping now.
+                    let audioInactivityThreshold: TimeInterval = 30
+                    if let secondsSince = transcriptStore.secondsSinceLastUpdate,
+                       secondsSince < audioInactivityThreshold {
+                        print("[AutoStop] audio still active \(Int(secondsSince))s ago (threshold \(Int(audioInactivityThreshold))s) — deferring auto-stop")
+                        return
+                    }
+
+                    print("[AutoStop] meeting gone + audio inactive — stopping recording")
                     recordingService.stopRecording()
                 }
             }
@@ -115,6 +137,15 @@ struct MainContainerView: View {
             calendarService.refreshAuthorizationStatus()
             if calendarBackgroundSync {
                 calendarService.startBackgroundSync()
+            }
+            // Check for recording action queued while the app was in the background.
+            processPendingNotificationAction()
+        }
+        // Re-check the pending action whenever the app transitions to active (e.g.,
+        // user tapped "Start Recording" on a notification while Orin was backgrounded).
+        .onChange(of: scenePhase) { _, newPhase in
+            if newPhase == .active {
+                processPendingNotificationAction()
             }
         }
         .onChange(of: recordingService.isRecording) { _, isNow in
@@ -150,9 +181,13 @@ struct MainContainerView: View {
                 meetingDetector.disableFastPoll()
                 systemAudioService.stopCapturing()
                 FloatingRecordingWidgetWindowManager.shared.hide()
+                // Clear the persistent "Recording in Progress" notification (BUG-12).
+                notificationService.notifyRecordingStopped()
 
                 let elapsed = TimeInterval(recordingService.elapsedSeconds)
                 let audioURL = recordingService.recordingURL
+                // Capture meeting reference BEFORE clearing so auto-analysis can use it.
+                let meetingForAnalysis = activeRecordingMeeting
                 activeRecordingMeeting = nil
 
                 // Delegate finalization to TranscriptStore — idempotent, best-of-N selection,
@@ -160,6 +195,9 @@ struct MainContainerView: View {
                 Task { @MainActor in
                     await transcriptStore.finalize(elapsed: elapsed, audioURL: audioURL)
                     print("[Transcript] MainContainer: TranscriptStore.finalize complete")
+
+                    // Auto-analysis: run if the setting is enabled and meeting was long enough.
+                    await autoAnalyzeIfEnabled(meeting: meetingForAnalysis, elapsed: elapsed)
                 }
             }
         }
@@ -196,6 +234,61 @@ struct MainContainerView: View {
             return max(72, totalWidth * 0.05)
         }
         return max(240, totalWidth * 0.2)
+    }
+
+    // MARK: - Auto-analysis
+
+    /// Runs meeting intelligence analysis after recording if the user has enabled
+    /// auto-analyze AND the meeting duration meets the minimum threshold.
+    ///
+    /// - Parameters:
+    ///   - meeting: The `MeetingItem` that was just recorded.  `nil` when the recording
+    ///     was started from `MeetingDetailView` (which has its own analysis path).
+    ///   - elapsed: Actual recording duration in seconds.
+    @MainActor
+    private func autoAnalyzeIfEnabled(meeting: MeetingItem?, elapsed: TimeInterval) async {
+        guard UserDefaults.standard.bool(forKey: "orin.meetings.autoAnalyze") else { return }
+        guard let meeting else { return }
+
+        let minMinutes = max(1, UserDefaults.standard.integer(forKey: "orin.meetings.minDurationMinutes"))
+        let minSeconds = TimeInterval(minMinutes * 60)
+        guard elapsed >= minSeconds else {
+            print("[AutoAnalysis] skipped — elapsed \(Int(elapsed))s < minimum \(Int(minSeconds))s")
+            return
+        }
+        guard !meeting.transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            print("[AutoAnalysis] skipped — transcript is empty")
+            return
+        }
+
+        print("[AutoAnalysis] starting for '\(meeting.title)' elapsed=\(Int(elapsed))s")
+        let analysis = await intelligence.analyze(title: meeting.title, transcript: meeting.transcript)
+        meeting.summary              = analysis.summary
+        meeting.decisions            = analysis.decisions
+        meeting.actionItems          = analysis.actionItems
+        meeting.suggestedTaskTitles  = analysis.suggestedTasks
+        meeting.commitments          = analysis.commitments.map { CommitmentItem(title: $0) }
+        modelContext.safeSave(context: "auto-analysis")
+        print("[AutoAnalysis] complete — summary chars=\(analysis.summary.count) decisions=\(analysis.decisions.count) actions=\(analysis.actionItems.count)")
+    }
+
+    // MARK: - Pending notification action (background recording start)
+
+    /// Processes a "Start Recording" action that was queued via UserDefaults while
+    /// the app was in the background or not running.
+    ///
+    /// Called from both `onAppear` (cold launch via notification tap) and
+    /// `onChange(of: scenePhase)` (background → active transition).
+    private func processPendingNotificationAction() {
+        guard UserDefaults.standard.bool(
+            forKey: MeetingNotificationService.pendingStartRecordingKey
+        ) else { return }
+        UserDefaults.standard.removeObject(
+            forKey: MeetingNotificationService.pendingStartRecordingKey
+        )
+        Task { @MainActor in
+            await startRecordingFromDetectedMeeting()
+        }
     }
 
     @MainActor

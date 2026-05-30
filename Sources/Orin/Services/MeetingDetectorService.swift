@@ -37,6 +37,25 @@ final class MeetingDetectorService: Service {
         case unavailable
     }
 
+    // MARK: - Confidence Scoring (via MeetingDetectionConfidence from MeetingProviderTypes)
+
+    /// Typealias so all existing callsites (`DetectionConfidence`, nested enum access)
+    /// continue to compile after the type was promoted to a top-level struct in
+    /// `MeetingProviderTypes.swift`.
+    ///
+    /// Score table (threshold = 40):
+    ///   fromCalendarEvent        : 40 — calendar event with meeting URL
+    ///   fromMeetingURL           : 30 — browser tab contains a known meeting URL
+    ///   fromRunningProcess       : 25 — known meeting app is running
+    ///   fromWindowTitle          : 30 — window title confirms active call
+    ///   microphoneActivityScore  : 20 — mic in use by another app
+    ///   systemAudioActivityScore : 20 — system audio stream active
+    typealias DetectionConfidence = MeetingDetectionConfidence
+
+    /// Confidence score for the current detection result.
+    /// Reset to `.zero` when no meeting is detected.
+    private(set) var currentConfidence: DetectionConfidence = .zero
+
     // MARK: - Public State
 
     var detectedMeetingApp: String?
@@ -62,6 +81,28 @@ final class MeetingDetectorService: Service {
         ("com.microsoft.teams2",      "Microsoft Teams"),
         ("com.tinyspeck.slackmacgap", "Slack"),
         ("com.cisco.webex.meetings",  "Webex"),
+    ]
+
+    // MARK: - Direct call window-title keywords
+    //
+    // Maps a bundle ID to the window-title substrings that confirm an active call
+    // (rather than the app merely being open).  Requires Screen Recording permission
+    // to read window titles; gracefully degrades to process-only detection if absent.
+    //
+    // Zoom:   "Zoom Meeting" appears when in a call; plain "Zoom" is the launcher.
+    // Teams:  Title changes to participant name or shows "In a call" during calls.
+    // Slack:  Separate huddle window titled "Slack - Huddle" or "Huddle".
+    // Webex:  Active session shows "Webex Meeting" or "Cisco Webex".
+    // FaceTime: Included for completeness; bundle ID differs per macOS version.
+    private let callWindowKeywords: [String: [String]] = [
+        "us.zoom.xos":               ["Zoom Meeting", "zoom meeting"],
+        "com.microsoft.teams":       ["In a call", "in a call", "call in progress",
+                                      "meeting in progress", "meeting"],
+        "com.microsoft.teams2":      ["In a call", "in a call", "call in progress",
+                                      "meeting in progress", "meeting"],
+        "com.tinyspeck.slackmacgap": ["Huddle", "huddle", "Slack Call", "call"],
+        "com.cisco.webex.meetings":  ["Webex Meeting", "Cisco Webex", "meeting"],
+        "com.apple.FaceTime":        ["FaceTime"],
     ]
 
     private let chromiumBrowsers: [(bundleID: String, appName: String)] = [
@@ -121,6 +162,21 @@ final class MeetingDetectorService: Service {
     /// Provides EventKit event data for the calendar-based detection path.
     private let calendarService: CalendarService
 
+    /// Platform-agnostic calendar abstraction.  When set, `detectFromCalendar()`
+    /// uses this provider instead of querying `calendarService` directly.
+    /// Defaults to `nil` (legacy path) until registered in `OrinApp`.
+    var calendarProvider: (any CalendarProvider)?
+
+    /// Window-title inspector.  When set, `detectNativeApp()` checks call-specific
+    /// window titles to award `fromWindowTitle` confidence score.
+    /// Defaults to `nil` — detection degrades to process-only (existing behavior).
+    var accessibilityProvider: (any AccessibilityProvider)?
+
+    /// Microphone activity inspector.  When set, each detection cycle checks
+    /// whether another app has claimed the mic and awards `microphoneActivityScore`.
+    /// Defaults to `nil` — mic score stays 0 (existing behavior).
+    var audioActivityProvider: (any AudioActivityProvider)?
+
     // MARK: - Testing Support
 
     /// Overrides the EventKit query performed by `detectFromCalendar()`.
@@ -174,6 +230,7 @@ final class MeetingDetectorService: Service {
         dismissedMeetingKey = nil
         automationPermissionStatus = .unknown
         hasReportedAutomationDenial = false
+        currentConfidence = .zero
     }
 
     @MainActor
@@ -237,31 +294,83 @@ final class MeetingDetectorService: Service {
         Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
             let detection = await self.detectMeeting()
-            await self.applyDetectionResult(detection)
+            // Convert to (app, key)? using confidence threshold gate.
+            let gated: (app: String, key: String)? = detection.flatMap { d in
+                d.confidence.meetsThreshold ? (app: d.app, key: d.key) : nil
+            }
+            if let d = detection {
+                await MainActor.run { self.currentConfidence = d.confidence }
+            }
+            await self.applyDetectionResult(gated)
             await MainActor.run { self.isPollInFlight = false }
         }
     }
 
     // MARK: - Detection pipeline (background-safe)
 
-    private func detectMeeting() async -> (app: String, key: String)? {
+    private func detectMeeting() async -> (app: String, key: String, confidence: DetectionConfidence)? {
         // Priority order: native app > calendar event > browser tab.
         //
         // Native apps are the most reliable signal (the meeting software is running).
         // Calendar events are proactive (a scheduled meeting is about to start or just started).
         // Browser tabs catch meetings joined without a native client.
-        if let native   = detectNativeApp()    { return native   }
-        if let calendar = detectFromCalendar() { return calendar }
-        return await detectBrowserMeeting()
+        //
+        // All paths now also query accessibilityProvider (window titles) and
+        // audioActivityProvider (microphone-in-use) to supplement confidence.
+
+        let micScore = audioActivityProvider?.isMicrophoneInUseByAnotherApp() == true ? 20 : 0
+
+        if let native = detectNativeApp() {
+            var c = DetectionConfidence()
+            c.fromRunningProcess = 25
+            // Calendar event at the same time boosts confidence.
+            if detectFromCalendar() != nil { c.fromCalendarEvent = 40 }
+            // Window title confirms active call (requires Screen Recording permission).
+            c.fromWindowTitle = windowTitleScore(for: native.bundleID, appName: native.app)
+            // Microphone in use by another app.
+            c.microphoneActivityScore = micScore
+            return (app: native.app, key: native.key, confidence: c)
+        }
+        if let calendar = detectFromCalendar() {
+            var c = DetectionConfidence()
+            c.fromCalendarEvent = 40
+            c.microphoneActivityScore = micScore
+            return (app: calendar.app, key: calendar.key, confidence: c)
+        }
+        if let browser = await detectBrowserMeeting() {
+            var c = DetectionConfidence()
+            c.fromMeetingURL = 30
+            c.microphoneActivityScore = micScore
+            return (app: browser.app, key: browser.key, confidence: c)
+        }
+        return nil
     }
 
-    private func detectNativeApp() -> (app: String, key: String)? {
+    /// Returns the `fromWindowTitle` score for `bundleID`.
+    ///
+    /// 30 if `accessibilityProvider` is set AND a call-specific window title
+    /// is on-screen.  0 otherwise (no provider or no matching title).
+    private func windowTitleScore(for bundleID: String, appName: String) -> Int {
+        guard let provider = accessibilityProvider,
+              let keywords = callWindowKeywords[bundleID],
+              provider.hasWindow(appNamed: appName, withTitleContaining: keywords)
+        else { return 0 }
+        return 30
+    }
+
+    /// Returns the detected app name, session key, and bundle ID.
+    /// Bundle ID is needed by `detectMeeting()` to look up call-window keywords.
+    private func detectNativeApp() -> (app: String, key: String, bundleID: String)? {
         let running = NSWorkspace.shared.runningApplications
         for config in nativeApps {
             guard let match = running.first(where: { $0.bundleIdentifier == config.bundleID }) else { continue }
             // Slack: only surface when a Huddle or call window is actually on-screen.
             if config.bundleID == "com.tinyspeck.slackmacgap", !slackHasActiveCall() { continue }
-            return (app: match.localizedName ?? config.displayName, key: "\(config.bundleID)|active")
+            return (
+                app:      match.localizedName ?? config.displayName,
+                key:      "\(config.bundleID)|active",
+                bundleID: config.bundleID
+            )
         }
         return nil
     }
@@ -284,8 +393,13 @@ final class MeetingDetectorService: Service {
 
     // MARK: - Calendar detection
 
-    /// Scans EventKit events that overlap the [−2 min, +5 min] window around now
+    /// Scans calendar events that overlap the [−2 min, +5 min] window around now
     /// for a known video-conference URL and returns the first match.
+    ///
+    /// Detection priority:
+    ///   1. `_calendarEventProviderOverride` (test hook, EKEvent-based)
+    ///   2. `calendarProvider` (new platform-agnostic path, CalendarEventDescriptor)
+    ///   3. `calendarService.events(from:to:)` (legacy EventKit direct path)
     ///
     /// Returns `nil` when calendar access is denied, no events exist in the window,
     /// or no events contain a recognised meeting URL.
@@ -294,16 +408,42 @@ final class MeetingDetectorService: Service {
         let windowStart = now.addingTimeInterval(-(2 * 60))   // 2 minutes before now
         let windowEnd   = now.addingTimeInterval(  5 * 60)    // 5 minutes ahead
 
-        let events: [EKEvent]
+        // Path 1: test hook (EKEvent — backward compatible with all existing tests)
         if let provider = _calendarEventProviderOverride {
-            events = provider(windowStart, windowEnd)
-        } else {
-            events = calendarService.events(from: windowStart, to: windowEnd)
+            let events = provider(windowStart, windowEnd)
+            for event in events {
+                guard let info = extractMeetingInfo(from: event) else { continue }
+                let rawID = event.eventIdentifier ?? ""
+                let eventID: String
+                if rawID.isEmpty {
+                    let epoch = Int(event.startDate.timeIntervalSince1970)
+                    eventID = "unsaved_\(event.title ?? "unknown")_\(epoch)"
+                } else {
+                    eventID = rawID
+                }
+                let key     = "calendar|\(eventID)|\(info.stableURL)"
+                let appName = event.title.map { "\(info.platform) — \($0)" } ?? info.platform
+                return (app: appName, key: key)
+            }
+            return nil
         }
 
+        // Path 2: CalendarProvider abstraction (platform-agnostic)
+        if let provider = calendarProvider {
+            let descriptors = provider.events(from: windowStart, to: windowEnd)
+            for desc in descriptors {
+                guard let info = extractMeetingInfo(from: desc) else { continue }
+                let key     = "calendar|\(desc.identifier)|\(info.stableURL)"
+                let appName = desc.title.map { "\(info.platform) — \($0)" } ?? info.platform
+                return (app: appName, key: key)
+            }
+            return nil
+        }
+
+        // Path 3: legacy direct CalendarService query
+        let events = calendarService.events(from: windowStart, to: windowEnd)
         for event in events {
             guard let info = extractMeetingInfo(from: event) else { continue }
-
             let rawID = event.eventIdentifier ?? ""
             let eventID: String
             if rawID.isEmpty {
@@ -312,10 +452,32 @@ final class MeetingDetectorService: Service {
             } else {
                 eventID = rawID
             }
-
             let key     = "calendar|\(eventID)|\(info.stableURL)"
             let appName = event.title.map { "\(info.platform) — \($0)" } ?? info.platform
             return (app: appName, key: key)
+        }
+        return nil
+    }
+
+    // MARK: - CalendarEventDescriptor overload
+
+    /// Extracts meeting info from a platform-agnostic `CalendarEventDescriptor`.
+    /// Used by the CalendarProvider detection path.
+    func extractMeetingInfo(from descriptor: CalendarEventDescriptor) -> (platform: String, stableURL: String)? {
+        let candidates: [String] = [
+            descriptor.url?.absoluteString,
+            descriptor.notes,
+            descriptor.location
+        ].compactMap { $0 }
+
+        for text in candidates {
+            for pattern in meetingURLPatterns {
+                guard text.contains(pattern) else { continue }
+                return (
+                    platform:  platformName(for: pattern),
+                    stableURL: stableKey(url: text, pattern: pattern)
+                )
+            }
         }
         return nil
     }
@@ -610,6 +772,7 @@ final class MeetingDetectorService: Service {
             print("[MeetingDetector] meeting ended app='\(endedApp)' — notifying auto-stop watchdog")
             detectedMeetingApp = nil
             shouldShowRecordingPrompt = false
+            currentConfidence = .zero
             onMeetingEnded?()    // auto-stop watchdog registered by MainContainerView
 
             // Key-reset policy:
@@ -639,4 +802,13 @@ final class MeetingDetectorService: Service {
         shouldShowRecordingPrompt = true
         onMeetingDetected?(result.app)
     }
+}
+
+// MARK: - MeetingDetectorProvider conformance
+
+extension MeetingDetectorService: MeetingDetectorProvider {
+    // All required properties and methods are already implemented on the class.
+    // This extension makes the conformance declaration explicit so Swift code
+    // that accepts `any MeetingDetectorProvider` can accept a
+    // `MeetingDetectorService` instance without a wrapper.
 }
