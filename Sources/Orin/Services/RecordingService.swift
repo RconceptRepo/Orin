@@ -389,9 +389,9 @@ final class RecordingService: Service {
     ) -> SFSpeechAudioBufferRecognitionRequest {
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
-        if recognizer.supportsOnDeviceRecognition {
-            request.requiresOnDeviceRecognition = true
-        }
+        // Do NOT force requiresOnDeviceRecognition — on-device VAD fires
+        // "No speech detected" aggressively on compressed/mixed-language call audio.
+        // Server-based recognition is more robust for real-world meeting audio.
         return request
     }
 
@@ -445,9 +445,17 @@ final class RecordingService: Service {
 
                 if let error, self.isRecording {
                     let nsError = error as NSError
-                    // Code 301 (kAFAssistantErrorDomain) fires on cancellation — not a real error.
+                    // 301 = cancellation (expected on stopRecording) — ignore.
+                    // All other errors (209 "No speech detected", 203 "recognition failed",
+                    // etc.) are transient: restart the session so audio capture continues.
+                    // Never surface "No speech detected" to the UI — it fires on silence
+                    // gaps and would spam the user during normal pauses.
                     if nsError.code != 301 {
-                        self.errorMessage = "Speech recognition error: \(error.localizedDescription)"
+                        print("[Transcript] recognition error — restarting session: code=\(nsError.code) \(error.localizedDescription)")
+                        let nextRequest = self.buildRecognitionRequest(recognizer: recognizer)
+                        self.tapState.updateRequest(nextRequest)
+                        self.recognitionTask = nil
+                        self.startRecognitionTask(with: recognizer, request: nextRequest)
                     }
                 }
             }

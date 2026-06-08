@@ -206,9 +206,9 @@ final class SystemAudioCaptureService: Service {
     ) -> SFSpeechAudioBufferRecognitionRequest {
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
-        if recognizer.supportsOnDeviceRecognition {
-            request.requiresOnDeviceRecognition = true
-        }
+        // Do NOT force requiresOnDeviceRecognition — system audio from video calls
+        // is compressed and may contain mixed languages; server-based recognition
+        // handles this far better than the on-device VAD which fires "No speech detected".
         return request
     }
 
@@ -246,9 +246,16 @@ final class SystemAudioCaptureService: Service {
 
                 if let error, self.isCapturing {
                     let ns = error as NSError
-                    // Code 301 = cancellation — not a real error; swallow it.
+                    // 301 = cancellation (expected on stop) — ignore.
+                    // All other codes are transient; restart so participant audio
+                    // keeps flowing. Never let a single "No speech detected" (209)
+                    // kill the whole system-audio channel for the rest of the meeting.
                     if ns.code != 301 {
-                        print("[SystemAudio] recognition error (non-fatal — mic recording unaffected): code=\(ns.code) \(error.localizedDescription)")
+                        print("[SystemAudio] recognition error — restarting session: code=\(ns.code) \(error.localizedDescription)")
+                        let next = self.buildRecognitionRequest(recognizer: recognizer)
+                        self.tapState.updateRequest(next)
+                        self.recognitionTask = nil
+                        self.startRecognitionTask(with: recognizer, request: next)
                     }
                 }
             }

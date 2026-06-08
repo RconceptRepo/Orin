@@ -307,12 +307,18 @@ final class TranscriptStore: Service {
         // After sleep: re-read live (recognition may have delivered a final chunk)
         let freshLive = liveTranscript
 
-        // Best-of-N: pick the longest non-empty transcript
-        let candidates = [freshLive, snapshotLive, snapshotPersisted, snapshotModel]
+        // Rebuild from TranscriptChunks — covers the case where recognition died
+        // mid-session (e.g. "No speech detected") but chunks kept accumulating.
+        // Each chunk stores the full cumulative text for its speaker channel, so
+        // latest mic + latest participant together represent the best available transcript.
+        let chunkText = latestTextFromChunks(meetingID: meeting.id, context: context)
+
+        // Best-of-N: pick the longest non-empty transcript across all candidates
+        let candidates = [freshLive, snapshotLive, snapshotPersisted, snapshotModel, chunkText]
             .filter { !$0.isEmpty }
         let finalText = candidates.max(by: { $0.count < $1.count }) ?? ""
 
-        log.info("finalize candidates: fresh=\(freshLive.count) snapshot=\(snapshotLive.count) persisted=\(snapshotPersisted.count) model=\(snapshotModel.count) → selected=\(finalText.count)")
+        log.info("finalize candidates: fresh=\(freshLive.count) snapshot=\(snapshotLive.count) persisted=\(snapshotPersisted.count) model=\(snapshotModel.count) chunks=\(chunkText.count) → selected=\(finalText.count)")
 
         // Integrity: never truncate the model (write only if longer or equal)
         if finalText.isEmpty {
@@ -447,11 +453,11 @@ final class TranscriptStore: Service {
         log.info("ORPHAN RECOVERY: complete meeting='\(meeting.title)'")
     }
 
-    /// Reconstructs a transcript from `TranscriptChunk` records for `meetingID`.
+    /// Fetches the latest mic + participant `TranscriptChunk` records and merges them.
     ///
-    /// Fetches the most recent "mic" and "participant" chunks and merges them.
-    /// Returns `""` if no chunks exist (e.g., meeting just started before first chunk).
-    private func rebuildFromChunks(meetingID: UUID, context: ModelContext) -> String {
+    /// Used both during normal `finalize()` (covers recognition-died-mid-session cases)
+    /// and during orphan recovery on relaunch.  Returns `""` if no chunks exist.
+    private func latestTextFromChunks(meetingID: UUID, context: ModelContext) -> String {
         let chunkDescriptor = FetchDescriptor<TranscriptChunk>(
             predicate: #Predicate { $0.meetingId == meetingID },
             sortBy: [SortDescriptor(\.timestamp, order: .reverse)]
@@ -462,8 +468,14 @@ final class TranscriptStore: Service {
         let latestMic = chunks.first { $0.speaker == "mic" }?.text ?? ""
         let latestParticipant = chunks.first { $0.speaker == "participant" }?.text ?? ""
         let rebuilt = TranscriptStore.mergeTranscripts(mic: latestMic, participant: latestParticipant)
-        log.info("ORPHAN RECOVERY: rebuilt from \(chunks.count) chunks → chars=\(rebuilt.count)")
+        log.info("latestTextFromChunks: rebuilt from \(chunks.count) chunks → chars=\(rebuilt.count)")
         return rebuilt
+    }
+
+    /// Reconstructs a transcript from `TranscriptChunk` records for `meetingID`.
+    /// Used by orphan recovery on relaunch after a crash/force-quit.
+    private func rebuildFromChunks(meetingID: UUID, context: ModelContext) -> String {
+        return latestTextFromChunks(meetingID: meetingID, context: context)
     }
 
     // MARK: - Testing support
