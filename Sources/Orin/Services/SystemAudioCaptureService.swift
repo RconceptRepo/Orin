@@ -206,9 +206,12 @@ final class SystemAudioCaptureService: Service {
     ) -> SFSpeechAudioBufferRecognitionRequest {
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
-        // Do NOT force requiresOnDeviceRecognition — system audio from video calls
-        // is compressed and may contain mixed languages; server-based recognition
-        // handles this far better than the on-device VAD which fires "No speech detected".
+        // On-device recognition when available — avoids network dependency.
+        // "No speech detected" (209) is now handled by a delayed restart rather
+        // than killing the session, so on-device VAD aggressiveness is tolerable.
+        if recognizer.supportsOnDeviceRecognition {
+            request.requiresOnDeviceRecognition = true
+        }
         return request
     }
 
@@ -247,15 +250,19 @@ final class SystemAudioCaptureService: Service {
                 if let error, self.isCapturing {
                     let ns = error as NSError
                     // 301 = cancellation (expected on stop) — ignore.
-                    // All other codes are transient; restart so participant audio
-                    // keeps flowing. Never let a single "No speech detected" (209)
-                    // kill the whole system-audio channel for the rest of the meeting.
+                    // All other errors are transient — restart with a 1-second delay.
+                    // The delay is essential: a zero-delay restart spins faster than
+                    // the VAD can detect speech, producing a silent no-transcript loop.
                     if ns.code != 301 {
-                        print("[SystemAudio] recognition error — restarting session: code=\(ns.code) \(error.localizedDescription)")
-                        let next = self.buildRecognitionRequest(recognizer: recognizer)
-                        self.tapState.updateRequest(next)
-                        self.recognitionTask = nil
-                        self.startRecognitionTask(with: recognizer, request: next)
+                        print("[SystemAudio] recognition error code=\(ns.code) — restarting in 1 s")
+                        Task { @MainActor [weak self] in
+                            try? await Task.sleep(nanoseconds: 1_000_000_000)
+                            guard let self, self.isCapturing else { return }
+                            let next = self.buildRecognitionRequest(recognizer: recognizer)
+                            self.tapState.updateRequest(next)
+                            self.recognitionTask = nil
+                            self.startRecognitionTask(with: recognizer, request: next)
+                        }
                     }
                 }
             }

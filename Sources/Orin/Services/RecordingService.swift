@@ -389,9 +389,12 @@ final class RecordingService: Service {
     ) -> SFSpeechAudioBufferRecognitionRequest {
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
-        // Do NOT force requiresOnDeviceRecognition — on-device VAD fires
-        // "No speech detected" aggressively on compressed/mixed-language call audio.
-        // Server-based recognition is more robust for real-world meeting audio.
+        // On-device recognition when available: avoids network dependency and
+        // responds faster. The recognizer fires "No speech detected" (209) on
+        // silence gaps, but we now restart silently with a delay rather than dying.
+        if recognizer.supportsOnDeviceRecognition {
+            request.requiresOnDeviceRecognition = true
+        }
         return request
     }
 
@@ -446,16 +449,21 @@ final class RecordingService: Service {
                 if let error, self.isRecording {
                     let nsError = error as NSError
                     // 301 = cancellation (expected on stopRecording) — ignore.
-                    // All other errors (209 "No speech detected", 203 "recognition failed",
-                    // etc.) are transient: restart the session so audio capture continues.
-                    // Never surface "No speech detected" to the UI — it fires on silence
-                    // gaps and would spam the user during normal pauses.
+                    // All other errors are transient (209 "No speech detected" fires on
+                    // silence gaps; 203 is a temporary recognition failure).
+                    // Restart with a 1-second delay — the delay is critical: a zero-delay
+                    // restart spins so fast the VAD never accumulates enough audio to
+                    // detect speech, producing a silent infinite loop with no transcript.
                     if nsError.code != 301 {
-                        print("[Transcript] recognition error — restarting session: code=\(nsError.code) \(error.localizedDescription)")
-                        let nextRequest = self.buildRecognitionRequest(recognizer: recognizer)
-                        self.tapState.updateRequest(nextRequest)
-                        self.recognitionTask = nil
-                        self.startRecognitionTask(with: recognizer, request: nextRequest)
+                        print("[Transcript] recognition error code=\(nsError.code) — restarting in 1 s")
+                        Task { @MainActor [weak self] in
+                            try? await Task.sleep(nanoseconds: 1_000_000_000)
+                            guard let self, self.isRecording else { return }
+                            let nextRequest = self.buildRecognitionRequest(recognizer: recognizer)
+                            self.tapState.updateRequest(nextRequest)
+                            self.recognitionTask = nil
+                            self.startRecognitionTask(with: recognizer, request: nextRequest)
+                        }
                     }
                 }
             }
