@@ -30,10 +30,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-XCPROJECT="$REPO_ROOT/Orin 2.xcodeproj"
+XCPROJECT="$REPO_ROOT/Orin.xcodeproj"
 BUILD_ROOT="$REPO_ROOT/build-xcode"
 DERIVED_DATA="$BUILD_ROOT"
-APP_PRODUCTS="$BUILD_ROOT/Build/Products/Debug"
+APP_PRODUCTS="$BUILD_ROOT/Build/Debug"
 STAGING_DIR="$BUILD_ROOT/dmg-staging-qa"
 TIMESTAMP=$(date +"%Y-%m-%d-%H%M")
 DMG_NAME="Orin-${TIMESTAMP}.dmg"
@@ -133,7 +133,7 @@ if [[ "$SKIP_BUILD" == false ]]; then
     # This provides Info.plist, compiled assets, and the correct bundle structure.
     TEMPLATE_APP=$(find "$APP_PRODUCTS" -maxdepth 1 -name "Orin.app" -type d 2>/dev/null | head -1)
     if [[ -z "$TEMPLATE_APP" || ! -d "$TEMPLATE_APP" ]]; then
-        die "No Xcode app bundle template found at:\n  $APP_PRODUCTS\n\nRun once to create it:\n  xcodebuild build -project \"Orin 2.xcodeproj\" -target Orin \\\\\n    CODE_SIGNING_ALLOWED=NO BUILD_DIR=\"$BUILD_ROOT/Build\"\nThen re-run this script."
+        die "No Xcode app bundle template found at:\n  $APP_PRODUCTS\n\nRun once to create it:\n  xcodebuild build -project \"Orin.xcodeproj\" -target Orin \\\\\n    CODE_SIGNING_ALLOWED=NO BUILD_DIR=\"$BUILD_ROOT/Build\"\nThen re-run this script."
     fi
 
     # Assemble the QA app in /tmp (outside iCloud/cloud-sync dirs) using ditto
