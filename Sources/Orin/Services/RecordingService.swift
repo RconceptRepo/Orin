@@ -462,11 +462,21 @@ final class RecordingService: Service {
                 if let error, self.isRecording {
                     let nsError = error as NSError
                     if nsError.code != 301 {
+                        // Save any partial transcript accumulated in this window before
+                        // restarting — critical for error 1110 (macOS 26 short-segment
+                        // boundary) which fires after ~1 s whether or not speech was
+                        // detected, replacing the old isFinal=true session-end signal.
+                        if !self.transcript.isEmpty {
+                            self.transcriptPrefix = self.transcript + " "
+                        }
                         let nextGen = self.recognitionGeneration + 1
                         self.recognitionGeneration = nextGen
-                        SessionLogger.shared.log("[Mic] error code=\(nsError.code) gen=\(gen) → nextGen=\(nextGen) restart in 1 s")
+                        // Error 1110 = macOS 26 on-device recognition segment boundary.
+                        // Restart in 50 ms (not 1 s) to keep pace with continuous speech.
+                        let delay: UInt64 = nsError.code == 1110 ? 50_000_000 : 1_000_000_000
+                        SessionLogger.shared.log("[Mic] error \(nsError.code) domain=\(nsError.domain) gen=\(gen) prefix=\(self.transcriptPrefix.count)ch restart in \(nsError.code == 1110 ? "50ms" : "1s")")
                         Task { @MainActor [weak self] in
-                            try? await Task.sleep(nanoseconds: 1_000_000_000)
+                            try? await Task.sleep(nanoseconds: delay)
                             guard let self, self.isRecording,
                                   self.recognitionGeneration == nextGen else { return }
                             let nextRequest = self.buildRecognitionRequest(recognizer: recognizer)

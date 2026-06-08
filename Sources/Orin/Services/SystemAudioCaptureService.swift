@@ -84,16 +84,22 @@ final class SystemAudioCaptureService: Service {
             print("[SystemAudio] startCapturing already in progress — ignored")
             return
         }
+        // Set isCapturing = true BEFORE the first await so a concurrent call
+        // cannot slip past the guard above while SCShareableContent is fetched.
+        // Reset to false in every early-return path below.
+        isCapturing = true
 
         print("[SystemAudio] starting system audio capture meetingID=\(String(describing: meetingID))")
 
         // Speech recognizer must be ready before we open the stream
         guard SFSpeechRecognizer.authorizationStatus() == .authorized else {
             print("[SystemAudio] speech not authorized — system audio skipped (mic-only)")
+            isCapturing = false
             return
         }
         guard let recognizer = speechRecognizer, recognizer.isAvailable else {
             print("[SystemAudio] speech recognizer unavailable — system audio skipped")
+            isCapturing = false
             return
         }
 
@@ -105,11 +111,13 @@ final class SystemAudioCaptureService: Service {
             )
         } catch {
             print("[SystemAudio] SCShareableContent failed (Screen Recording permission denied?): \(error) — mic-only fallback")
+            isCapturing = false
             return
         }
 
         guard let display = content.displays.first else {
             print("[SystemAudio] no displays found — system audio skipped")
+            isCapturing = false
             return
         }
 
@@ -168,6 +176,7 @@ final class SystemAudioCaptureService: Service {
         } catch {
             // Non-fatal: clean up and fall back to mic-only transcription
             print("[SystemAudio] SCStream start failed (mic-only fallback): \(error)")
+            isCapturing = false
             tapState.disarm()
             recognitionTask?.cancel()
             recognitionTask = nil
@@ -264,11 +273,15 @@ final class SystemAudioCaptureService: Service {
                 if let error, self.isCapturing {
                     let ns = error as NSError
                     if ns.code != 301 {
+                        if !self.transcript.isEmpty {
+                            self.transcriptPrefix = self.transcript + " "
+                        }
                         let nextGen = self.recognitionGeneration + 1
                         self.recognitionGeneration = nextGen
-                        SessionLogger.shared.log("[Participant] error code=\(ns.code) gen=\(gen) → nextGen=\(nextGen) restart in 1 s")
+                        let delay: UInt64 = ns.code == 1110 ? 50_000_000 : 1_000_000_000
+                        SessionLogger.shared.log("[Participant] error \(ns.code) domain=\(ns.domain) gen=\(gen) prefix=\(self.transcriptPrefix.count)ch restart in \(ns.code == 1110 ? "50ms" : "1s")")
                         Task { @MainActor [weak self] in
-                            try? await Task.sleep(nanoseconds: 1_000_000_000)
+                            try? await Task.sleep(nanoseconds: delay)
                             guard let self, self.isCapturing,
                                   self.recognitionGeneration == nextGen else { return }
                             let next = self.buildRecognitionRequest(recognizer: recognizer)
