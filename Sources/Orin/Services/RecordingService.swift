@@ -1,6 +1,7 @@
 import AVFoundation
 import CoreAudio
 import Foundation
+import OSLog
 import Observation
 import Speech
 
@@ -121,8 +122,13 @@ final class RecordingService: Service {
     private nonisolated(unsafe) var durationTimer: Timer?
 
     private var transcriptPrefix = ""
-    /// Count of partial-result callbacks received in the current session; for logging only.
     @ObservationIgnored private var transcriptChunkCount = 0
+    /// Monotonically-increasing counter; incremented on every recognition restart.
+    /// Each `startRecognitionTask` call captures the current value as `gen`.
+    /// Callbacks from superseded tasks (stale gen) are discarded before they
+    /// can schedule duplicate restarts that kill the in-flight session.
+    @ObservationIgnored private var recognitionGeneration = 0
+    private let logger = Logger(subsystem: "com.clavrit.orin", category: "RecordingService")
 
     // MARK: - Private — cross-thread state
 
@@ -259,10 +265,12 @@ final class RecordingService: Service {
         }
         print("STEP 4: format valid — sampleRate=\(format.sampleRate) channels=\(format.channelCount)")
 
-        activeMeetingID  = meetingID
-        transcriptPrefix = ""
+        activeMeetingID      = meetingID
+        transcriptPrefix     = ""
         transcriptChunkCount = 0
-        print("[Transcript] session started meetingID=\(String(describing: meetingID))")
+        recognitionGeneration = 0
+        SessionLogger.shared.startSession()
+        SessionLogger.shared.log("[Mic] session started meetingID=\(String(describing: meetingID))")
 
         // Create the on-disk file before arming the tap state.  If this fails,
         // no tap is installed and no hardware is left in a partial state.
@@ -373,7 +381,10 @@ final class RecordingService: Service {
         }
 
         phase = .idle
-        print("[Transcript] finalized url=\(recordingURL?.lastPathComponent ?? "nil") chars=\(transcript.count) speakerChars=\(speakerTranscript.count)")
+        let finalChars = transcript.count
+        logger.info("stopped url=\(self.recordingURL?.lastPathComponent ?? "nil", privacy: .public) chars=\(finalChars)")
+        SessionLogger.shared.log("[Mic] stopped url=\(self.recordingURL?.lastPathComponent ?? "nil") chars=\(finalChars)")
+        SessionLogger.shared.endSession()
     }
 
     @MainActor
@@ -398,27 +409,30 @@ final class RecordingService: Service {
         return request
     }
 
-    /// Starts a `SFSpeechRecognitionTask` for `request` and stores it in
-    /// `recognitionTask`.  The callback transparently restarts the session
-    /// when Apple's ~60-second network limit is reached.
+    /// Starts a `SFSpeechRecognitionTask` for `request`.
+    ///
+    /// **Generation counter** (`recognitionGeneration`): each call captures the
+    /// current generation as `gen`.  Any callback that fires after a restart has
+    /// already incremented the counter will see `gen != recognitionGeneration` and
+    /// return immediately.  This prevents the duplicate-restart race where multiple
+    /// stale error callbacks each schedule a 1-second-delayed restart, and those
+    /// restarts then kill the live session — producing only 1-2 words per meeting.
+    ///
+    /// **Direct TranscriptStore update**: transcript is pushed to `TranscriptStore`
+    /// on every partial result directly from this service, bypassing SwiftUI's
+    /// `onChange` handlers.  This ensures updates are delivered even when the main
+    /// window is closed or the view is not in the render tree.
     @MainActor
     private func startRecognitionTask(
         with recognizer: SFSpeechRecognizer,
         request: SFSpeechAudioBufferRecognitionRequest
     ) {
+        let gen = recognitionGeneration
         recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
-            // CRITICAL FIX: Task { @MainActor in } replaces DispatchQueue.main.async.
-            //
-            // `DispatchQueue.main.async` dispatches onto the main *thread* but does NOT
-            // create a Swift Concurrency actor task.  On macOS 26, @Query.update() calls
-            // swift_task_isCurrentExecutorWithFlagsImpl to verify it is executing within
-            // a Swift main actor task.  A GCD callback has no current task, so the runtime
-            // dereferences a stale executor pointer → PAC authentication trap → EXC_BREAKPOINT.
-            //
-            // `Task { @MainActor in }` schedules work on the Swift main actor's executor,
-            // creating a proper task context that satisfies the runtime invariant.
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                guard let self, self.recognitionGeneration == gen else {
+                    return  // stale callback from a superseded recognition session
+                }
 
                 if let result {
                     let segment = result.bestTranscription.formattedString
@@ -426,38 +440,35 @@ final class RecordingService: Service {
                         ? segment
                         : self.transcriptPrefix + segment
                     self.transcriptChunkCount += 1
-                    print("[Transcript] chunk #\(self.transcriptChunkCount) received chars=\(segment.count) isFinal=\(result.isFinal) totalChars=\(self.transcript.count)")
+                    SessionLogger.shared.log("[Mic] chunk #\(self.transcriptChunkCount) gen=\(gen) chars=\(segment.count) isFinal=\(result.isFinal) total=\(self.transcript.count)")
+                    // Push directly — does not require the main window to be open.
+                    ServiceContainer.shared.resolve(TranscriptStore.self)
+                        .updateMic(self.speakerTranscript)
                 }
 
-                // isFinal restart takes full ownership of session teardown.
-                // When Apple's 60-second limit is hit, SFSpeechRecognizer delivers
-                // BOTH result.isFinal == true AND a non-nil error (code 203/209) in
-                // the same callback invocation. Without the `return` below, the error
-                // block also fires and schedules a second restart 1 second later —
-                // killing the freshly-started session before it can accumulate audio,
-                // leaving each window with only a word or two of transcript.
                 if result?.isFinal == true, self.isRecording {
-                    print("[Transcript] segment finalised — restarting recognition session totalChars=\(self.transcript.count)")
+                    SessionLogger.shared.log("[Mic] isFinal gen=\(gen) total=\(self.transcript.count) — starting gen \(gen + 1)")
                     if !self.transcript.isEmpty {
                         self.transcriptPrefix = self.transcript + " "
                     }
+                    self.recognitionGeneration += 1
                     let nextRequest = self.buildRecognitionRequest(recognizer: recognizer)
                     self.tapState.updateRequest(nextRequest)
                     self.recognitionTask = nil
                     self.startRecognitionTask(with: recognizer, request: nextRequest)
-                    return  // ← prevents error block from firing a duplicate restart
+                    return
                 }
 
                 if let error, self.isRecording {
                     let nsError = error as NSError
-                    // 301 = cancellation (expected on stopRecording) — ignore.
-                    // All other error codes are transient; restart with a 1-second delay
-                    // so the VAD has enough audio to detect speech before deciding again.
                     if nsError.code != 301 {
-                        print("[Transcript] recognition error code=\(nsError.code) — restarting in 1 s")
+                        let nextGen = self.recognitionGeneration + 1
+                        self.recognitionGeneration = nextGen
+                        SessionLogger.shared.log("[Mic] error code=\(nsError.code) gen=\(gen) → nextGen=\(nextGen) restart in 1 s")
                         Task { @MainActor [weak self] in
                             try? await Task.sleep(nanoseconds: 1_000_000_000)
-                            guard let self, self.isRecording else { return }
+                            guard let self, self.isRecording,
+                                  self.recognitionGeneration == nextGen else { return }
                             let nextRequest = self.buildRecognitionRequest(recognizer: recognizer)
                             self.tapState.updateRequest(nextRequest)
                             self.recognitionTask = nil

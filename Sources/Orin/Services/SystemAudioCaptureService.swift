@@ -1,6 +1,7 @@
 import AVFoundation
 import CoreMedia
 import Foundation
+import OSLog
 import Observation
 import ScreenCaptureKit
 import Speech
@@ -66,6 +67,8 @@ final class SystemAudioCaptureService: Service {
 
     private var transcriptPrefix = ""
     @ObservationIgnored private var chunkCount = 0
+    @ObservationIgnored private var recognitionGeneration = 0
+    private let logger = Logger(subsystem: "com.clavrit.orin", category: "SystemAudioService")
 
     // MARK: - Capture Lifecycle
 
@@ -111,9 +114,12 @@ final class SystemAudioCaptureService: Service {
         }
 
         // Reset per-session state
-        transcriptPrefix = ""
-        chunkCount       = 0
-        transcript       = ""
+        transcriptPrefix      = ""
+        chunkCount            = 0
+        transcript            = ""
+        recognitionGeneration = 0
+        SessionLogger.shared.startSession()
+        SessionLogger.shared.log("[Participant] capture started meetingID=\(String(describing: meetingID))")
 
         // Arm tap state with first recognition request BEFORE stream starts,
         // so the first audio buffer is not lost.
@@ -216,50 +222,55 @@ final class SystemAudioCaptureService: Service {
     }
 
     /// Starts a recognition task and transparently restarts at the ~60-second
-    /// Apple network limit, identical to the pattern in `RecordingService`.
+    /// Apple limit.  Mirrors the generation-counter + direct-update pattern in
+    /// `RecordingService` — see that service for detailed commentary.
     @MainActor
     private func startRecognitionTask(
         with recognizer: SFSpeechRecognizer,
         request: SFSpeechAudioBufferRecognitionRequest
     ) {
+        let gen = recognitionGeneration
         recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                guard let self, self.recognitionGeneration == gen else {
+                    return  // stale callback from a superseded recognition session
+                }
 
                 if let result {
                     let segment = result.bestTranscription.formattedString
                     self.transcript = self.transcriptPrefix.isEmpty
                         ? segment
-                        : self.transcriptPrefix + " " + segment
+                        : self.transcriptPrefix + segment
                     self.chunkCount += 1
-                    print("[SystemAudio] chunk #\(self.chunkCount) segChars=\(segment.count) isFinal=\(result.isFinal) totalChars=\(self.transcript.count)")
+                    SessionLogger.shared.log("[Participant] chunk #\(self.chunkCount) gen=\(gen) chars=\(segment.count) isFinal=\(result.isFinal) total=\(self.transcript.count)")
+                    // Push directly — does not require the main window to be open.
+                    ServiceContainer.shared.resolve(TranscriptStore.self)
+                        .updateParticipant(self.participantSpeakerTranscript)
                 }
 
-                // isFinal restart takes full ownership — return prevents error block
-                // from firing a duplicate restart (same root cause as RecordingService:
-                // Apple delivers isFinal=true AND error 203/209 in the same callback
-                // when the 60-second limit is hit).
                 if result?.isFinal == true, self.isCapturing {
-                    print("[SystemAudio] segment finalized — restarting recognition totalChars=\(self.transcript.count)")
+                    SessionLogger.shared.log("[Participant] isFinal gen=\(gen) total=\(self.transcript.count) — starting gen \(gen + 1)")
                     if !self.transcript.isEmpty {
                         self.transcriptPrefix = self.transcript + " "
                     }
+                    self.recognitionGeneration += 1
                     let next = self.buildRecognitionRequest(recognizer: recognizer)
                     self.tapState.updateRequest(next)
                     self.recognitionTask = nil
                     self.startRecognitionTask(with: recognizer, request: next)
-                    return  // ← prevents error block from scheduling a duplicate restart
+                    return
                 }
 
                 if let error, self.isCapturing {
                     let ns = error as NSError
-                    // 301 = cancellation (expected on stop) — ignore.
-                    // All other errors are transient — restart with a 1-second delay.
                     if ns.code != 301 {
-                        print("[SystemAudio] recognition error code=\(ns.code) — restarting in 1 s")
+                        let nextGen = self.recognitionGeneration + 1
+                        self.recognitionGeneration = nextGen
+                        SessionLogger.shared.log("[Participant] error code=\(ns.code) gen=\(gen) → nextGen=\(nextGen) restart in 1 s")
                         Task { @MainActor [weak self] in
                             try? await Task.sleep(nanoseconds: 1_000_000_000)
-                            guard let self, self.isCapturing else { return }
+                            guard let self, self.isCapturing,
+                                  self.recognitionGeneration == nextGen else { return }
                             let next = self.buildRecognitionRequest(recognizer: recognizer)
                             self.tapState.updateRequest(next)
                             self.recognitionTask = nil
