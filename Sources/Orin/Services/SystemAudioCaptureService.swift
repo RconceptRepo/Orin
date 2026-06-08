@@ -235,24 +235,26 @@ final class SystemAudioCaptureService: Service {
                     print("[SystemAudio] chunk #\(self.chunkCount) segChars=\(segment.count) isFinal=\(result.isFinal) totalChars=\(self.transcript.count)")
                 }
 
-                // Transparent ~60-second session restart
+                // isFinal restart takes full ownership — return prevents error block
+                // from firing a duplicate restart (same root cause as RecordingService:
+                // Apple delivers isFinal=true AND error 203/209 in the same callback
+                // when the 60-second limit is hit).
                 if result?.isFinal == true, self.isCapturing {
                     print("[SystemAudio] segment finalized — restarting recognition totalChars=\(self.transcript.count)")
                     if !self.transcript.isEmpty {
-                        self.transcriptPrefix = self.transcript
+                        self.transcriptPrefix = self.transcript + " "
                     }
                     let next = self.buildRecognitionRequest(recognizer: recognizer)
                     self.tapState.updateRequest(next)
                     self.recognitionTask = nil
                     self.startRecognitionTask(with: recognizer, request: next)
+                    return  // ← prevents error block from scheduling a duplicate restart
                 }
 
                 if let error, self.isCapturing {
                     let ns = error as NSError
                     // 301 = cancellation (expected on stop) — ignore.
                     // All other errors are transient — restart with a 1-second delay.
-                    // The delay is essential: a zero-delay restart spins faster than
-                    // the VAD can detect speech, producing a silent no-transcript loop.
                     if ns.code != 301 {
                         print("[SystemAudio] recognition error code=\(ns.code) — restarting in 1 s")
                         Task { @MainActor [weak self] in

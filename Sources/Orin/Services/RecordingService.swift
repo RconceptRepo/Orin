@@ -429,31 +429,30 @@ final class RecordingService: Service {
                     print("[Transcript] chunk #\(self.transcriptChunkCount) received chars=\(segment.count) isFinal=\(result.isFinal) totalChars=\(self.transcript.count)")
                 }
 
-                // Apple's network recogniser ends sessions at ~60 s.
-                // Accumulate the finalised text and restart transparently.
-                // Guard on `isRecording` so a teardown-triggered final result
-                // does not re-arm a new session.
+                // isFinal restart takes full ownership of session teardown.
+                // When Apple's 60-second limit is hit, SFSpeechRecognizer delivers
+                // BOTH result.isFinal == true AND a non-nil error (code 203/209) in
+                // the same callback invocation. Without the `return` below, the error
+                // block also fires and schedules a second restart 1 second later —
+                // killing the freshly-started session before it can accumulate audio,
+                // leaving each window with only a word or two of transcript.
                 if result?.isFinal == true, self.isRecording {
                     print("[Transcript] segment finalised — restarting recognition session totalChars=\(self.transcript.count)")
                     if !self.transcript.isEmpty {
                         self.transcriptPrefix = self.transcript + " "
                     }
                     let nextRequest = self.buildRecognitionRequest(recognizer: recognizer)
-                    // Swap the live request inside TapState so the audio callback
-                    // feeds the new session from the very next buffer.
                     self.tapState.updateRequest(nextRequest)
                     self.recognitionTask = nil
                     self.startRecognitionTask(with: recognizer, request: nextRequest)
+                    return  // ← prevents error block from firing a duplicate restart
                 }
 
                 if let error, self.isRecording {
                     let nsError = error as NSError
                     // 301 = cancellation (expected on stopRecording) — ignore.
-                    // All other errors are transient (209 "No speech detected" fires on
-                    // silence gaps; 203 is a temporary recognition failure).
-                    // Restart with a 1-second delay — the delay is critical: a zero-delay
-                    // restart spins so fast the VAD never accumulates enough audio to
-                    // detect speech, producing a silent infinite loop with no transcript.
+                    // All other error codes are transient; restart with a 1-second delay
+                    // so the VAD has enough audio to detect speech before deciding again.
                     if nsError.code != 301 {
                         print("[Transcript] recognition error code=\(nsError.code) — restarting in 1 s")
                         Task { @MainActor [weak self] in
