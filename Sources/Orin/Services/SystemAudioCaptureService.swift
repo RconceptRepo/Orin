@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreGraphics
 import CoreMedia
 import Foundation
 import OSLog
@@ -138,7 +139,11 @@ final class SystemAudioCaptureService: Service {
         // Fetch shareable content — requires Screen Recording permission.
         // On macOS 14+ this does NOT show a permission dialog; the user must
         // enable Screen Recording in System Settings → Privacy & Security.
-        SessionLogger.shared.log("[Participant] STEP_03 calling SCShareableContent")
+        let cgPreflight = CGPreflightScreenCaptureAccess()
+        SessionLogger.shared.log(
+            "[Participant] STEP_03 calling SCShareableContent"
+            + " CGPreflightScreenCaptureAccess=\(cgPreflight)"
+        )
         let content: SCShareableContent
         do {
             content = try await SCShareableContent.excludingDesktopWindows(
