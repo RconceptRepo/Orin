@@ -70,6 +70,11 @@ final class SystemAudioCaptureService: Service {
     @ObservationIgnored private var chunkCount = 0
     @ObservationIgnored private var recognitionGeneration = 0
     @ObservationIgnored private var generationHadSpeech = false
+    /// Counts how many callbacks would have triggered the removed utterance-boundary
+    /// heuristic this session. Reset at session start.
+    @ObservationIgnored private var probeHeuristicFireCount = 0
+    /// Cumulative extra characters the heuristic would have injected. Reset at start.
+    @ObservationIgnored private var probeHeuristicExtraChars = 0
     private let logger = Logger(subsystem: "com.clavrit.orin", category: "SystemAudioService")
 
     // MARK: - Capture Lifecycle
@@ -185,10 +190,12 @@ final class SystemAudioCaptureService: Service {
         SessionLogger.shared.log("[Participant] STEP_05 display selected id=\(display.displayID)")
 
         // Reset per-session state
-        transcriptPrefix      = ""
-        chunkCount            = 0
-        transcript            = ""
-        recognitionGeneration = 0
+        transcriptPrefix         = ""
+        chunkCount               = 0
+        transcript               = ""
+        recognitionGeneration    = 0
+        probeHeuristicFireCount  = 0
+        probeHeuristicExtraChars = 0
         RecognitionDiagnostics.shared.resetParticipantChannel(
             authStatus: speechAuth,
             recognizerAvailable: recognizer.isAvailable,
@@ -283,6 +290,12 @@ final class SystemAudioCaptureService: Service {
             return
         }
         print("[SystemAudio] stopping — transcriptChars=\(transcript.count)")
+        SessionLogger.shared.log(
+            "[Participant] HEURISTIC-PROBE SESSION TOTAL"
+            + " fires=\(probeHeuristicFireCount)"
+            + " totalExtraChars=\(probeHeuristicExtraChars)"
+            + " finalTranscriptChars=\(transcript.count)"
+        )
         isCapturing = false
 
         // Stop stream asynchronously; errors are logged but non-fatal
@@ -352,6 +365,38 @@ final class SystemAudioCaptureService: Service {
                     let segment = result.bestTranscription.formattedString
                     let prevTotal = self.transcript.count
                     let prevInGen = prevTotal - self.transcriptPrefix.count
+                    let candidateTotal = self.transcriptPrefix.count + segment.count
+
+                    // ── HEURISTIC PROBE (read-only) ────────────────────────────────────
+                    // Reproduce the exact condition of the removed utterance-boundary
+                    // heuristic and log every case where it would have fired, together
+                    // with the extra characters it would have injected.  State is never
+                    // modified here — this is purely observational instrumentation.
+                    if !self.transcript.isEmpty,
+                       candidateTotal < self.transcript.count,
+                       segment.count <= 20 {
+                        // Extra chars the heuristic would inject:
+                        //   new transcript = (old_transcript + " ") + segment
+                        //   correct result = transcriptPrefix             + segment
+                        //   extra          = old_transcript.count + 1 - transcriptPrefix.count
+                        let extraChars = prevInGen + 1
+                        self.probeHeuristicFireCount  += 1
+                        self.probeHeuristicExtraChars += extraChars
+                        let beforeSnip = String(self.transcript.prefix(100))
+                        let afterHeuristic = self.transcript + " " + segment
+                        let afterSnip  = String(afterHeuristic.prefix(100))
+                        SessionLogger.shared.log(
+                            "[Participant] HEURISTIC-PROBE fire #\(self.probeHeuristicFireCount)"
+                            + " chunk=\(self.chunkCount + 1) gen=\(gen)"
+                            + " prevTotal=\(prevTotal) segLen=\(segment.count)"
+                            + " candidateTotal=\(candidateTotal) prefixLen=\(self.transcriptPrefix.count)"
+                            + " extraChars=\(extraChars) cumulativeExtra=\(self.probeHeuristicExtraChars)"
+                        )
+                        SessionLogger.shared.log("[Participant] HEURISTIC-PROBE before: \(beforeSnip)")
+                        SessionLogger.shared.log("[Participant] HEURISTIC-PROBE after:  \(afterSnip)")
+                    }
+                    // ── END PROBE ──────────────────────────────────────────────────────
+
                     // bestTranscription.formattedString is the complete current-best
                     // transcription of this gen's audio — each callback REPLACES the
                     // in-gen portion, it does not append. Prefix is only updated at

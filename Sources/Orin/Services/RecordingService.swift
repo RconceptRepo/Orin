@@ -132,6 +132,11 @@ final class RecordingService: Service {
     /// Used to distinguish a segment-boundary 1110 (speech was heard → restart fast)
     /// from a startup-silence 1110 (no speech yet → back off 2 s to avoid tight loop).
     @ObservationIgnored private var generationHadSpeech = false
+    /// Counts how many callbacks would have triggered the removed utterance-boundary
+    /// heuristic this session. Reset at session start.
+    @ObservationIgnored private var probeHeuristicFireCount = 0
+    /// Cumulative extra characters the heuristic would have injected. Reset at start.
+    @ObservationIgnored private var probeHeuristicExtraChars = 0
     private let logger = Logger(subsystem: "com.clavrit.orin", category: "RecordingService")
 
     // MARK: - Private — cross-thread state
@@ -269,10 +274,12 @@ final class RecordingService: Service {
         }
         print("STEP 4: format valid — sampleRate=\(format.sampleRate) channels=\(format.channelCount)")
 
-        activeMeetingID      = meetingID
-        transcriptPrefix     = ""
-        transcriptChunkCount = 0
-        recognitionGeneration = 0
+        activeMeetingID          = meetingID
+        transcriptPrefix         = ""
+        transcriptChunkCount     = 0
+        recognitionGeneration    = 0
+        probeHeuristicFireCount  = 0
+        probeHeuristicExtraChars = 0
         SessionLogger.shared.startSession()
         SessionLogger.shared.log("[Mic] session started meetingID=\(String(describing: meetingID))")
         RecognitionDiagnostics.shared.resetMicChannel(
@@ -352,6 +359,12 @@ final class RecordingService: Service {
         // handlers, without risking a double-teardown or double-removeTap crash.
         guard phase == .recording || phase == .starting else { return }
         print("[Recording] stopRecording called phase=\(phase) chunks=\(transcriptChunkCount) transcriptChars=\(transcript.count)")
+        SessionLogger.shared.log(
+            "[Mic] HEURISTIC-PROBE SESSION TOTAL"
+            + " fires=\(probeHeuristicFireCount)"
+            + " totalExtraChars=\(probeHeuristicExtraChars)"
+            + " finalTranscriptChars=\(transcript.count)"
+        )
         phase = .stopping
 
         durationTimer?.invalidate()
@@ -466,6 +479,30 @@ final class RecordingService: Service {
                     let segment = result.bestTranscription.formattedString
                     let prevTotal = self.transcript.count
                     let prevInGen = prevTotal - self.transcriptPrefix.count
+                    let candidateTotal = self.transcriptPrefix.count + segment.count
+
+                    // ── HEURISTIC PROBE (read-only) ────────────────────────────────────
+                    if !self.transcript.isEmpty,
+                       candidateTotal < self.transcript.count,
+                       segment.count <= 20 {
+                        let extraChars = prevInGen + 1
+                        self.probeHeuristicFireCount  += 1
+                        self.probeHeuristicExtraChars += extraChars
+                        let beforeSnip = String(self.transcript.prefix(100))
+                        let afterHeuristic = self.transcript + " " + segment
+                        let afterSnip  = String(afterHeuristic.prefix(100))
+                        SessionLogger.shared.log(
+                            "[Mic] HEURISTIC-PROBE fire #\(self.probeHeuristicFireCount)"
+                            + " chunk=\(self.transcriptChunkCount + 1) gen=\(gen)"
+                            + " prevTotal=\(prevTotal) segLen=\(segment.count)"
+                            + " candidateTotal=\(candidateTotal) prefixLen=\(self.transcriptPrefix.count)"
+                            + " extraChars=\(extraChars) cumulativeExtra=\(self.probeHeuristicExtraChars)"
+                        )
+                        SessionLogger.shared.log("[Mic] HEURISTIC-PROBE before: \(beforeSnip)")
+                        SessionLogger.shared.log("[Mic] HEURISTIC-PROBE after:  \(afterSnip)")
+                    }
+                    // ── END PROBE ──────────────────────────────────────────────────────
+
                     // bestTranscription.formattedString is the complete current-best
                     // transcription of this gen's audio — each callback REPLACES the
                     // in-gen portion, it does not append. Prefix is only updated at
