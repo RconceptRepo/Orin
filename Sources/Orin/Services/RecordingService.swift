@@ -464,18 +464,24 @@ final class RecordingService: Service {
                     RecognitionDiagnostics.shared.micRecognitionCallback()
                     self.generationHadSpeech = true
                     let segment = result.bestTranscription.formattedString
-                    let candidateTotal = self.transcriptPrefix.count + segment.count
-                    if !self.transcript.isEmpty,
-                       candidateTotal < self.transcript.count,
-                       segment.count <= 20 {
-                        SessionLogger.shared.log("[Mic] utterance boundary: saved \(self.transcript.count)ch → prefix, new seg=\(segment.count)ch")
-                        self.transcriptPrefix = self.transcript + " "
-                    }
+                    let prevTotal = self.transcript.count
+                    let prevInGen = prevTotal - self.transcriptPrefix.count
+                    // bestTranscription.formattedString is the complete current-best
+                    // transcription of this gen's audio — each callback REPLACES the
+                    // in-gen portion, it does not append. Prefix is only updated at
+                    // gen boundaries (1110 restart or isFinal), never inside a gen.
                     self.transcript = self.transcriptPrefix.isEmpty
                         ? segment
                         : self.transcriptPrefix + segment
                     self.transcriptChunkCount += 1
-                    SessionLogger.shared.log("[Mic] chunk #\(self.transcriptChunkCount) gen=\(gen) chars=\(segment.count) isFinal=\(result.isFinal) total=\(self.transcript.count)")
+                    let delta = self.transcript.count - prevTotal
+                    let retracted = max(0, prevInGen - segment.count)
+                    SessionLogger.shared.log(
+                        "[Mic] chunk #\(self.transcriptChunkCount) gen=\(gen)"
+                        + " seg=\(segment.count) prev=\(prevTotal) total=\(self.transcript.count)"
+                        + " delta=\(delta >= 0 ? "+\(delta)" : "\(delta)") retracted=\(retracted)"
+                        + " isFinal=\(result.isFinal)"
+                    )
                     ServiceContainer.shared.resolve(TranscriptStore.self)
                         .updateMic(self.speakerTranscript)
                 }
