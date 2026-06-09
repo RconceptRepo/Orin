@@ -80,85 +80,134 @@ final class SystemAudioCaptureService: Service {
     ///  - No display is found
     ///  - `SCStream` fails to start
     func startCapturing(for meetingID: UUID?) async {
+        // Start session log before every guard so all exits are recorded.
+        // startSession() is idempotent — RecordingService may have already opened it.
+        SessionLogger.shared.startSession()
+
         guard !isCapturing else {
-            print("[SystemAudio] startCapturing already in progress — ignored")
+            SessionLogger.shared.log(
+                "[Participant] EXIT_01 already capturing"
+                + " auth=\(SFSpeechRecognizer.authorizationStatus().rawValue)"
+                + " recognizerAvail=\(speechRecognizer?.isAvailable ?? false)"
+            )
             return
         }
         // Set isCapturing = true BEFORE the first await so a concurrent call
         // cannot slip past the guard above while SCShareableContent is fetched.
-        // Reset to false in every early-return path below.
         isCapturing = true
 
-        // Start the session log immediately — BEFORE any guard — so that every
-        // early-return path can write a diagnostic entry to the log file.
-        // startSession() is idempotent; RecordingService may have already opened the file.
-        SessionLogger.shared.startSession()
-        SessionLogger.shared.log("[Participant] startCapturing called meetingID=\(String(describing: meetingID))")
+        let speechAuth = SFSpeechRecognizer.authorizationStatus()
+        SessionLogger.shared.log(
+            "[Participant] STEP_01 entered"
+            + " meetingID=\(String(describing: meetingID))"
+            + " auth=\(speechAuth.rawValue)"
+            + " recognizerNil=\(speechRecognizer == nil)"
+            + " recognizerAvail=\(speechRecognizer?.isAvailable ?? false)"
+        )
 
-        // Speech recognizer must be ready before we open the stream
-        let speechAuthStatus = SFSpeechRecognizer.authorizationStatus()
-        guard speechAuthStatus == .authorized else {
-            SessionLogger.shared.log("[Participant] EARLY RETURN: speech not authorized (status=\(speechAuthStatus.rawValue)) — mic-only fallback")
-            print("[SystemAudio] speech not authorized — system audio skipped (mic-only)")
+        guard speechAuth == .authorized else {
+            SessionLogger.shared.log(
+                "[Participant] EXIT_02 speech not authorized"
+                + " auth=\(speechAuth.rawValue)"
+                + " recognizerAvail=\(speechRecognizer?.isAvailable ?? false)"
+                + " displays=N/A SCKit=not_called"
+            )
             isCapturing = false
             return
         }
+
         guard let recognizer = speechRecognizer, recognizer.isAvailable else {
-            let avail = speechRecognizer?.isAvailable ?? false
-            SessionLogger.shared.log("[Participant] EARLY RETURN: speech recognizer nil=\(speechRecognizer == nil) available=\(avail) — mic-only fallback")
-            print("[SystemAudio] speech recognizer unavailable — system audio skipped")
+            SessionLogger.shared.log(
+                "[Participant] EXIT_03 recognizer nil or unavailable"
+                + " auth=\(speechAuth.rawValue)"
+                + " recognizerNil=\(speechRecognizer == nil)"
+                + " recognizerAvail=\(speechRecognizer?.isAvailable ?? false)"
+                + " displays=N/A SCKit=not_called"
+            )
             isCapturing = false
             return
         }
+
+        SessionLogger.shared.log(
+            "[Participant] STEP_02 recognizer ready"
+            + " locale=\(recognizer.locale.identifier)"
+            + " available=\(recognizer.isAvailable)"
+            + " supportsOnDevice=\(recognizer.supportsOnDeviceRecognition)"
+        )
 
         // Fetch shareable content — requires Screen Recording permission.
-        // On macOS 14+ this does NOT show a permission dialog; the user must manually
+        // On macOS 14+ this does NOT show a permission dialog; the user must
         // enable Screen Recording in System Settings → Privacy & Security.
+        SessionLogger.shared.log("[Participant] STEP_03 calling SCShareableContent")
         let content: SCShareableContent
         do {
             content = try await SCShareableContent.excludingDesktopWindows(
                 false, onScreenWindowsOnly: false
             )
         } catch {
-            SessionLogger.shared.log("[Participant] EARLY RETURN: SCShareableContent threw error=\(error) — Screen Recording permission likely denied. Grant it in System Settings → Privacy & Security → Screen Recording, then restart the app.")
-            print("[SystemAudio] SCShareableContent failed (Screen Recording permission denied?): \(error) — mic-only fallback")
+            let ns = error as NSError
+            SessionLogger.shared.log(
+                "[Participant] EXIT_04 SCShareableContent threw"
+                + " auth=\(speechAuth.rawValue)"
+                + " recognizerAvail=\(recognizer.isAvailable)"
+                + " displays=N/A"
+                + " SCKit=domain:\(ns.domain) code:\(ns.code) desc:\(ns.localizedDescription)"
+            )
             isCapturing = false
             return
         }
 
+        let displayCount = content.displays.count
+        SessionLogger.shared.log(
+            "[Participant] STEP_04 SCShareableContent ok"
+            + " displays=\(displayCount)"
+            + " windows=\(content.windows.count)"
+            + " apps=\(content.applications.count)"
+        )
+
         guard let display = content.displays.first else {
-            SessionLogger.shared.log("[Participant] EARLY RETURN: no displays found in SCShareableContent — system audio skipped")
-            print("[SystemAudio] no displays found — system audio skipped")
+            SessionLogger.shared.log(
+                "[Participant] EXIT_05 no displays found"
+                + " auth=\(speechAuth.rawValue)"
+                + " recognizerAvail=\(recognizer.isAvailable)"
+                + " displays=0 SCKit=ok"
+            )
             isCapturing = false
             return
         }
+
+        SessionLogger.shared.log("[Participant] STEP_05 display selected id=\(display.displayID)")
 
         // Reset per-session state
         transcriptPrefix      = ""
         chunkCount            = 0
         transcript            = ""
         recognitionGeneration = 0
-        SessionLogger.shared.log("[Participant] capture started meetingID=\(String(describing: meetingID))")
         RecognitionDiagnostics.shared.resetParticipantChannel(
-            authStatus: SFSpeechRecognizer.authorizationStatus(),
+            authStatus: speechAuth,
             recognizerAvailable: recognizer.isAvailable,
             supportsOnDevice: recognizer.supportsOnDeviceRecognition
         )
-        SessionLogger.shared.log("[Participant] recognizer available=\(recognizer.isAvailable) supportsOnDevice=\(recognizer.supportsOnDeviceRecognition) auth=\(SFSpeechRecognizer.authorizationStatus().rawValue)")
 
-        // Arm tap state with first recognition request BEFORE stream starts,
-        // so the first audio buffer is not lost.
+        // Arm tap state with recognition request BEFORE stream starts so the
+        // first audio buffer is not lost.
         let request = buildRecognitionRequest(recognizer: recognizer)
         tapState.arm(request: request)
+        SessionLogger.shared.log(
+            "[Participant] STEP_06 recognition task creating"
+            + " taskHint=\(request.taskHint.rawValue)"
+            + " partialResults=\(request.shouldReportPartialResults)"
+            + " requiresOnDevice=\(request.requiresOnDeviceRecognition)"
+        )
         startRecognitionTask(with: recognizer, request: request)
 
-        // Configure SCStream for audio only — minimal video dimensions to reduce overhead
+        // Configure SCStream for audio only — minimal video to reduce overhead
         let config = SCStreamConfiguration()
         config.capturesAudio = true
-        config.excludesCurrentProcessAudio = true   // exclude Orin's own playback (if any)
-        config.width                = 2             // 2 × 2 px video — keeps CPU usage near zero
+        config.excludesCurrentProcessAudio = true
+        config.width                = 2
         config.height               = 2
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 1)  // 1 fps max video
+        config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
 
         let filter = SCContentFilter(
             display: display,
@@ -166,10 +215,16 @@ final class SystemAudioCaptureService: Service {
             exceptingWindows: []
         )
 
+        SessionLogger.shared.log(
+            "[Participant] STEP_07 SCStream configured"
+            + " capturesAudio=\(config.capturesAudio)"
+            + " excludesCurrentProcess=\(config.excludesCurrentProcessAudio)"
+        )
+
         let delegate = SystemAudioStreamDelegate(tapState: tapState) { [weak self] error in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                print("[SystemAudio] stream stopped unexpectedly: \(error)")
+                SessionLogger.shared.log("[Participant] stream stopped unexpectedly: \(error)")
                 isCapturing = false
             }
         }
@@ -189,11 +244,22 @@ final class SystemAudioCaptureService: Service {
             stream      = newStream
             isCapturing = true
             isAvailable = true
-            print("[SystemAudio] capture started — screen recording active")
+            SessionLogger.shared.log(
+                "[Participant] STEP_08 stream started"
+                + " auth=\(speechAuth.rawValue)"
+                + " recognizerAvail=\(recognizer.isAvailable)"
+                + " supportsOnDevice=\(recognizer.supportsOnDeviceRecognition)"
+                + " displays=\(displayCount)"
+            )
         } catch {
-            // Non-fatal: clean up and fall back to mic-only transcription
-            SessionLogger.shared.log("[Participant] STREAM FAILED: SCStream.startCapture threw error=\(error) — mic-only fallback")
-            print("[SystemAudio] SCStream start failed (mic-only fallback): \(error)")
+            let ns = error as NSError
+            SessionLogger.shared.log(
+                "[Participant] EXIT_06 SCStream.startCapture failed"
+                + " auth=\(speechAuth.rawValue)"
+                + " recognizerAvail=\(recognizer.isAvailable)"
+                + " displays=\(displayCount)"
+                + " SCKit=domain:\(ns.domain) code:\(ns.code) desc:\(ns.localizedDescription)"
+            )
             isCapturing = false
             tapState.disarm()
             recognitionTask?.cancel()
