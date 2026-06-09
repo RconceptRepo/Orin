@@ -416,9 +416,10 @@ final class RecordingService: Service {
     ) -> SFSpeechAudioBufferRecognitionRequest {
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
-        if recognizer.supportsOnDeviceRecognition {
-            request.requiresOnDeviceRecognition = true
-        }
+        // Do NOT set requiresOnDeviceRecognition = true.
+        // On macOS 26, on-device recognition fires code 1110 every ~1.5 s as a segment
+        // boundary, forcing 21+ restarts/min and producing incoherent output.
+        // Server recognition supports 60-second continuous sessions without 1110.
         return request
     }
 
@@ -515,9 +516,9 @@ final class RecordingService: Service {
                         //   tight create→1110→restart spiral that blocks all transcription.
                         let hadSpeech = self.generationHadSpeech
                         let delay: UInt64 = nsError.code == 1110
-                            ? (hadSpeech ? 50_000_000 : 2_000_000_000)
+                            ? (hadSpeech ? 200_000_000 : 2_000_000_000)
                             : 1_000_000_000
-                        let delayLabel = nsError.code == 1110 ? (hadSpeech ? "50ms" : "2s") : "1s"
+                        let delayLabel = nsError.code == 1110 ? (hadSpeech ? "200ms" : "2s") : "1s"
                         SessionLogger.shared.log("[Mic] restarting gen=\(gen) → \(nextGen) in \(delayLabel) hadSpeech=\(hadSpeech) prefix=\(self.transcriptPrefix.count)ch")
                         Task { @MainActor [weak self] in
                             try? await Task.sleep(nanoseconds: delay)
