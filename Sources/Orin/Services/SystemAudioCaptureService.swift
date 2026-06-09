@@ -291,9 +291,9 @@ final class SystemAudioCaptureService: Service {
         }
         print("[SystemAudio] stopping — transcriptChars=\(transcript.count)")
         SessionLogger.shared.log(
-            "[Participant] HEURISTIC-PROBE SESSION TOTAL"
+            "[Participant] utterance-boundary SESSION TOTAL"
             + " fires=\(probeHeuristicFireCount)"
-            + " totalExtraChars=\(probeHeuristicExtraChars)"
+            + " savedExtraChars=\(probeHeuristicExtraChars)"
             + " finalTranscriptChars=\(transcript.count)"
         )
         isCapturing = false
@@ -325,10 +325,11 @@ final class SystemAudioCaptureService: Service {
     ) -> SFSpeechAudioBufferRecognitionRequest {
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
-        // Do NOT set requiresOnDeviceRecognition = true.
-        // On macOS 26, on-device recognition fires code 1110 every ~1.5 s as a segment
-        // boundary, forcing 21+ restarts/min and producing incoherent output.
-        // Server recognition supports 60-second continuous sessions without 1110.
+        // Force server recognition. On macOS 26 the SDK default is true (on-device),
+        // which fires code 1110 every ~1.5 s as VAD segment boundaries, causing 21+
+        // restarts/min and incoherent output. Server recognition runs 60-second
+        // continuous sessions without 1110.
+        request.requiresOnDeviceRecognition = false
         return request
     }
 
@@ -367,43 +368,35 @@ final class SystemAudioCaptureService: Service {
                     let prevInGen = prevTotal - self.transcriptPrefix.count
                     let candidateTotal = self.transcriptPrefix.count + segment.count
 
-                    // ── HEURISTIC PROBE (read-only) ────────────────────────────────────
-                    // Reproduce the exact condition of the removed utterance-boundary
-                    // heuristic and log every case where it would have fired, together
-                    // with the extra characters it would have injected.  State is never
-                    // modified here — this is purely observational instrumentation.
+                    // On macOS 26 server recognition, Apple resets the recognition
+                    // window at sentence boundaries without firing isFinal. When this
+                    // happens, formattedString shrinks back to a tiny partial of the
+                    // next sentence — if not caught, the full accumulated transcript
+                    // collapses to those few chars. Save the full accumulated text to
+                    // prefix before the window resets.
+                    // For partial results: discard the tiny segment rather than appending
+                    // it — appending would duplicate tail words of the committed prefix.
+                    // The segment reappears and grows naturally in the next callback.
                     if !self.transcript.isEmpty,
                        candidateTotal < self.transcript.count,
                        segment.count <= 20 {
-                        // Extra chars the heuristic would inject:
-                        //   new transcript = (old_transcript + " ") + segment
-                        //   correct result = transcriptPrefix             + segment
-                        //   extra          = old_transcript.count + 1 - transcriptPrefix.count
-                        let extraChars = prevInGen + 1
                         self.probeHeuristicFireCount  += 1
-                        self.probeHeuristicExtraChars += extraChars
-                        let beforeSnip = String(self.transcript.prefix(100))
-                        let afterHeuristic = self.transcript + " " + segment
-                        let afterSnip  = String(afterHeuristic.prefix(100))
+                        self.probeHeuristicExtraChars += (prevInGen + 1)
+                        self.transcriptPrefix = self.transcript + " "
+                        self.transcript = result.isFinal
+                            ? self.transcriptPrefix + segment
+                            : self.transcriptPrefix
                         SessionLogger.shared.log(
-                            "[Participant] HEURISTIC-PROBE fire #\(self.probeHeuristicFireCount)"
+                            "[Participant] utterance-boundary fire #\(self.probeHeuristicFireCount)"
                             + " chunk=\(self.chunkCount + 1) gen=\(gen)"
                             + " prevTotal=\(prevTotal) segLen=\(segment.count)"
-                            + " candidateTotal=\(candidateTotal) prefixLen=\(self.transcriptPrefix.count)"
-                            + " extraChars=\(extraChars) cumulativeExtra=\(self.probeHeuristicExtraChars)"
+                            + " isFinal=\(result.isFinal)"
                         )
-                        SessionLogger.shared.log("[Participant] HEURISTIC-PROBE before: \(beforeSnip)")
-                        SessionLogger.shared.log("[Participant] HEURISTIC-PROBE after:  \(afterSnip)")
+                    } else {
+                        self.transcript = self.transcriptPrefix.isEmpty
+                            ? segment
+                            : self.transcriptPrefix + segment
                     }
-                    // ── END PROBE ──────────────────────────────────────────────────────
-
-                    // bestTranscription.formattedString is the complete current-best
-                    // transcription of this gen's audio — each callback REPLACES the
-                    // in-gen portion, it does not append. Prefix is only updated at
-                    // gen boundaries (1110 restart or isFinal), never inside a gen.
-                    self.transcript = self.transcriptPrefix.isEmpty
-                        ? segment
-                        : self.transcriptPrefix + segment
                     self.chunkCount += 1
                     let delta = self.transcript.count - prevTotal
                     let retracted = max(0, prevInGen - segment.count)
