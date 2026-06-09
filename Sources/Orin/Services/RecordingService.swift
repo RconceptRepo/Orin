@@ -271,6 +271,13 @@ final class RecordingService: Service {
         recognitionGeneration = 0
         SessionLogger.shared.startSession()
         SessionLogger.shared.log("[Mic] session started meetingID=\(String(describing: meetingID))")
+        RecognitionDiagnostics.shared.resetMicChannel(
+            sessionID: meetingID?.uuidString ?? "none",
+            authStatus: SFSpeechRecognizer.authorizationStatus(),
+            recognizerAvailable: recognizer.isAvailable,
+            supportsOnDevice: recognizer.supportsOnDeviceRecognition
+        )
+        SessionLogger.shared.log("[Mic] recognizer available=\(recognizer.isAvailable) supportsOnDevice=\(recognizer.supportsOnDeviceRecognition) auth=\(SFSpeechRecognizer.authorizationStatus().rawValue)")
 
         // Create the on-disk file before arming the tap state.  If this fails,
         // no tap is installed and no hardware is left in a partial state.
@@ -356,6 +363,7 @@ final class RecordingService: Service {
         // the final-result callback sees `isRecording == false` and does not
         // attempt a transparent session restart.
         recognitionTask?.cancel()
+        RecognitionDiagnostics.shared.micTaskCancelled()
         recognitionTask = nil
 
         // `disarm` signals end-of-audio to the recogniser and releases the file.
@@ -384,6 +392,10 @@ final class RecordingService: Service {
         let finalChars = transcript.count
         logger.info("stopped url=\(self.recordingURL?.lastPathComponent ?? "nil", privacy: .public) chars=\(finalChars)")
         SessionLogger.shared.log("[Mic] stopped url=\(self.recordingURL?.lastPathComponent ?? "nil") chars=\(finalChars)")
+        let diagSummary = RecognitionDiagnostics.shared.save(logPath: SessionLogger.shared.currentLogPath)
+        for line in diagSummary.components(separatedBy: "\n") where !line.isEmpty {
+            SessionLogger.shared.log(line)
+        }
         SessionLogger.shared.endSession()
     }
 
@@ -400,9 +412,6 @@ final class RecordingService: Service {
     ) -> SFSpeechAudioBufferRecognitionRequest {
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
-        // On-device recognition when available: avoids network dependency and
-        // responds faster. The recognizer fires "No speech detected" (209) on
-        // silence gaps, but we now restart silently with a delay rather than dying.
         if recognizer.supportsOnDeviceRecognition {
             request.requiresOnDeviceRecognition = true
         }
@@ -427,7 +436,18 @@ final class RecordingService: Service {
         with recognizer: SFSpeechRecognizer,
         request: SFSpeechAudioBufferRecognitionRequest
     ) {
+        RecognitionDiagnostics.shared.micTaskCreated()
         let gen = recognitionGeneration
+        SessionLogger.shared.log(
+            "[Mic] task created gen=\(gen)"
+            + " locale=\(recognizer.locale.identifier)"
+            + " available=\(recognizer.isAvailable)"
+            + " supportsOnDevice=\(recognizer.supportsOnDeviceRecognition)"
+            + " auth=\(SFSpeechRecognizer.authorizationStatus().rawValue)"
+            + " taskHint=\(request.taskHint.rawValue)"
+            + " partialResults=\(request.shouldReportPartialResults)"
+            + " requiresOnDevice=\(request.requiresOnDeviceRecognition)"
+        )
         recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
             Task { @MainActor [weak self] in
                 guard let self, self.recognitionGeneration == gen else {
@@ -435,13 +455,20 @@ final class RecordingService: Service {
                 }
 
                 if let result {
+                    RecognitionDiagnostics.shared.micRecognitionCallback()
                     let segment = result.bestTranscription.formattedString
+                    let candidateTotal = self.transcriptPrefix.count + segment.count
+                    if !self.transcript.isEmpty,
+                       candidateTotal < self.transcript.count,
+                       segment.count <= 20 {
+                        SessionLogger.shared.log("[Mic] utterance boundary: saved \(self.transcript.count)ch → prefix, new seg=\(segment.count)ch")
+                        self.transcriptPrefix = self.transcript + " "
+                    }
                     self.transcript = self.transcriptPrefix.isEmpty
                         ? segment
                         : self.transcriptPrefix + segment
                     self.transcriptChunkCount += 1
                     SessionLogger.shared.log("[Mic] chunk #\(self.transcriptChunkCount) gen=\(gen) chars=\(segment.count) isFinal=\(result.isFinal) total=\(self.transcript.count)")
-                    // Push directly — does not require the main window to be open.
                     ServiceContainer.shared.resolve(TranscriptStore.self)
                         .updateMic(self.speakerTranscript)
                 }
@@ -454,6 +481,8 @@ final class RecordingService: Service {
                     self.recognitionGeneration += 1
                     let nextRequest = self.buildRecognitionRequest(recognizer: recognizer)
                     self.tapState.updateRequest(nextRequest)
+                    self.recognitionTask?.cancel()
+                    RecognitionDiagnostics.shared.micTaskCancelled()
                     self.recognitionTask = nil
                     self.startRecognitionTask(with: recognizer, request: nextRequest)
                     return
@@ -461,26 +490,29 @@ final class RecordingService: Service {
 
                 if let error, self.isRecording {
                     let nsError = error as NSError
+                    SessionLogger.shared.log(
+                        "[Mic] error gen=\(gen)"
+                        + " domain=\(nsError.domain)"
+                        + " code=\(nsError.code)"
+                        + " desc=\(nsError.localizedDescription)"
+                    )
                     if nsError.code != 301 {
-                        // Save any partial transcript accumulated in this window before
-                        // restarting — critical for error 1110 (macOS 26 short-segment
-                        // boundary) which fires after ~1 s whether or not speech was
-                        // detected, replacing the old isFinal=true session-end signal.
+                        RecognitionDiagnostics.shared.micError(nsError.code)
                         if !self.transcript.isEmpty {
                             self.transcriptPrefix = self.transcript + " "
                         }
                         let nextGen = self.recognitionGeneration + 1
                         self.recognitionGeneration = nextGen
-                        // Error 1110 = macOS 26 on-device recognition segment boundary.
-                        // Restart in 50 ms (not 1 s) to keep pace with continuous speech.
                         let delay: UInt64 = nsError.code == 1110 ? 50_000_000 : 1_000_000_000
-                        SessionLogger.shared.log("[Mic] error \(nsError.code) domain=\(nsError.domain) gen=\(gen) prefix=\(self.transcriptPrefix.count)ch restart in \(nsError.code == 1110 ? "50ms" : "1s")")
+                        SessionLogger.shared.log("[Mic] restarting gen=\(gen) → \(nextGen) in \(nsError.code == 1110 ? "50ms" : "1s") prefix=\(self.transcriptPrefix.count)ch")
                         Task { @MainActor [weak self] in
                             try? await Task.sleep(nanoseconds: delay)
                             guard let self, self.isRecording,
                                   self.recognitionGeneration == nextGen else { return }
                             let nextRequest = self.buildRecognitionRequest(recognizer: recognizer)
                             self.tapState.updateRequest(nextRequest)
+                            self.recognitionTask?.cancel()
+                            RecognitionDiagnostics.shared.micTaskCancelled()
                             self.recognitionTask = nil
                             self.startRecognitionTask(with: recognizer, request: nextRequest)
                         }
@@ -497,6 +529,7 @@ final class RecordingService: Service {
     private func teardownAudioEngine() {
         audioEngine.inputNode.removeTap(onBus: 0)
         recognitionTask?.cancel()
+        RecognitionDiagnostics.shared.micTaskCancelled()
         recognitionTask = nil
         tapState.disarm()
     }

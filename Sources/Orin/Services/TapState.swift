@@ -100,7 +100,9 @@ final class TapState: @unchecked Sendable {
     /// them to the user instead of silently producing an incomplete or empty file.
     func feed(buffer: AVAudioPCMBuffer) {
         lock.withLock {
+            let didAppend = recognitionRequest != nil
             recognitionRequest?.append(buffer)
+            RecognitionDiagnostics.shared.micBufferReceived(appended: didAppend)
             do {
                 try audioFile?.write(from: buffer)
             } catch {

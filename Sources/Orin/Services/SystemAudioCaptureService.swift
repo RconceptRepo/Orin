@@ -89,33 +89,45 @@ final class SystemAudioCaptureService: Service {
         // Reset to false in every early-return path below.
         isCapturing = true
 
-        print("[SystemAudio] starting system audio capture meetingID=\(String(describing: meetingID))")
+        // Start the session log immediately — BEFORE any guard — so that every
+        // early-return path can write a diagnostic entry to the log file.
+        // startSession() is idempotent; RecordingService may have already opened the file.
+        SessionLogger.shared.startSession()
+        SessionLogger.shared.log("[Participant] startCapturing called meetingID=\(String(describing: meetingID))")
 
         // Speech recognizer must be ready before we open the stream
-        guard SFSpeechRecognizer.authorizationStatus() == .authorized else {
+        let speechAuthStatus = SFSpeechRecognizer.authorizationStatus()
+        guard speechAuthStatus == .authorized else {
+            SessionLogger.shared.log("[Participant] EARLY RETURN: speech not authorized (status=\(speechAuthStatus.rawValue)) — mic-only fallback")
             print("[SystemAudio] speech not authorized — system audio skipped (mic-only)")
             isCapturing = false
             return
         }
         guard let recognizer = speechRecognizer, recognizer.isAvailable else {
+            let avail = speechRecognizer?.isAvailable ?? false
+            SessionLogger.shared.log("[Participant] EARLY RETURN: speech recognizer nil=\(speechRecognizer == nil) available=\(avail) — mic-only fallback")
             print("[SystemAudio] speech recognizer unavailable — system audio skipped")
             isCapturing = false
             return
         }
 
-        // Fetch shareable content — triggers Screen Recording permission prompt if needed
+        // Fetch shareable content — requires Screen Recording permission.
+        // On macOS 14+ this does NOT show a permission dialog; the user must manually
+        // enable Screen Recording in System Settings → Privacy & Security.
         let content: SCShareableContent
         do {
             content = try await SCShareableContent.excludingDesktopWindows(
                 false, onScreenWindowsOnly: false
             )
         } catch {
+            SessionLogger.shared.log("[Participant] EARLY RETURN: SCShareableContent threw error=\(error) — Screen Recording permission likely denied. Grant it in System Settings → Privacy & Security → Screen Recording, then restart the app.")
             print("[SystemAudio] SCShareableContent failed (Screen Recording permission denied?): \(error) — mic-only fallback")
             isCapturing = false
             return
         }
 
         guard let display = content.displays.first else {
+            SessionLogger.shared.log("[Participant] EARLY RETURN: no displays found in SCShareableContent — system audio skipped")
             print("[SystemAudio] no displays found — system audio skipped")
             isCapturing = false
             return
@@ -126,8 +138,13 @@ final class SystemAudioCaptureService: Service {
         chunkCount            = 0
         transcript            = ""
         recognitionGeneration = 0
-        SessionLogger.shared.startSession()
         SessionLogger.shared.log("[Participant] capture started meetingID=\(String(describing: meetingID))")
+        RecognitionDiagnostics.shared.resetParticipantChannel(
+            authStatus: SFSpeechRecognizer.authorizationStatus(),
+            recognizerAvailable: recognizer.isAvailable,
+            supportsOnDevice: recognizer.supportsOnDeviceRecognition
+        )
+        SessionLogger.shared.log("[Participant] recognizer available=\(recognizer.isAvailable) supportsOnDevice=\(recognizer.supportsOnDeviceRecognition) auth=\(SFSpeechRecognizer.authorizationStatus().rawValue)")
 
         // Arm tap state with first recognition request BEFORE stream starts,
         // so the first audio buffer is not lost.
@@ -175,6 +192,7 @@ final class SystemAudioCaptureService: Service {
             print("[SystemAudio] capture started — screen recording active")
         } catch {
             // Non-fatal: clean up and fall back to mic-only transcription
+            SessionLogger.shared.log("[Participant] STREAM FAILED: SCStream.startCapture threw error=\(error) — mic-only fallback")
             print("[SystemAudio] SCStream start failed (mic-only fallback): \(error)")
             isCapturing = false
             tapState.disarm()
@@ -207,6 +225,7 @@ final class SystemAudioCaptureService: Service {
 
         // End recognition before clearing tap state
         recognitionTask?.cancel()
+        RecognitionDiagnostics.shared.participantTaskCancelled()
         recognitionTask = nil
         tapState.disarm()
         streamDelegate = nil
@@ -221,9 +240,6 @@ final class SystemAudioCaptureService: Service {
     ) -> SFSpeechAudioBufferRecognitionRequest {
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
-        // On-device recognition when available — avoids network dependency.
-        // "No speech detected" (209) is now handled by a delayed restart rather
-        // than killing the session, so on-device VAD aggressiveness is tolerable.
         if recognizer.supportsOnDeviceRecognition {
             request.requiresOnDeviceRecognition = true
         }
@@ -238,7 +254,18 @@ final class SystemAudioCaptureService: Service {
         with recognizer: SFSpeechRecognizer,
         request: SFSpeechAudioBufferRecognitionRequest
     ) {
+        RecognitionDiagnostics.shared.participantTaskCreated()
         let gen = recognitionGeneration
+        SessionLogger.shared.log(
+            "[Participant] task created gen=\(gen)"
+            + " locale=\(recognizer.locale.identifier)"
+            + " available=\(recognizer.isAvailable)"
+            + " supportsOnDevice=\(recognizer.supportsOnDeviceRecognition)"
+            + " auth=\(SFSpeechRecognizer.authorizationStatus().rawValue)"
+            + " taskHint=\(request.taskHint.rawValue)"
+            + " partialResults=\(request.shouldReportPartialResults)"
+            + " requiresOnDevice=\(request.requiresOnDeviceRecognition)"
+        )
         recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
             Task { @MainActor [weak self] in
                 guard let self, self.recognitionGeneration == gen else {
@@ -246,13 +273,20 @@ final class SystemAudioCaptureService: Service {
                 }
 
                 if let result {
+                    RecognitionDiagnostics.shared.participantRecognitionCallback()
                     let segment = result.bestTranscription.formattedString
+                    let candidateTotal = self.transcriptPrefix.count + segment.count
+                    if !self.transcript.isEmpty,
+                       candidateTotal < self.transcript.count,
+                       segment.count <= 20 {
+                        SessionLogger.shared.log("[Participant] utterance boundary: saved \(self.transcript.count)ch → prefix, new seg=\(segment.count)ch")
+                        self.transcriptPrefix = self.transcript + " "
+                    }
                     self.transcript = self.transcriptPrefix.isEmpty
                         ? segment
                         : self.transcriptPrefix + segment
                     self.chunkCount += 1
                     SessionLogger.shared.log("[Participant] chunk #\(self.chunkCount) gen=\(gen) chars=\(segment.count) isFinal=\(result.isFinal) total=\(self.transcript.count)")
-                    // Push directly — does not require the main window to be open.
                     ServiceContainer.shared.resolve(TranscriptStore.self)
                         .updateParticipant(self.participantSpeakerTranscript)
                 }
@@ -265,6 +299,8 @@ final class SystemAudioCaptureService: Service {
                     self.recognitionGeneration += 1
                     let next = self.buildRecognitionRequest(recognizer: recognizer)
                     self.tapState.updateRequest(next)
+                    self.recognitionTask?.cancel()
+                    RecognitionDiagnostics.shared.participantTaskCancelled()
                     self.recognitionTask = nil
                     self.startRecognitionTask(with: recognizer, request: next)
                     return
@@ -272,20 +308,29 @@ final class SystemAudioCaptureService: Service {
 
                 if let error, self.isCapturing {
                     let ns = error as NSError
+                    SessionLogger.shared.log(
+                        "[Participant] error gen=\(gen)"
+                        + " domain=\(ns.domain)"
+                        + " code=\(ns.code)"
+                        + " desc=\(ns.localizedDescription)"
+                    )
                     if ns.code != 301 {
+                        RecognitionDiagnostics.shared.participantError(ns.code)
                         if !self.transcript.isEmpty {
                             self.transcriptPrefix = self.transcript + " "
                         }
                         let nextGen = self.recognitionGeneration + 1
                         self.recognitionGeneration = nextGen
                         let delay: UInt64 = ns.code == 1110 ? 50_000_000 : 1_000_000_000
-                        SessionLogger.shared.log("[Participant] error \(ns.code) domain=\(ns.domain) gen=\(gen) prefix=\(self.transcriptPrefix.count)ch restart in \(ns.code == 1110 ? "50ms" : "1s")")
+                        SessionLogger.shared.log("[Participant] restarting gen=\(gen) → \(nextGen) in \(ns.code == 1110 ? "50ms" : "1s") prefix=\(self.transcriptPrefix.count)ch")
                         Task { @MainActor [weak self] in
                             try? await Task.sleep(nanoseconds: delay)
                             guard let self, self.isCapturing,
                                   self.recognitionGeneration == nextGen else { return }
                             let next = self.buildRecognitionRequest(recognizer: recognizer)
                             self.tapState.updateRequest(next)
+                            self.recognitionTask?.cancel()
+                            RecognitionDiagnostics.shared.participantTaskCancelled()
                             self.recognitionTask = nil
                             self.startRecognitionTask(with: recognizer, request: next)
                         }
@@ -323,7 +368,11 @@ private final class SystemAudioTapState: @unchecked Sendable {
     }
 
     func feed(_ buffer: AVAudioPCMBuffer) {
-        lock.withLock { recognitionRequest?.append(buffer) }
+        lock.withLock {
+            let didAppend = recognitionRequest != nil
+            recognitionRequest?.append(buffer)
+            RecognitionDiagnostics.shared.participantBufferReceived(appended: didAppend)
+        }
     }
 }
 
