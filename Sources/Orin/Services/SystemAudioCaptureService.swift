@@ -69,6 +69,7 @@ final class SystemAudioCaptureService: Service {
     private var transcriptPrefix = ""
     @ObservationIgnored private var chunkCount = 0
     @ObservationIgnored private var recognitionGeneration = 0
+    @ObservationIgnored private var generationHadSpeech = false
     private let logger = Logger(subsystem: "com.clavrit.orin", category: "SystemAudioService")
 
     // MARK: - Capture Lifecycle
@@ -326,6 +327,7 @@ final class SystemAudioCaptureService: Service {
         request: SFSpeechAudioBufferRecognitionRequest
     ) {
         RecognitionDiagnostics.shared.participantTaskCreated()
+        generationHadSpeech = false
         let gen = recognitionGeneration
         SessionLogger.shared.log(
             "[Participant] task created gen=\(gen)"
@@ -345,6 +347,7 @@ final class SystemAudioCaptureService: Service {
 
                 if let result {
                     RecognitionDiagnostics.shared.participantRecognitionCallback()
+                    self.generationHadSpeech = true
                     let segment = result.bestTranscription.formattedString
                     let candidateTotal = self.transcriptPrefix.count + segment.count
                     if !self.transcript.isEmpty,
@@ -392,8 +395,12 @@ final class SystemAudioCaptureService: Service {
                         }
                         let nextGen = self.recognitionGeneration + 1
                         self.recognitionGeneration = nextGen
-                        let delay: UInt64 = ns.code == 1110 ? 50_000_000 : 1_000_000_000
-                        SessionLogger.shared.log("[Participant] restarting gen=\(gen) → \(nextGen) in \(ns.code == 1110 ? "50ms" : "1s") prefix=\(self.transcriptPrefix.count)ch")
+                        let hadSpeech = self.generationHadSpeech
+                        let delay: UInt64 = ns.code == 1110
+                            ? (hadSpeech ? 50_000_000 : 2_000_000_000)
+                            : 1_000_000_000
+                        let delayLabel = ns.code == 1110 ? (hadSpeech ? "50ms" : "2s") : "1s"
+                        SessionLogger.shared.log("[Participant] restarting gen=\(gen) → \(nextGen) in \(delayLabel) hadSpeech=\(hadSpeech) prefix=\(self.transcriptPrefix.count)ch")
                         Task { @MainActor [weak self] in
                             try? await Task.sleep(nanoseconds: delay)
                             guard let self, self.isCapturing,

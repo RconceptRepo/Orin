@@ -128,6 +128,10 @@ final class RecordingService: Service {
     /// Callbacks from superseded tasks (stale gen) are discarded before they
     /// can schedule duplicate restarts that kill the in-flight session.
     @ObservationIgnored private var recognitionGeneration = 0
+    /// Set to true when the current generation receives its first speech result.
+    /// Used to distinguish a segment-boundary 1110 (speech was heard → restart fast)
+    /// from a startup-silence 1110 (no speech yet → back off 2 s to avoid tight loop).
+    @ObservationIgnored private var generationHadSpeech = false
     private let logger = Logger(subsystem: "com.clavrit.orin", category: "RecordingService")
 
     // MARK: - Private — cross-thread state
@@ -437,6 +441,7 @@ final class RecordingService: Service {
         request: SFSpeechAudioBufferRecognitionRequest
     ) {
         RecognitionDiagnostics.shared.micTaskCreated()
+        generationHadSpeech = false
         let gen = recognitionGeneration
         SessionLogger.shared.log(
             "[Mic] task created gen=\(gen)"
@@ -456,6 +461,7 @@ final class RecordingService: Service {
 
                 if let result {
                     RecognitionDiagnostics.shared.micRecognitionCallback()
+                    self.generationHadSpeech = true
                     let segment = result.bestTranscription.formattedString
                     let candidateTotal = self.transcriptPrefix.count + segment.count
                     if !self.transcript.isEmpty,
@@ -503,8 +509,16 @@ final class RecordingService: Service {
                         }
                         let nextGen = self.recognitionGeneration + 1
                         self.recognitionGeneration = nextGen
-                        let delay: UInt64 = nsError.code == 1110 ? 50_000_000 : 1_000_000_000
-                        SessionLogger.shared.log("[Mic] restarting gen=\(gen) → \(nextGen) in \(nsError.code == 1110 ? "50ms" : "1s") prefix=\(self.transcriptPrefix.count)ch")
+                        // 1110 = on-device VAD boundary.
+                        // - Speech heard this gen (segment boundary): restart in 50 ms.
+                        // - No speech yet (startup silence): back off 2 s to avoid a
+                        //   tight create→1110→restart spiral that blocks all transcription.
+                        let hadSpeech = self.generationHadSpeech
+                        let delay: UInt64 = nsError.code == 1110
+                            ? (hadSpeech ? 50_000_000 : 2_000_000_000)
+                            : 1_000_000_000
+                        let delayLabel = nsError.code == 1110 ? (hadSpeech ? "50ms" : "2s") : "1s"
+                        SessionLogger.shared.log("[Mic] restarting gen=\(gen) → \(nextGen) in \(delayLabel) hadSpeech=\(hadSpeech) prefix=\(self.transcriptPrefix.count)ch")
                         Task { @MainActor [weak self] in
                             try? await Task.sleep(nanoseconds: delay)
                             guard let self, self.isRecording,
