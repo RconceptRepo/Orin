@@ -436,7 +436,12 @@ private final class SystemAudioTapState: @unchecked Sendable {
     }
 
     func updateRequest(_ request: SFSpeechAudioBufferRecognitionRequest) {
-        lock.withLock { recognitionRequest = request }
+        var old: SFSpeechAudioBufferRecognitionRequest?
+        lock.withLock {
+            old = recognitionRequest
+            recognitionRequest = request
+        }
+        old?.endAudio()  // outside lock — avoids blocking the SCStream audio queue
     }
 
     func disarm() {

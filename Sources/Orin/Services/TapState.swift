@@ -78,8 +78,20 @@ final class TapState: @unchecked Sendable {
 
     /// Swap in a new recognition request (transparent ~60-second restart).
     /// Call on MainActor while the tap is still installed.
+    ///
+    /// `endAudio()` is called on the OLD request AFTER the lock is released so
+    /// the audio IO thread (which calls `feed` under the same lock) is never
+    /// blocked waiting for the speech-daemon XPC round-trip that `endAudio`
+    /// triggers. Failing to call `endAudio` on the replaced request causes the
+    /// daemon to throw a serialised ObjC exception that propagates back onto the
+    /// audio IO thread and terminates the process via `std::terminate()`.
     func updateRequest(_ request: SFSpeechAudioBufferRecognitionRequest?) {
-        lock.withLock { recognitionRequest = request }
+        var old: SFSpeechAudioBufferRecognitionRequest?
+        lock.withLock {
+            old = recognitionRequest
+            recognitionRequest = request
+        }
+        old?.endAudio()  // outside lock — must not block the audio IO thread
     }
 
     /// Signal end-of-audio, then release both resources.
