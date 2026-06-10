@@ -199,7 +199,8 @@ final class SystemAudioCaptureService: Service {
         RecognitionDiagnostics.shared.resetParticipantChannel(
             authStatus: speechAuth,
             recognizerAvailable: recognizer.isAvailable,
-            supportsOnDevice: recognizer.supportsOnDeviceRecognition
+            supportsOnDevice: recognizer.supportsOnDeviceRecognition,
+            locale: recognizer.locale.identifier
         )
 
         // Arm tap state with recognition request BEFORE stream starts so the
@@ -315,6 +316,7 @@ final class SystemAudioCaptureService: Service {
         }
 
         // End recognition before clearing tap state
+        RecognitionDiagnostics.shared.setParticipantFinalGeneration(recognitionGeneration)
         recognitionTask?.cancel()
         RecognitionDiagnostics.shared.participantTaskCancelled()
         recognitionTask = nil
@@ -331,11 +333,12 @@ final class SystemAudioCaptureService: Service {
     ) -> SFSpeechAudioBufferRecognitionRequest {
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
-        // Do not set requiresOnDeviceRecognition. macOS 26 defaults to on-device (true).
-        // On-device runs with no concurrency limit and no server-side timeouts.
-        // Setting = false forces server recognition, which fires 1110 immediately when
-        // two concurrent channels (mic + participant) are both hitting the server —
-        // Apple enforces a single concurrent server request per device.
+        // Force on-device recognition — eliminates error 1110.
+        // The framework default (false) uses Apple's servers; two concurrent channels
+        // (mic + participant) compete for one device slot → continuous 1110 errors and
+        // system slowdown. On-device has no concurrency limit and no network overhead.
+        request.requiresOnDeviceRecognition = true
+        RecognitionDiagnostics.shared.setParticipantRequestConfig(requiresOnDevice: true)
         return request
     }
 

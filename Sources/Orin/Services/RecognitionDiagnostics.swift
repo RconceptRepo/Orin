@@ -25,9 +25,15 @@ final class RecognitionDiagnostics: @unchecked Sendable {
     private var _micAuthStatus: String = "unknown"
     private var _micRecognizerAvailable: Bool = false
     private var _micSupportsOnDevice: Bool = false
+    private var _micLocale: String = ""
+    private var _micRequiresOnDevice: Bool = false
+    private var _micFinalGeneration: Int = 0
     private var _participantAuthStatus: String = "unknown"
     private var _participantRecognizerAvailable: Bool = false
     private var _participantSupportsOnDevice: Bool = false
+    private var _participantLocale: String = ""
+    private var _participantRequiresOnDevice: Bool = false
+    private var _participantFinalGeneration: Int = 0
 
     // MARK: - Mic counters
 
@@ -55,13 +61,17 @@ final class RecognitionDiagnostics: @unchecked Sendable {
         sessionID: String,
         authStatus: SFSpeechRecognizerAuthorizationStatus,
         recognizerAvailable: Bool,
-        supportsOnDevice: Bool
+        supportsOnDevice: Bool,
+        locale: String
     ) {
         lock.withLock {
             self.sessionID = sessionID
             _micAuthStatus = Self.authString(authStatus)
             _micRecognizerAvailable = recognizerAvailable
             _micSupportsOnDevice = supportsOnDevice
+            _micLocale = locale
+            _micRequiresOnDevice = false
+            _micFinalGeneration = 0
             _micAudioBuffers = 0
             _micBuffersAppended = 0
             _micRecognitionCallbacks = 0
@@ -75,12 +85,16 @@ final class RecognitionDiagnostics: @unchecked Sendable {
     func resetParticipantChannel(
         authStatus: SFSpeechRecognizerAuthorizationStatus,
         recognizerAvailable: Bool,
-        supportsOnDevice: Bool
+        supportsOnDevice: Bool,
+        locale: String
     ) {
         lock.withLock {
             _participantAuthStatus = Self.authString(authStatus)
             _participantRecognizerAvailable = recognizerAvailable
             _participantSupportsOnDevice = supportsOnDevice
+            _participantLocale = locale
+            _participantRequiresOnDevice = false
+            _participantFinalGeneration = 0
             _participantAudioBuffers = 0
             _participantBuffersAppended = 0
             _participantRecognitionCallbacks = 0
@@ -141,6 +155,26 @@ final class RecognitionDiagnostics: @unchecked Sendable {
         }
     }
 
+    // MARK: - Request config setters (called from buildRecognitionRequest)
+
+    func setMicRequestConfig(requiresOnDevice: Bool) {
+        lock.withLock { _micRequiresOnDevice = requiresOnDevice }
+    }
+
+    func setParticipantRequestConfig(requiresOnDevice: Bool) {
+        lock.withLock { _participantRequiresOnDevice = requiresOnDevice }
+    }
+
+    // MARK: - Final generation setters (called before save)
+
+    func setMicFinalGeneration(_ gen: Int) {
+        lock.withLock { _micFinalGeneration = gen }
+    }
+
+    func setParticipantFinalGeneration(_ gen: Int) {
+        lock.withLock { _participantFinalGeneration = gen }
+    }
+
     // MARK: - Snapshot
 
     struct Snapshot {
@@ -148,6 +182,9 @@ final class RecognitionDiagnostics: @unchecked Sendable {
         let micAuthStatus: String
         let micRecognizerAvailable: Bool
         let micSupportsOnDevice: Bool
+        let micLocale: String
+        let micRequiresOnDevice: Bool
+        let micFinalGeneration: Int
         let micAudioBuffers: Int
         let micBuffersAppended: Int
         let micRecognitionCallbacks: Int
@@ -158,6 +195,9 @@ final class RecognitionDiagnostics: @unchecked Sendable {
         let participantAuthStatus: String
         let participantRecognizerAvailable: Bool
         let participantSupportsOnDevice: Bool
+        let participantLocale: String
+        let participantRequiresOnDevice: Bool
+        let participantFinalGeneration: Int
         let participantAudioBuffers: Int
         let participantBuffersAppended: Int
         let participantRecognitionCallbacks: Int
@@ -174,6 +214,9 @@ final class RecognitionDiagnostics: @unchecked Sendable {
                 micAuthStatus: _micAuthStatus,
                 micRecognizerAvailable: _micRecognizerAvailable,
                 micSupportsOnDevice: _micSupportsOnDevice,
+                micLocale: _micLocale,
+                micRequiresOnDevice: _micRequiresOnDevice,
+                micFinalGeneration: _micFinalGeneration,
                 micAudioBuffers: _micAudioBuffers,
                 micBuffersAppended: _micBuffersAppended,
                 micRecognitionCallbacks: _micRecognitionCallbacks,
@@ -184,6 +227,9 @@ final class RecognitionDiagnostics: @unchecked Sendable {
                 participantAuthStatus: _participantAuthStatus,
                 participantRecognizerAvailable: _participantRecognizerAvailable,
                 participantSupportsOnDevice: _participantSupportsOnDevice,
+                participantLocale: _participantLocale,
+                participantRequiresOnDevice: _participantRequiresOnDevice,
+                participantFinalGeneration: _participantFinalGeneration,
                 participantAudioBuffers: _participantAudioBuffers,
                 participantBuffersAppended: _participantBuffersAppended,
                 participantRecognitionCallbacks: _participantRecognitionCallbacks,
@@ -206,38 +252,46 @@ final class RecognitionDiagnostics: @unchecked Sendable {
             [Diagnostics] mic: \
             buffers=\(s.micAudioBuffers) appended=\(s.micBuffersAppended) \
             tasks=\(s.micTaskCreations) callbacks=\(s.micRecognitionCallbacks) \
-            errors1110=\(s.micErrors1110) cancellations=\(s.micTaskCancellations)
+            errors1110=\(s.micErrors1110) cancellations=\(s.micTaskCancellations) \
+            requiresOnDevice=\(s.micRequiresOnDevice) finalGen=\(s.micFinalGeneration)
             [Diagnostics] participant: \
             buffers=\(s.participantAudioBuffers) appended=\(s.participantBuffersAppended) \
             tasks=\(s.participantTaskCreations) callbacks=\(s.participantRecognitionCallbacks) \
-            errors1110=\(s.participantErrors1110) cancellations=\(s.participantTaskCancellations)
+            errors1110=\(s.participantErrors1110) cancellations=\(s.participantTaskCancellations) \
+            requiresOnDevice=\(s.participantRequiresOnDevice) finalGen=\(s.participantFinalGeneration)
             """
 
         let dict: [String: Any] = [
             "sessionID": s.sessionID,
             "mic": [
-                "authorizationStatus":        s.micAuthStatus,
-                "recognizerAvailable":        s.micRecognizerAvailable,
-                "supportsOnDeviceRecognition": s.micSupportsOnDevice,
-                "audioBuffersReceived":       s.micAudioBuffers,
-                "buffersAppended":            s.micBuffersAppended,
-                "recognitionCallbacks":       s.micRecognitionCallbacks,
-                "errors1110":                 s.micErrors1110,
-                "errorsOther":                s.micErrorsOther,
-                "taskCreations":              s.micTaskCreations,
-                "taskCancellations":          s.micTaskCancellations
+                "authorizationStatus":          s.micAuthStatus,
+                "recognizerAvailable":          s.micRecognizerAvailable,
+                "supportsOnDeviceRecognition":  s.micSupportsOnDevice,
+                "locale":                       s.micLocale,
+                "requiresOnDeviceRecognition":  s.micRequiresOnDevice,
+                "finalGeneration":              s.micFinalGeneration,
+                "audioBuffersReceived":         s.micAudioBuffers,
+                "buffersAppended":              s.micBuffersAppended,
+                "recognitionCallbacks":         s.micRecognitionCallbacks,
+                "errors1110":                   s.micErrors1110,
+                "errorsOther":                  s.micErrorsOther,
+                "taskCreations":                s.micTaskCreations,
+                "taskCancellations":            s.micTaskCancellations
             ] as [String: Any],
             "participant": [
-                "authorizationStatus":        s.participantAuthStatus,
-                "recognizerAvailable":        s.participantRecognizerAvailable,
-                "supportsOnDeviceRecognition": s.participantSupportsOnDevice,
-                "audioBuffersReceived":       s.participantAudioBuffers,
-                "buffersAppended":            s.participantBuffersAppended,
-                "recognitionCallbacks":       s.participantRecognitionCallbacks,
-                "errors1110":                 s.participantErrors1110,
-                "errorsOther":                s.participantErrorsOther,
-                "taskCreations":              s.participantTaskCreations,
-                "taskCancellations":          s.participantTaskCancellations
+                "authorizationStatus":          s.participantAuthStatus,
+                "recognizerAvailable":          s.participantRecognizerAvailable,
+                "supportsOnDeviceRecognition":  s.participantSupportsOnDevice,
+                "locale":                       s.participantLocale,
+                "requiresOnDeviceRecognition":  s.participantRequiresOnDevice,
+                "finalGeneration":              s.participantFinalGeneration,
+                "audioBuffersReceived":         s.participantAudioBuffers,
+                "buffersAppended":              s.participantBuffersAppended,
+                "recognitionCallbacks":         s.participantRecognitionCallbacks,
+                "errors1110":                   s.participantErrors1110,
+                "errorsOther":                  s.participantErrorsOther,
+                "taskCreations":                s.participantTaskCreations,
+                "taskCancellations":            s.participantTaskCancellations
             ] as [String: Any]
         ]
 

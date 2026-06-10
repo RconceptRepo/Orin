@@ -286,7 +286,8 @@ final class RecordingService: Service {
             sessionID: meetingID?.uuidString ?? "none",
             authStatus: SFSpeechRecognizer.authorizationStatus(),
             recognizerAvailable: recognizer.isAvailable,
-            supportsOnDevice: recognizer.supportsOnDeviceRecognition
+            supportsOnDevice: recognizer.supportsOnDeviceRecognition,
+            locale: recognizer.locale.identifier
         )
         SessionLogger.shared.log("[Mic] recognizer available=\(recognizer.isAvailable) supportsOnDevice=\(recognizer.supportsOnDeviceRecognition) auth=\(SFSpeechRecognizer.authorizationStatus().rawValue)")
 
@@ -409,6 +410,7 @@ final class RecordingService: Service {
         let finalChars = transcript.count
         logger.info("stopped url=\(self.recordingURL?.lastPathComponent ?? "nil", privacy: .public) chars=\(finalChars)")
         SessionLogger.shared.log("[Mic] stopped url=\(self.recordingURL?.lastPathComponent ?? "nil") chars=\(finalChars)")
+        RecognitionDiagnostics.shared.setMicFinalGeneration(recognitionGeneration)
         let diagSummary = RecognitionDiagnostics.shared.save(logPath: SessionLogger.shared.currentLogPath)
         for line in diagSummary.components(separatedBy: "\n") where !line.isEmpty {
             SessionLogger.shared.log(line)
@@ -429,11 +431,12 @@ final class RecordingService: Service {
     ) -> SFSpeechAudioBufferRecognitionRequest {
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
-        // Do not set requiresOnDeviceRecognition. macOS 26 defaults to on-device (true).
-        // On-device runs with no concurrency limit and no server-side timeouts.
-        // Setting = false forces server recognition, which fires 1110 immediately when
-        // two concurrent channels (mic + participant) are both hitting the server —
-        // Apple enforces a single concurrent server request per device.
+        // Force on-device recognition — eliminates error 1110.
+        // The framework default (false) uses Apple's servers; two concurrent channels
+        // (mic + participant) compete for one device slot → continuous 1110 errors and
+        // system slowdown. On-device has no concurrency limit and no network overhead.
+        request.requiresOnDeviceRecognition = true
+        RecognitionDiagnostics.shared.setMicRequestConfig(requiresOnDevice: true)
         return request
     }
 
