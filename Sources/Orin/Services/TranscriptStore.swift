@@ -199,14 +199,19 @@ final class TranscriptStore: Service {
     ///
     /// Same empty-overwrite rule as `updateMic`.
     func updateParticipant(_ labeledText: String) {
-        guard activeMeetingID != nil else { return }
+        guard activeMeetingID != nil else {
+            SessionLogger.shared.log("[TranscriptStore] updateParticipant DROPPED — no active session (chars=\(labeledText.count))")
+            return
+        }
         guard !labeledText.isEmpty || participantLabeledText.isEmpty else {
             log.debug("updateParticipant skipped — empty chunk, participantChars=\(self.participantLabeledText.count) protected")
+            SessionLogger.shared.log("[TranscriptStore] updateParticipant EMPTY-OVERWRITE blocked (existing=\(self.participantLabeledText.count)ch)")
             return
         }
         let previousLength = participantLabeledText.count
         participantLabeledText = labeledText
         log.debug("updateParticipant participantChars=\(labeledText.count)")
+        SessionLogger.shared.log("[TranscriptStore] updateParticipant chars=\(labeledText.count) prev=\(previousLength) first50=\(labeledText.prefix(50))")
         recomputeLive()
         lastUpdateTime = Date()
         persistChunkIfNeeded(speaker: "participant", text: labeledText, previousLength: previousLength)
@@ -252,6 +257,8 @@ final class TranscriptStore: Service {
         }
 
         let text = liveTranscript
+        let micSection = micLabeledText.count
+        let ptSection  = participantLabeledText.count
         meeting.transcript = text
         context.safeSaveWithRetry(context: "transcript checkpoint")
         lastPersistedText = text
@@ -260,6 +267,7 @@ final class TranscriptStore: Service {
         // Keep orphan backup current
         UserDefaults.standard.set(text, forKey: kOrphanText)
         log.info("checkpoint saved chars=\(text.count) elapsed=\(meeting.durationSeconds)s")
+        SessionLogger.shared.log("[TranscriptStore] checkpoint micChars=\(micSection) participantChars=\(ptSection) liveChars=\(text.count) first80=\(text.prefix(80))")
     }
 
     /// Finalises the recording session.
@@ -294,6 +302,8 @@ final class TranscriptStore: Service {
         }
 
         log.info("finalize begin meetingID=\(String(describing: meetingIDForLog)) — waiting 1.5 s for trailing recognition chunks")
+        SessionLogger.shared.log("[TranscriptStore] finalize BEGIN micChars=\(micLabeledText.count) participantChars=\(participantLabeledText.count) liveChars=\(liveTranscript.count) modelChars=\(meeting.transcript.count)")
+        SessionLogger.shared.log("[TranscriptStore] finalize live100=\(liveTranscript.prefix(100))")
         stopCheckpointTimer()
 
         // Snapshot state BEFORE sleep (protects against a new recording session
@@ -319,6 +329,8 @@ final class TranscriptStore: Service {
         let finalText = candidates.max(by: { $0.count < $1.count }) ?? ""
 
         log.info("finalize candidates: fresh=\(freshLive.count) snapshot=\(snapshotLive.count) persisted=\(snapshotPersisted.count) model=\(snapshotModel.count) chunks=\(chunkText.count) → selected=\(finalText.count)")
+        SessionLogger.shared.log("[TranscriptStore] finalize CANDIDATES fresh=\(freshLive.count) snap=\(snapshotLive.count) persisted=\(snapshotPersisted.count) model=\(snapshotModel.count) chunks=\(chunkText.count) → selected=\(finalText.count)")
+        SessionLogger.shared.log("[TranscriptStore] finalize selected100=\(finalText.prefix(100))")
 
         // Integrity: never truncate the model (write only if longer or equal)
         if finalText.isEmpty {
@@ -334,8 +346,10 @@ final class TranscriptStore: Service {
         if let url = audioURL { meeting.audioFilePath = url.path }
 
         let preSaveLen = meeting.transcript.count
+        SessionLogger.shared.log("[TranscriptStore] finalize PRE-SAVE modelChars=\(preSaveLen) first100=\(meeting.transcript.prefix(100))")
         context.safeSaveWithRetry(context: "meeting recording final")
         let postSaveLen = meeting.transcript.count
+        SessionLogger.shared.log("[TranscriptStore] finalize POST-SAVE modelChars=\(postSaveLen)")
 
         if postSaveLen < preSaveLen {
             log.error("INTEGRITY WARNING: post-save len \(postSaveLen) < pre-save \(preSaveLen) — SwiftData serialisation issue")
