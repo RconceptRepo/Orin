@@ -214,10 +214,16 @@ final class SystemAudioCaptureService: Service {
         )
         startRecognitionTask(with: recognizer, request: request)
 
-        // Configure SCStream for audio only — minimal video to reduce overhead
+        // Configure SCStream for audio only — minimal video to reduce overhead.
+        // sampleRate and channelCount must be set explicitly: on macOS 26 the
+        // stream fails with -3818 if the audio format is left for the runtime
+        // to negotiate.  excludesCurrentProcessAudio is left at its default
+        // (false) — setting it true conflicts with audio routing on macOS 26
+        // and is unnecessary since Orin produces no audio output of its own.
         let config = SCStreamConfiguration()
         config.capturesAudio = true
-        config.excludesCurrentProcessAudio = true
+        config.sampleRate    = 48000
+        config.channelCount  = 2
         config.width                = 2
         config.height               = 2
         config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
