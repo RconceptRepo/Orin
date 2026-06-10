@@ -325,11 +325,11 @@ final class SystemAudioCaptureService: Service {
     ) -> SFSpeechAudioBufferRecognitionRequest {
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
-        // Force server recognition. On macOS 26 the SDK default is true (on-device),
-        // which fires code 1110 every ~1.5 s as VAD segment boundaries, causing 21+
-        // restarts/min and incoherent output. Server recognition runs 60-second
-        // continuous sessions without 1110.
-        request.requiresOnDeviceRecognition = false
+        // Do not set requiresOnDeviceRecognition. macOS 26 defaults to on-device (true).
+        // On-device runs with no concurrency limit and no server-side timeouts.
+        // Setting = false forces server recognition, which fires 1110 immediately when
+        // two concurrent channels (mic + participant) are both hitting the server —
+        // Apple enforces a single concurrent server request per device.
         return request
     }
 
