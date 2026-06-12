@@ -13,5 +13,8 @@
     <true/>
     <key>com.apple.security.screen-recording</key>
     <true/>
+    <!-- Required for SpeechTranscriber to process arbitrary audio content (Phase 1 validation) -->
+    <key>com.apple.security.speech.recognition.allow-any-content</key>
+    <true/>
 </dict>
 </plist>

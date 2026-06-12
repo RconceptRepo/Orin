@@ -202,11 +202,20 @@ struct MainContainerView: View {
             }
         }
         // Route mic transcript chunks into TranscriptStore on every recognition update.
+        // Skipped when the SpeechTranscriber mic pipeline is active — that pipeline
+        // calls updateMic() directly, and the view observer would produce a redundant
+        // duplicate write on every result.
         .onChange(of: recordingService.speakerTranscript) { _, labeled in
+            guard !FeatureFlags.useNewMicPipeline else { return }
             transcriptStore.updateMic(labeled)
         }
         // Route participant transcript chunks into TranscriptStore on every recognition update.
+        // Skipped when the SpeechTranscriber participant pipeline is active — the legacy
+        // self.transcript property (source of participantSpeakerTranscript) is still
+        // mutated by the legacy recognizer when it runs, and without this guard, every
+        // legacy callback overwrites the ST pipeline's accumulated TranscriptStore content.
         .onChange(of: systemAudioService.participantSpeakerTranscript) { _, labeled in
+            guard !FeatureFlags.useNewParticipantPipeline else { return }
             transcriptStore.updateParticipant(labeled)
         }
         .onChange(of: calendarBackgroundSync) { _, enabled in

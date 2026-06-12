@@ -18,3 +18,7 @@ Sources.zip
 
 # Claude Code local settings
 .claude/
+
+# Release build output — binaries excluded, update.log tracked
+release/Orin.app
+release/Orin.app.bak

@@ -1,3 +1,4 @@
+import CoreGraphics
 import OSLog
 import SwiftData
 import SwiftUI
@@ -155,6 +156,11 @@ struct OrinApp: App {
             MainContainerView()
                 .modelContainer(modelContainer)
                 .onAppear {
+                    // Register the current binary with TCC so Screen Recording
+                    // works correctly after each new DMG install. No-op if already
+                    // granted; opens System Settings once if not yet granted.
+                    CGRequestScreenCaptureAccess()
+
                     rolloverEngine.verifyAndExecuteRollover()
                     ServiceContainer.shared.resolve(AssistantService.self).processPendingIntents()
                     bringWindowToFront()

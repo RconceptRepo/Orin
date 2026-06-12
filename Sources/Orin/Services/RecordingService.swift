@@ -52,9 +52,11 @@ final class RecordingService: Service {
 
     private(set) var phase: Phase = .idle
 
-    /// Convenience alias; equivalent to `phase == .recording`.
-    /// Computed so it is always consistent with `phase`.
-    var isRecording: Bool { phase == .recording }
+    /// True when recording has been initiated (`.starting`) or is actively running (`.recording`).
+    /// Including `.starting` prevents `startRecordingFromDetectedMeeting()` from racing past the
+    /// guard and creating a new auto-titled meeting while a MeetingDetailView-initiated recording
+    /// is still in its setup phase.
+    var isRecording: Bool { phase == .recording || phase == .starting }
 
     private(set) var elapsedSeconds: Int = 0
     private(set) var transcript = ""
@@ -150,6 +152,21 @@ final class RecordingService: Service {
     @ObservationIgnored
     private let tapState = TapState()
 
+    // MARK: - SpeechTranscriber mic pipeline (Phase 2A — feature-flagged, macOS 26+)
+    //
+    // Properties that hold macOS-26-only types are declared as `Any?` so the class
+    // can compile against a macOS 14 deployment target. Actual SpeechAnalyzer /
+    // SpeechTranscriber / MicTranscriberFeed objects are created and accessed only
+    // inside `if #available(macOS 26.0, *)` guards.
+
+    @ObservationIgnored private var micSTFeed: Any?              // MicTranscriberFeed
+    @ObservationIgnored private var micSTAnalyzer: Any?          // SpeechAnalyzer
+    @ObservationIgnored private var micSTTranscriber: Any?       // SpeechTranscriber
+    @ObservationIgnored private var micSTAnalyzeTask: Task<Void, Never>?
+    @ObservationIgnored private var micSTResultsTask: Task<Void, Never>?
+    @ObservationIgnored private var micSTSamplingTask: Task<Void, Never>?
+    @ObservationIgnored private var micSTMetrics: MicSTSessionMetrics?
+
     // MARK: - Lifecycle
 
     deinit {
@@ -178,12 +195,19 @@ final class RecordingService: Service {
         // ── STEP 1: permissions ───────────────────────────────────────────────
         print("STEP 1: checking mic permission")
 
-        // `requestPermissions()` suspends and allows other @MainActor work to run.
-        // Re-confirm phase is still `.starting` after the await.
-        if !hasMicPermission || !hasSpeechPermission {
-            print("STEP 1: requesting permissions (suspended)")
-            await requestPermissions()
-            print("STEP 1: permissions returned hasMic=\(hasMicPermission) hasSpeech=\(hasSpeechPermission)")
+        // Permission requirements differ per pipeline:
+        // - Legacy (SFSpeechRecognizer): both mic + speech recognition permission required.
+        // - New (SpeechTranscriber): only mic; the sandbox entitlement covers speech access.
+        if FeatureFlags.useNewMicPipeline {
+            if !hasMicPermission {
+                _ = await AVCaptureDevice.requestAccess(for: .audio)
+            }
+        } else {
+            if !hasMicPermission || !hasSpeechPermission {
+                print("STEP 1: requesting permissions (suspended)")
+                await requestPermissions()
+                print("STEP 1: permissions returned hasMic=\(hasMicPermission) hasSpeech=\(hasSpeechPermission)")
+            }
         }
 
         guard phase == .starting else {
@@ -197,19 +221,29 @@ final class RecordingService: Service {
             phase = .idle
             return
         }
-        guard hasSpeechPermission else {
-            print("STEP 1: speech recognition access denied")
-            errorMessage = "Speech Recognition access denied. Enable it in System Settings → Privacy & Security → Speech Recognition."
-            phase = .idle
-            return
+
+        // Legacy only: verify speech recognition permission + recognizer availability.
+        // SpeechTranscriber uses a sandbox entitlement; no runtime authorization is needed.
+        let legacyRecognizer: SFSpeechRecognizer?
+        if FeatureFlags.useNewMicPipeline {
+            legacyRecognizer = nil
+            print("STEP 1: SpeechTranscriber pipeline selected — no speech permission required")
+        } else {
+            guard hasSpeechPermission else {
+                print("STEP 1: speech recognition access denied")
+                errorMessage = "Speech Recognition access denied. Enable it in System Settings → Privacy & Security → Speech Recognition."
+                phase = .idle
+                return
+            }
+            guard let r = speechRecognizer, r.isAvailable else {
+                print("STEP 1: speech recognizer unavailable")
+                errorMessage = "Speech recognition is unavailable on this device."
+                phase = .idle
+                return
+            }
+            legacyRecognizer = r
+            print("STEP 1: permissions OK — mic=\(hasMicPermission) speech=\(hasSpeechPermission)")
         }
-        guard let recognizer = speechRecognizer, recognizer.isAvailable else {
-            print("STEP 1: speech recognizer unavailable")
-            errorMessage = "Speech recognition is unavailable on this device."
-            phase = .idle
-            return
-        }
-        print("STEP 1: permissions OK — mic=\(hasMicPermission) speech=\(hasSpeechPermission)")
 
         // ── STEP 2: audio device check + engine guard ─────────────────────────
         // Root cause of EXC_BAD_ACCESS (SIGSEGV) KERN_INVALID_ADDRESS 0x0:
@@ -282,14 +316,25 @@ final class RecordingService: Service {
         probeHeuristicExtraChars = 0
         SessionLogger.shared.startSession()
         SessionLogger.shared.log("[Mic] session started meetingID=\(String(describing: meetingID))")
-        RecognitionDiagnostics.shared.resetMicChannel(
-            sessionID: meetingID?.uuidString ?? "none",
-            authStatus: SFSpeechRecognizer.authorizationStatus(),
-            recognizerAvailable: recognizer.isAvailable,
-            supportsOnDevice: recognizer.supportsOnDeviceRecognition,
-            locale: recognizer.locale.identifier
-        )
-        SessionLogger.shared.log("[Mic] recognizer available=\(recognizer.isAvailable) supportsOnDevice=\(recognizer.supportsOnDeviceRecognition) auth=\(SFSpeechRecognizer.authorizationStatus().rawValue)")
+        if let recognizer = legacyRecognizer {
+            RecognitionDiagnostics.shared.resetMicChannel(
+                sessionID: meetingID?.uuidString ?? "none",
+                authStatus: SFSpeechRecognizer.authorizationStatus(),
+                recognizerAvailable: recognizer.isAvailable,
+                supportsOnDevice: recognizer.supportsOnDeviceRecognition,
+                locale: recognizer.locale.identifier
+            )
+            SessionLogger.shared.log("[Mic] recognizer available=\(recognizer.isAvailable) supportsOnDevice=\(recognizer.supportsOnDeviceRecognition) auth=\(SFSpeechRecognizer.authorizationStatus().rawValue)")
+        } else {
+            RecognitionDiagnostics.shared.resetMicChannel(
+                sessionID: meetingID?.uuidString ?? "none",
+                authStatus: .notDetermined,
+                recognizerAvailable: false,
+                supportsOnDevice: true,
+                locale: "en-US"
+            )
+            SessionLogger.shared.log("[Mic-ST] SpeechTranscriber pipeline active — no SFSpeechRecognizer")
+        }
 
         // Create the on-disk file before arming the tap state.  If this fails,
         // no tap is installed and no hardware is left in a partial state.
@@ -304,18 +349,52 @@ final class RecordingService: Service {
         }
 
         // Arm tap state BEFORE installTap — the Core-Audio callback may fire
-        // immediately after installation, so both audioFile and recognitionRequest
-        // must be valid at that moment.
-        let initialRequest = buildRecognitionRequest(recognizer: recognizer)
-        tapState.arm(audioFile: audioFile, recognitionRequest: initialRequest)
-        startRecognitionTask(with: recognizer, request: initialRequest)
+        // immediately after installation, so audioFile must be valid at that moment.
+        if let recognizer = legacyRecognizer {
+            // Legacy path: arm with both audioFile and recognition request.
+            let initialRequest = buildRecognitionRequest(recognizer: recognizer)
+            tapState.arm(audioFile: audioFile, recognitionRequest: initialRequest)
+            startRecognitionTask(with: recognizer, request: initialRequest)
 
-        // ── STEP 5: install tap ───────────────────────────────────────────────
-        // The tap closure captures `tapState` (not `self`) to avoid touching
-        // @Observable state from the Core-Audio real-time I/O thread.
-        print("STEP 5: installing tap")
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [tapState] buffer, _ in
-            tapState.feed(buffer: buffer)
+            // ── STEP 5: install tap (legacy) ──────────────────────────────────
+            print("STEP 5: installing tap [legacy SFSpeechRecognizer]")
+            inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [tapState] buffer, _ in
+                tapState.feed(buffer: buffer)
+            }
+        } else {
+            // New path: arm tapState for file-only recording, then set up ST pipeline.
+            tapState.arm(audioFile: audioFile)
+            if #available(macOS 26.0, *) {
+                do {
+                    try await startMicSTSession(inputFormat: format)
+                } catch {
+                    print("STEP 5: SpeechTranscriber setup failed — \(error)")
+                    teardownAudioEngine()
+                    errorMessage = "SpeechTranscriber setup failed: \(error.localizedDescription)"
+                    phase = .idle
+                    return
+                }
+            } else {
+                print("STEP 5: SpeechTranscriber requires macOS 26 — falling back to idle")
+                teardownAudioEngine()
+                errorMessage = "SpeechTranscriber requires macOS 26 or later."
+                phase = .idle
+                return
+            }
+
+            // ── STEP 5: install tap (SpeechTranscriber) ───────────────────────
+            // Tap closure captures tapState (file write) and micSTFeed (ST feed) —
+            // neither touches self, keeping the real-time thread off @Observable state.
+            // The `micSTFeed` Any? cast under #available is a single O(1) check per buffer.
+            print("STEP 5: installing tap [SpeechTranscriber]")
+            let capturedSTFeed = micSTFeed
+            inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [tapState, capturedSTFeed] buffer, _ in
+                tapState.feed(buffer: buffer)
+                if #available(macOS 26.0, *),
+                   let feed = capturedSTFeed as? MicTranscriberFeed {
+                    feed.feed(buffer)
+                }
+            }
         }
         print("STEP 5: tap installed")
 
@@ -377,12 +456,45 @@ final class RecordingService: Service {
         // on the audio thread while the tap state is being cleared.
         audioEngine.inputNode.removeTap(onBus: 0)
 
+        // Stop CPU/RAM sampling and write the benchmark summary to the session log
+        // before `endSession()` closes it. The sampling task is cancelled first so
+        // no new samples race with `summary(sessionEndTime:)`.
+        micSTSamplingTask?.cancel()
+        micSTSamplingTask = nil
+        if FeatureFlags.useNewMicPipeline, let metrics = micSTMetrics {
+            let snapshot = metrics.summary(sessionEndTime: CFAbsoluteTimeGetCurrent())
+            for line in snapshot.components(separatedBy: "\n") where !line.isEmpty {
+                SessionLogger.shared.log(line)
+            }
+        }
+        micSTMetrics = nil
+
         // Cancel the recognition task **before** `disarm` calls `endAudio` so
         // the final-result callback sees `isRecording == false` and does not
         // attempt a transparent session restart.
-        recognitionTask?.cancel()
-        RecognitionDiagnostics.shared.micTaskCancelled()
-        recognitionTask = nil
+        if FeatureFlags.useNewMicPipeline, #available(macOS 26.0, *) {
+            let capturedAnalyzer    = micSTAnalyzer as? SpeechAnalyzer
+            let capturedAnalyzeTask = micSTAnalyzeTask
+            let capturedResultsTask = micSTResultsTask
+            (micSTFeed as? MicTranscriberFeed)?.disarm()
+            micSTFeed        = nil
+            micSTAnalyzer    = nil
+            micSTTranscriber = nil
+            micSTAnalyzeTask = nil
+            micSTResultsTask = nil
+            Task {
+                if let a = capturedAnalyzer {
+                    try? await a.finalizeAndFinishThroughEndOfInput()
+                }
+                await capturedAnalyzeTask?.value
+                await capturedResultsTask?.value
+                SessionLogger.shared.log("[Mic-ST] finalization complete")
+            }
+        } else {
+            recognitionTask?.cancel()
+            RecognitionDiagnostics.shared.micTaskCancelled()
+            recognitionTask = nil
+        }
 
         // `disarm` signals end-of-audio to the recogniser and releases the file.
         // Releasing `AVAudioFile` here closes and flushes all pending writes to disk,
@@ -412,6 +524,10 @@ final class RecordingService: Service {
         SessionLogger.shared.log("[Mic] stopped url=\(self.recordingURL?.lastPathComponent ?? "nil") chars=\(finalChars)")
         RecognitionDiagnostics.shared.setMicFinalGeneration(recognitionGeneration)
         let diagSummary = RecognitionDiagnostics.shared.save(logPath: SessionLogger.shared.currentLogPath)
+        RecognitionDiagnostics.shared.saveCoverageReport(
+            logPath: SessionLogger.shared.currentLogPath,
+            elapsedSeconds: elapsedSeconds
+        )
         for line in diagSummary.components(separatedBy: "\n") where !line.isEmpty {
             SessionLogger.shared.log(line)
         }
@@ -471,14 +587,32 @@ final class RecordingService: Service {
             + " partialResults=\(request.shouldReportPartialResults)"
             + " requiresOnDevice=\(request.requiresOnDeviceRecognition)"
         )
+        RecognitionDiagnostics.shared.micGenerationStarted(gen: gen, charsAtStart: transcriptPrefix.count)
+        let taskCreationTime = CFAbsoluteTimeGetCurrent()
         recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
             Task { @MainActor [weak self] in
-                guard let self, self.recognitionGeneration == gen else {
-                    return  // stale callback from a superseded recognition session
+                guard let self else { return }
+                if self.recognitionGeneration != gen {
+                    if result != nil {
+                        // Task produced a result after 1110/cancel — proves callbacks continue
+                        SessionLogger.shared.log("[Mic] STALE_RESULT gen=\(gen) current=\(self.recognitionGeneration)")
+                        RecognitionDiagnostics.shared.micStaleResult()
+                    }
+                    return
                 }
 
                 if let result {
                     RecognitionDiagnostics.shared.micRecognitionCallback()
+                    if !self.generationHadSpeech {
+                        let firstCallbackTime = CFAbsoluteTimeGetCurrent()
+                        let latencySeconds = firstCallbackTime - taskCreationTime
+                        SessionLogger.shared.log(
+                            "[Mic] firstCallbackLatency gen=\(gen)"
+                            + " taskCreated=\(String(format: "%.3f", taskCreationTime))"
+                            + " firstCallback=\(String(format: "%.3f", firstCallbackTime))"
+                            + " latencySeconds=\(String(format: "%.3f", latencySeconds))"
+                        )
+                    }
                     self.generationHadSpeech = true
                     let segment = result.bestTranscription.formattedString
                     let prevTotal = self.transcript.count
@@ -514,6 +648,10 @@ final class RecordingService: Service {
                             ? segment
                             : self.transcriptPrefix + segment
                     }
+                    RecognitionDiagnostics.shared.micGenerationCallback(
+                        gen: gen, chars: self.transcript.count,
+                        snippet: String(segment.prefix(50))
+                    )
                     self.transcriptChunkCount += 1
                     let delta = self.transcript.count - prevTotal
                     let retracted = max(0, prevInGen - segment.count)
@@ -529,6 +667,10 @@ final class RecordingService: Service {
 
                 if result?.isFinal == true, self.isRecording {
                     SessionLogger.shared.log("[Mic] isFinal gen=\(gen) total=\(self.transcript.count) — starting gen \(gen + 1)")
+                    RecognitionDiagnostics.shared.micGenerationEnded(
+                        gen: gen, errorCode: 0, chars: self.transcript.count,
+                        lastSnippet: String(self.transcript.suffix(50))
+                    )
                     if !self.transcript.isEmpty {
                         self.transcriptPrefix = self.transcript + " "
                     }
@@ -551,6 +693,17 @@ final class RecordingService: Service {
                         + " desc=\(nsError.localizedDescription)"
                     )
                     if nsError.code != 301 {
+                        RecognitionDiagnostics.shared.micGenerationEnded(
+                            gen: gen, errorCode: nsError.code, chars: self.transcript.count,
+                            lastSnippet: String(self.transcript.suffix(50))
+                        )
+                        // Mode B: do NOT restart on 1110 — observe whether the task
+                        // continues producing callbacks after Apple fires the error.
+                        // staleResults counter in diagnostics will show if any arrive.
+                        if RecognitionDiagnostics.experimentMode == "B" && nsError.code == 1110 {
+                            SessionLogger.shared.log("[Mic] MODE_B gen=\(gen) 1110 ignored — no restart")
+                            return
+                        }
                         RecognitionDiagnostics.shared.micError(nsError.code)
                         if !self.transcript.isEmpty {
                             self.transcriptPrefix = self.transcript + " "
@@ -558,14 +711,12 @@ final class RecordingService: Service {
                         let nextGen = self.recognitionGeneration + 1
                         self.recognitionGeneration = nextGen
                         // 1110 = on-device VAD boundary.
-                        // - Speech heard this gen (segment boundary): restart in 50 ms.
-                        // - No speech yet (startup silence): back off 2 s to avoid a
+                        // - Speech heard this gen (segment boundary): restart in 200ms.
+                        // - No speech yet (startup silence): back off 1 s to avoid a
                         //   tight create→1110→restart spiral that blocks all transcription.
                         let hadSpeech = self.generationHadSpeech
-                        let delay: UInt64 = nsError.code == 1110
-                            ? (hadSpeech ? 200_000_000 : 2_000_000_000)
-                            : 1_000_000_000
-                        let delayLabel = nsError.code == 1110 ? (hadSpeech ? "200ms" : "2s") : "1s"
+                        let delay: UInt64 = (nsError.code == 1110 && hadSpeech) ? 200_000_000 : 1_000_000_000
+                        let delayLabel = (nsError.code == 1110 && hadSpeech) ? "200ms" : "1s"
                         SessionLogger.shared.log("[Mic] restarting gen=\(gen) → \(nextGen) in \(delayLabel) hadSpeech=\(hadSpeech) prefix=\(self.transcriptPrefix.count)ch")
                         Task { @MainActor [weak self] in
                             try? await Task.sleep(nanoseconds: delay)
@@ -582,6 +733,32 @@ final class RecordingService: Service {
                 }
             }
         }
+
+        // Cold-start watchdog: on-device model can hang indefinitely on first load,
+        // producing 0 callbacks despite active audio. Cancel and restart after 10 s
+        // if no callback has arrived and the session is still on the same generation.
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 10_000_000_000)
+            guard let self, self.isRecording,
+                  self.recognitionGeneration == gen,
+                  !self.generationHadSpeech else { return }
+            let nextGen = self.recognitionGeneration + 1
+            self.recognitionGeneration = nextGen
+            SessionLogger.shared.log(
+                "[Mic] watchdog fired gen=\(gen) → \(nextGen) — 0 callbacks after 10s, restarting"
+            )
+            RecognitionDiagnostics.shared.micGenerationEnded(
+                gen: gen, errorCode: -1, chars: self.transcript.count,
+                lastSnippet: ""
+            )
+            RecognitionDiagnostics.shared.micError(-1)
+            let nextRequest = self.buildRecognitionRequest(recognizer: recognizer)
+            self.tapState.updateRequest(nextRequest)
+            self.recognitionTask?.cancel()
+            RecognitionDiagnostics.shared.micTaskCancelled()
+            self.recognitionTask = nil
+            self.startRecognitionTask(with: recognizer, request: nextRequest)
+        }
     }
 
     // MARK: - Helpers
@@ -590,10 +767,135 @@ final class RecordingService: Service {
     /// Safe to call when no tap is installed (removeTap on an untapped bus is a no-op).
     private func teardownAudioEngine() {
         audioEngine.inputNode.removeTap(onBus: 0)
-        recognitionTask?.cancel()
-        RecognitionDiagnostics.shared.micTaskCancelled()
-        recognitionTask = nil
+        micSTSamplingTask?.cancel()
+        micSTSamplingTask = nil
+        micSTMetrics = nil
+        if FeatureFlags.useNewMicPipeline, #available(macOS 26.0, *) {
+            (micSTFeed as? MicTranscriberFeed)?.disarm()
+            micSTFeed        = nil
+            micSTAnalyzeTask?.cancel()
+            micSTAnalyzeTask = nil
+            micSTResultsTask?.cancel()
+            micSTResultsTask = nil
+            micSTAnalyzer    = nil
+            micSTTranscriber = nil
+        } else {
+            recognitionTask?.cancel()
+            RecognitionDiagnostics.shared.micTaskCancelled()
+            recognitionTask = nil
+        }
         tapState.disarm()
+    }
+
+    // MARK: - SpeechTranscriber mic session (Phase 2A)
+
+    /// Sets up the SpeechTranscriber analysis pipeline for the mic channel.
+    ///
+    /// `tapState.arm(audioFile:)` must be called before this method. The method
+    /// arms `micSTFeed`, starts the `SpeechAnalyzer`, and launches two tasks:
+    ///  - `micSTAnalyzeTask`: feeds the AsyncStream into the analyzer.
+    ///  - `micSTResultsTask`: drains `transcriber.results` and pushes to TranscriptStore.
+    ///
+    /// - Parameter inputFormat: The AVAudioEngine tap format (e.g. 48 kHz Float32).
+    /// - Throws: `MicSTError` if no compatible audio format or converter is available.
+    @available(macOS 26.0, *)
+    private func startMicSTSession(inputFormat: AVAudioFormat) async throws {
+        let locale = VocabularyProvider.speechLocale
+        // .progressiveTranscription emits isFinal results every ~1-2s rather than waiting
+        // for a full utterance boundary (~14s with .transcription). This eliminates the
+        // long-buffer window that caused hallucinations on the first chunk.
+        let transcriber = SpeechTranscriber(locale: locale, preset: .progressiveTranscription)
+        let vocab = VocabularyProvider.allTerms
+        let analyzer = SpeechAnalyzer(modules: [transcriber])
+        if !vocab.isEmpty {
+            let ctx = AnalysisContext()
+            ctx.contextualStrings[.general] = vocab
+            try await analyzer.setContext(ctx)
+        }
+
+        guard let bestFmt = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
+            throw MicSTError.noAvailableFormat
+        }
+        guard let converter = AVAudioConverter(from: inputFormat, to: bestFmt) else {
+            throw MicSTError.converterFailed(inputFormat: inputFormat, outputFormat: bestFmt)
+        }
+
+        SessionLogger.shared.log(
+            "[Mic-ST] preparing"
+            + " inputFmt=\(inputFormat.sampleRate)Hz/\(inputFormat.channelCount)ch"
+            + " targetFmt=\(bestFmt.sampleRate)Hz/\(bestFmt.channelCount)ch"
+            + " locale=\(locale.identifier)"
+            + " vocab=\(vocab.count)terms"
+        )
+
+        try await analyzer.prepareToAnalyze(in: bestFmt)
+        SessionLogger.shared.log("[Mic-ST] prepareToAnalyze complete")
+
+        let (stream, continuation) = AsyncStream<AnalyzerInput>.makeStream(bufferingPolicy: .unbounded)
+        let feed = MicTranscriberFeed()
+        feed.arm(continuation: continuation, converter: converter, targetFormat: bestFmt)
+        micSTFeed        = feed
+        micSTAnalyzer    = analyzer
+        micSTTranscriber = transcriber
+
+        let metrics = MicSTSessionMetrics()
+        micSTMetrics = metrics
+        micSTSamplingTask = Task.detached { [weak metrics] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                guard !Task.isCancelled else { break }
+                metrics?.record(cpu: sampleCPUUsage(), ram: sampleRAMMB())
+            }
+        }
+
+        micSTAnalyzeTask = Task.detached {
+            do {
+                _ = try await analyzer.analyzeSequence(stream)
+                await SessionLogger.shared.log("[Mic-ST] analyzeSequence returned")
+            } catch {
+                await SessionLogger.shared.log("[Mic-ST] analyzeSequence error: \(error)")
+            }
+        }
+
+        micSTResultsTask = Task { @MainActor [weak self, metrics] in
+            guard let self else { return }
+            do {
+                for try await result in transcriber.results {
+                    // Skip progressive (non-final) results — they are intermediate
+                    // refinements of an in-progress utterance. Only isFinal results
+                    // represent a committed, stable transcription segment.
+                    guard result.isFinal else { continue }
+                    let text = String(result.text.characters)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !text.isEmpty else { continue }
+                    if self.transcript.isEmpty {
+                        self.transcript = text
+                    } else {
+                        self.transcript += " " + text
+                    }
+                    self.transcriptChunkCount += 1
+                    metrics.recordResult(text: text, time: CFAbsoluteTimeGetCurrent())
+                    SessionLogger.shared.log(
+                        "[Mic-ST] chunk #\(self.transcriptChunkCount)"
+                        + " seg=\(text.count)ch total=\(self.transcript.count)ch"
+                        + " snippet=\"\(String(text.prefix(50)))\""
+                    )
+                    RecognitionDiagnostics.shared.micGenerationCallback(
+                        gen: 0, chars: self.transcript.count,
+                        snippet: String(text.prefix(50))
+                    )
+                    ServiceContainer.shared.resolve(TranscriptStore.self)
+                        .updateMic(self.speakerTranscript)
+                }
+            } catch {
+                SessionLogger.shared.log("[Mic-ST] results error: \(error)")
+            }
+            SessionLogger.shared.log(
+                "[Mic-ST] results sequence complete total=\(self.transcript.count)ch"
+            )
+        }
+
+        SessionLogger.shared.log("[Mic-ST] session ready")
     }
 
     /// Creates the CAF file that audio buffers are written to during recording.
@@ -667,4 +969,235 @@ final class RecordingService: Service {
             + "Ensure the app is signed and running in its expected sandbox container."
         }
     }
+}
+
+// MARK: - MicSTError (Phase 2A)
+
+@available(macOS 26.0, *)
+private enum MicSTError: LocalizedError {
+    case noAvailableFormat
+    case converterFailed(inputFormat: AVAudioFormat, outputFormat: AVAudioFormat)
+
+    var errorDescription: String? {
+        switch self {
+        case .noAvailableFormat:
+            return "SpeechTranscriber: no compatible audio format available on this device."
+        case let .converterFailed(i, o):
+            return "SpeechTranscriber: cannot build converter from \(i.sampleRate)Hz to \(o.sampleRate)Hz."
+        }
+    }
+}
+
+// MARK: - MicTranscriberFeed (Phase 2A)
+
+/// Thread-safe bridge between the Core-Audio real-time tap and the SpeechTranscriber
+/// AsyncStream. Resamples each captured buffer to the analyser's required format
+/// (16 kHz Int16 mono) and yields it as an `AnalyzerInput`.
+///
+/// `@unchecked Sendable`: every property is accessed exclusively under `lock` (NSLock),
+/// which serialises the Core-Audio I/O thread (`feed`) and the MainActor (`arm`/`disarm`).
+@available(macOS 26.0, *)
+private final class MicTranscriberFeed: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: AsyncStream<AnalyzerInput>.Continuation?
+    private var converter:    AVAudioConverter?
+    private var targetFormat: AVAudioFormat?
+
+    func arm(
+        continuation: AsyncStream<AnalyzerInput>.Continuation,
+        converter:    AVAudioConverter,
+        targetFormat: AVAudioFormat
+    ) {
+        lock.withLock {
+            self.continuation = continuation
+            self.converter    = converter
+            self.targetFormat = targetFormat
+        }
+    }
+
+    /// Finish the stream continuation and release all resources.
+    /// Finishing the continuation triggers `analyzeSequence` to return once the
+    /// stream drains; call `finalizeAndFinishThroughEndOfInput()` after that to
+    /// close `transcriber.results`.
+    func disarm() {
+        var cont: AsyncStream<AnalyzerInput>.Continuation?
+        lock.withLock {
+            cont              = self.continuation
+            self.continuation = nil
+            self.converter    = nil
+            self.targetFormat = nil
+        }
+        cont?.finish()
+    }
+
+    /// Convert and forward one audio buffer. No-ops when not armed.
+    /// Called on the Core-Audio real-time I/O thread.
+    func feed(_ buffer: AVAudioPCMBuffer) {
+        lock.withLock {
+            guard let cont = continuation,
+                  let conv = converter,
+                  let fmt  = targetFormat else { return }
+
+            let ratio  = fmt.sampleRate / buffer.format.sampleRate
+            let dstCap = AVAudioFrameCount(ceil(Double(buffer.frameLength) * ratio) + 64)
+            guard let dst = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: dstCap) else { return }
+
+            var srcConsumed = false
+            let status = conv.convert(to: dst, error: nil) { _, outStatus in
+                if srcConsumed { outStatus.pointee = .noDataNow; return nil }
+                srcConsumed = true
+                outStatus.pointee = .haveData
+                return buffer
+            }
+            guard status != .error, dst.frameLength > 0 else { return }
+            cont.yield(AnalyzerInput(buffer: dst))
+        }
+    }
+}
+
+// MARK: - MicSTSessionMetrics (Phase 2A benchmark)
+
+/// Accumulates performance metrics for the SpeechTranscriber mic pipeline.
+/// Written to SessionLogger as a `[Mic-ST Summary]` block at the end of each session.
+///
+/// All mutation is serialised under `lock`; safe to call from both MainActor
+/// (result callbacks) and Task.detached (CPU/RAM sampling).
+final class MicSTSessionMetrics: @unchecked Sendable {
+
+    private let lock = NSLock()
+
+    /// Wall-clock reference for latency and duration calculations.
+    /// Set once at init; never mutated.
+    let sessionStartTime: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()
+
+    private var _firstResultTime: CFAbsoluteTime?
+    private var _lastResultTime:  CFAbsoluteTime?
+    private var _segmentCount  = 0
+    private var _totalWords    = 0
+    private var _totalChars    = 0
+    private var _maxGap:       Double = 0
+    private var _totalGapTime: Double = 0
+    private var _gapCount      = 0
+    private var _cpuSamples:   [Double] = []
+    private var _ramSamples:   [Double] = []
+
+    /// Record one transcription result. Call from the results task on MainActor.
+    func recordResult(text: String, time: CFAbsoluteTime) {
+        lock.withLock {
+            if _firstResultTime == nil { _firstResultTime = time }
+            if let prev = _lastResultTime {
+                let gap = time - prev
+                _totalGapTime += gap
+                _gapCount     += 1
+                if gap > _maxGap { _maxGap = gap }
+            }
+            _lastResultTime  = time
+            _segmentCount   += 1
+            _totalChars     += text.count
+            _totalWords     += text.split(whereSeparator: \.isWhitespace).count
+        }
+    }
+
+    /// Record one CPU/RAM sample. Call from the periodic sampling Task.detached.
+    func record(cpu: Double, ram: Double) {
+        lock.withLock {
+            _cpuSamples.append(cpu)
+            _ramSamples.append(ram)
+        }
+    }
+
+    /// Build the formatted `[Mic-ST Summary]` string. Call once at session end.
+    func summary(sessionEndTime: CFAbsoluteTime) -> String {
+        lock.withLock {
+            let duration = sessionEndTime - sessionStartTime
+            let durMins  = Int(duration) / 60
+            let durSecs  = Int(duration) % 60
+
+            let latency = _firstResultTime.map { $0 - sessionStartTime }
+
+            let fmt = DateFormatter()
+            fmt.dateFormat = "HH:mm:ss.SSS"
+            let firstCallbackStr = _firstResultTime
+                .map { fmt.string(from: Date(timeIntervalSinceReferenceDate: $0)) } ?? "n/a"
+            let lastCallbackStr  = _lastResultTime
+                .map { fmt.string(from: Date(timeIntervalSinceReferenceDate: $0)) } ?? "n/a"
+
+            let wpm = duration > 0 ? Double(_totalWords) / (duration / 60.0) : 0
+
+            let avgGap  = _gapCount > 0 ? _totalGapTime / Double(_gapCount) : 0
+            let cpuAvg  = _cpuSamples.isEmpty ? 0.0 : _cpuSamples.reduce(0, +) / Double(_cpuSamples.count)
+            let cpuPeak = _cpuSamples.max() ?? 0.0
+            let ramAvg  = _ramSamples.isEmpty ? 0.0 : _ramSamples.reduce(0, +) / Double(_ramSamples.count)
+            let ramPeak = _ramSamples.max() ?? 0.0
+
+            let latStr  = latency.map { String(format: "%.2fs", $0) } ?? "n/a"
+            let gapLong = _maxGap > 0 ? String(format: "%.2fs", _maxGap) : "n/a"
+            let gapAvg  = _gapCount > 0 ? String(format: "%.2fs", avgGap) : "n/a"
+
+            return """
+            [Mic-ST Summary]
+              SpeechTranscriber enabled = true
+              SFSpeechRecognizer enabled = false
+              duration = \(durMins)m \(durSecs)s
+              first result latency = \(latStr)
+              first transcript callback = \(firstCallbackStr)
+              last transcript callback = \(lastCallbackStr)
+              total words = \(_totalWords)
+              total characters = \(_totalChars)
+              total segments = \(_segmentCount)
+              words per minute = \(String(format: "%.1f", wpm))
+              longest result gap = \(gapLong)
+              average result gap = \(gapAvg)
+              CPU average = \(String(format: "%.1f%%", cpuAvg))
+              CPU peak = \(String(format: "%.1f%%", cpuPeak))
+              RAM average = \(String(format: "%.0f MB", ramAvg))
+              RAM peak = \(String(format: "%.0f MB", ramPeak))
+            """
+        }
+    }
+}
+
+// MARK: - System metrics sampling
+
+/// Returns the current process CPU usage summed across all threads.
+/// Based on `thread_basic_info.cpu_usage` scaled by `TH_USAGE_SCALE`.
+private func sampleCPUUsage() -> Double {
+    var threadList: thread_act_array_t?
+    var threadCount: mach_msg_type_number_t = 0
+    guard task_threads(mach_task_self_, &threadList, &threadCount) == KERN_SUCCESS,
+          let list = threadList else { return 0 }
+    defer {
+        vm_deallocate(mach_task_self_,
+                      vm_address_t(UInt(bitPattern: list)),
+                      vm_size_t(threadCount) * vm_size_t(MemoryLayout<thread_t>.size))
+    }
+    var total = 0.0
+    for i in 0..<Int(threadCount) {
+        var info  = thread_basic_info()
+        var count = mach_msg_type_number_t(THREAD_INFO_MAX)
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: 1) {
+                thread_info(list[i], thread_flavor_t(THREAD_BASIC_INFO), $0, &count)
+            }
+        }
+        if kr == KERN_SUCCESS, info.flags & TH_FLAGS_IDLE == 0 {
+            total += Double(info.cpu_usage) / Double(TH_USAGE_SCALE) * 100.0
+        }
+    }
+    return total
+}
+
+/// Returns the current process resident memory in megabytes via `mach_task_basic_info`.
+private func sampleRAMMB() -> Double {
+    var info  = mach_task_basic_info()
+    var count = mach_msg_type_number_t(
+        MemoryLayout<mach_task_basic_info>.size / MemoryLayout<integer_t>.size
+    )
+    let kr = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: 1) {
+            task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+        }
+    }
+    guard kr == KERN_SUCCESS else { return 0 }
+    return Double(info.resident_size) / (1024.0 * 1024.0)
 }

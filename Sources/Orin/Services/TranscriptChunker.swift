@@ -328,12 +328,18 @@ enum TranscriptChunker {
             .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
 
         func matching(_ kws: [String]) -> [String] {
-            Array(lines.filter { l in let lo = l.lowercased(); return kws.contains { lo.contains($0) } }.prefix(4))
+            Array(
+                lines
+                    .filter { l in let lo = l.lowercased(); return kws.contains { lo.contains($0) } }
+                    .map { MeetingIntelligenceService.cleanTranscriptLine($0) }
+                    .filter { !$0.isEmpty }
+                    .prefix(4)
+            )
         }
-        analysis.decisions  = matching(["decided", "agreed", "approved"])
+        analysis.decisions   = matching(["decided", "agreed", "approved"])
         analysis.commitments = matching(["i will", "i'll", "will send", "will prepare"])
         analysis.actionItems = matching(["action", "todo", "next step", "follow up"])
-        analysis.keyPoints  = Array(lines.prefix(2))
+        analysis.keyPoints   = Array(lines.prefix(2).map { MeetingIntelligenceService.cleanTranscriptLine($0) }.filter { !$0.isEmpty })
         return analysis
     }
 

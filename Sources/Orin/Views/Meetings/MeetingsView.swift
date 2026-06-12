@@ -1618,11 +1618,11 @@ private struct MeetingDetailView: View {
             }
         }
         .onChange(of: recordingService.speakerTranscript) { _, labeled in
-            guard wasRecordingThisMeeting else { return }
+            guard wasRecordingThisMeeting, !FeatureFlags.useNewMicPipeline else { return }
             transcriptStore.updateMic(labeled)
         }
         .onChange(of: systemAudioService.participantSpeakerTranscript) { _, labeled in
-            guard wasRecordingThisMeeting else { return }
+            guard wasRecordingThisMeeting, !FeatureFlags.useNewParticipantPipeline else { return }
             transcriptStore.updateParticipant(labeled)
         }
         .onChange(of: recordingService.isRecording) { _, isNow in

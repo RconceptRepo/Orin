@@ -62,11 +62,15 @@ final class TapState: @unchecked Sendable {
     }
 #endif
 
-    /// Arm both resources. Call on MainActor **before** `installTap`.
+    /// Arm for recording. Call on MainActor **before** `installTap`.
     /// Resets the write-failure flag so a new session always starts clean.
+    ///
+    /// `recognitionRequest` is optional: pass `nil` when the SpeechTranscriber
+    /// pipeline is active (Phase 2A) — audio is still written to `audioFile`
+    /// but `recognitionRequest?.append(_:)` becomes a no-op in `feed`.
     func arm(
         audioFile: AVAudioFile,
-        recognitionRequest: SFSpeechAudioBufferRecognitionRequest
+        recognitionRequest: SFSpeechAudioBufferRecognitionRequest? = nil
     ) {
         lock.withLock {
             self.audioFile          = audioFile

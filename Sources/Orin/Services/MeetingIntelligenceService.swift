@@ -167,13 +167,13 @@ final class MeetingIntelligenceService: Service {
 
         // If parsing produced almost nothing, run keyword fallback for missing sections
         let decisions     = parsed.decisions.isEmpty
-            ? extractLines(from: transcript, matching: ["decided", "decision", "agreed", "approved", "will proceed", "confirmed"])
+            ? extractCleanLines(from: transcript, matching: ["decided", "decision", "agreed", "approved", "will proceed", "confirmed"])
             : parsed.decisions
         let commitments   = parsed.commitments.isEmpty
-            ? extractLines(from: transcript, matching: ["i will", "i'll", "we will", "will send", "will prepare", "will schedule"])
+            ? extractCleanLines(from: transcript, matching: ["i will", "i'll", "we will", "will send", "will prepare", "will schedule"])
             : parsed.commitments
         let actionItems   = parsed.structuredActionItems.isEmpty
-            ? extractLines(from: transcript, matching: ["action", "todo", "to do", "next step", "follow up", "need to", "should"])
+            ? extractCleanLines(from: transcript, matching: ["action", "todo", "to do", "next step", "follow up", "need to", "should"])
             : parsed.structuredActionItems.map { "[\($0.owner)] \($0.task)" }
         let suggestedTasks = buildSuggestedTasks(
             title: title,
@@ -507,9 +507,9 @@ final class MeetingIntelligenceService: Service {
 
     private func keywordFallback(title: String, transcript: String, meetingType: String) -> MeetingAnalysis {
         let summary       = fallbackSummary(transcript)
-        let decisions     = extractLines(from: transcript, matching: ["decided", "decision", "agreed", "approved"])
-        let commitments   = extractLines(from: transcript, matching: ["i will", "i'll", "we will", "follow up", "will send"])
-        let actionItems   = extractLines(from: transcript, matching: ["action", "todo", "to do", "next step", "follow up"])
+        let decisions     = extractCleanLines(from: transcript, matching: ["decided", "decision", "agreed", "approved"])
+        let commitments   = extractCleanLines(from: transcript, matching: ["i will", "i'll", "we will", "follow up", "will send"])
+        let actionItems   = extractCleanLines(from: transcript, matching: ["action", "todo", "to do", "next step", "follow up"])
         let suggestedTasks = buildSuggestedTasks(title: title, commitments: commitments,
                                                  actionItems: actionItems, structuredItems: [])
         return MeetingAnalysis(
@@ -544,7 +544,12 @@ final class MeetingIntelligenceService: Service {
         return sentences.prefix(3).joined(separator: ". ") + (sentences.isEmpty ? "" : ".")
     }
 
-    private func extractLines(from transcript: String, matching keywords: [String]) -> [String] {
+    /// Extracts lines matching any of the given keywords, then strips transcript
+    /// formatting (timestamps, speaker labels) to produce readable action items.
+    ///
+    /// This replaces the old `extractLines` which returned raw timestamped lines
+    /// verbatim — those were unreadable and contained full transcript paragraphs.
+    private func extractCleanLines(from transcript: String, matching keywords: [String]) -> [String] {
         let candidates = transcript
             .components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -555,8 +560,41 @@ final class MeetingIntelligenceService: Service {
                     let lower = line.lowercased()
                     return keywords.contains { lower.contains($0) }
                 }
+                .map { Self.cleanTranscriptLine($0) }
+                .filter { !$0.isEmpty }
                 .prefix(8)
         )
+    }
+
+    /// Strips `[MM:SS]` timestamp prefix and `Speaker:` label from a transcript line,
+    /// then truncates to the first sentence boundary within 200 chars.
+    static func cleanTranscriptLine(_ raw: String) -> String {
+        var text = raw
+        // Remove leading timestamp — e.g. "[06:12] " or "[1:06:12] "
+        if let range = text.range(of: #"^\[\d{1,2}:\d{2}(?::\d{2})?\]\s*"#, options: .regularExpression) {
+            text.removeSubrange(range)
+        }
+        // Remove leading speaker label — e.g. "Me: " or "Participant: " or "Aditi: "
+        if let range = text.range(of: #"^[A-Za-z][A-Za-z\s]{0,20}:\s*"#, options: .regularExpression) {
+            text.removeSubrange(range)
+        }
+        text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Truncate to first sentence within 200 chars to avoid huge chunks
+        if text.count > 200 {
+            let truncated = text.prefix(200)
+            // Try to break at the last sentence-ending punctuation
+            if let dotRange = truncated.range(of: #"[.!?]"#, options: [.regularExpression, .backwards]) {
+                text = String(truncated[truncated.startIndex...dotRange.lowerBound])
+            } else {
+                // Break at last space to avoid cutting mid-word
+                if let spaceRange = truncated.range(of: " ", options: .backwards) {
+                    text = String(truncated[truncated.startIndex..<spaceRange.lowerBound]) + "…"
+                } else {
+                    text = String(truncated) + "…"
+                }
+            }
+        }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func buildSuggestedTasks(
