@@ -130,7 +130,7 @@ final class AIService: Service {
         request.timeoutInterval = 60  // longer for comprehensive analysis
 
         let payload: [String: Any] = [
-            "model": "llama3",
+            "model": "mistral",
             "prompt": prompt,
             "stream": false,
             "options": ["num_predict": maxTokens]
