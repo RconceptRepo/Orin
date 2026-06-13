@@ -19,6 +19,13 @@ struct OrinApp: App {
 #endif
 
     init() {
+        // Register factory defaults so UserDefaults.standard.bool(forKey:) returns
+        // the correct value on a fresh install before the user visits Settings.
+        UserDefaults.standard.register(defaults: [
+            "orin.meetings.autoAnalyze": true,
+            "orin.meetings.minDurationMinutes": 1
+        ])
+
         let schema = Schema([
             TaskItem.self,
             SubTaskItem.self,
