@@ -167,6 +167,19 @@ final class RecordingService: Service {
     @ObservationIgnored private var micSTSamplingTask: Task<Void, Never>?
     @ObservationIgnored private var micSTMetrics: MicSTSessionMetrics?
 
+    /// Token returned by `NotificationCenter.addObserver(forName:...)` for the
+    /// AVAudioEngineConfigurationChange handler. Stored so it can be removed in
+    /// `stopRecording` and `teardownAudioEngine` — forgetting to remove a block-based
+    /// observer leaks the closure and keeps `self` alive indefinitely.
+    @ObservationIgnored private var audioEngineConfigObserver: NSObjectProtocol?
+
+    /// Debounce timestamp for AVAudioEngineConfigurationChange. macOS fires two
+    /// notifications in rapid succession when earbuds connect (device change + sample
+    /// rate change). The second arrives ~4ms after the first handler restarts the engine;
+    /// calling installTap on a running engine crashes Core Audio. Suppress any second
+    /// notification that arrives within 500ms of the previous one.
+    @ObservationIgnored private var lastRouteChangeTime: ContinuousClock.Instant?
+
     // MARK: - Lifecycle
 
     deinit {
@@ -418,6 +431,21 @@ final class RecordingService: Service {
             return
         }
 
+        // When the user switches audio devices mid-session (e.g. plugging in earbuds),
+        // macOS changes the default input device and AVAudioEngine automatically stops,
+        // posting AVAudioEngineConfigurationChange. Without a handler the tap goes silent
+        // for the rest of the session. handleAudioEngineConfigChange reinstalls the tap
+        // on the new device and restarts the engine without tearing down SpeechTranscriber.
+        audioEngineConfigObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: audioEngine,
+            queue: nil
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleAudioEngineConfigChange()
+            }
+        }
+
         phase = .recording
         elapsedSeconds = 0
         transcript = ""
@@ -449,6 +477,11 @@ final class RecordingService: Service {
 
         durationTimer?.invalidate()
         durationTimer = nil
+
+        if let obs = audioEngineConfigObserver {
+            NotificationCenter.default.removeObserver(obs)
+            audioEngineConfigObserver = nil
+        }
 
         audioEngine.stop()
 
@@ -766,6 +799,10 @@ final class RecordingService: Service {
     /// Tears down the audio engine after a mid-startup failure.
     /// Safe to call when no tap is installed (removeTap on an untapped bus is a no-op).
     private func teardownAudioEngine() {
+        if let obs = audioEngineConfigObserver {
+            NotificationCenter.default.removeObserver(obs)
+            audioEngineConfigObserver = nil
+        }
         audioEngine.inputNode.removeTap(onBus: 0)
         micSTSamplingTask?.cancel()
         micSTSamplingTask = nil
@@ -785,6 +822,74 @@ final class RecordingService: Service {
             recognitionTask = nil
         }
         tapState.disarm()
+    }
+
+    // MARK: - Audio device hot-swap handler
+
+    /// Called when AVAudioEngine posts AVAudioEngineConfigurationChange — i.e. the user
+    /// plugged in earbuds, changed the default input device, or the system re-routed audio.
+    /// The engine is already stopped by the time this fires. We reinstall the tap on the
+    /// (potentially new) input node and restart the engine without touching SpeechTranscriber,
+    /// so transcription continues uninterrupted on the new device.
+    @MainActor
+    private func handleAudioEngineConfigChange() {
+        guard phase == .recording else { return }
+
+        let now = ContinuousClock.now
+        if let last = lastRouteChangeTime, now - last < .milliseconds(500) {
+            SessionLogger.shared.log("[Mic] route change: duplicate notification suppressed (< 500ms since last)")
+            return
+        }
+        lastRouteChangeTime = now
+
+        let inputNode = audioEngine.inputNode
+        let newFormat = inputNode.outputFormat(forBus: 0)
+        SessionLogger.shared.log(
+            "[Mic] audio route changed — reinstalling tap"
+            + " newFmt=\(newFormat.sampleRate)Hz/\(newFormat.channelCount)ch"
+        )
+
+        guard newFormat.sampleRate > 0 else {
+            SessionLogger.shared.log("[Mic] route change: new device has invalid format — not re-arming")
+            return
+        }
+
+        // Remove the stale tap. The engine is already stopped; removeTap is a no-op
+        // on an untapped bus, so this is safe whether or not the tap survived the stop.
+        inputNode.removeTap(onBus: 0)
+
+        if FeatureFlags.useNewMicPipeline, #available(macOS 26.0, *) {
+            // Rebuild the resampling converter for the new device's input format.
+            // This is necessary when earbuds have a different native sample rate than
+            // the built-in mic (e.g. 16 kHz earbuds vs 48 kHz built-in).
+            if let feed = micSTFeed as? MicTranscriberFeed {
+                let rebuilt = feed.rebuildConverter(inputFormat: newFormat)
+                SessionLogger.shared.log(
+                    "[Mic] route change: converter rebuild=\(rebuilt)"
+                    + " fmt=\(Int(newFormat.sampleRate))Hz/\(newFormat.channelCount)ch"
+                )
+            }
+            let capturedSTFeed = micSTFeed
+            inputNode.installTap(onBus: 0, bufferSize: 1024, format: newFormat) { [tapState, capturedSTFeed] buffer, _ in
+                tapState.feed(buffer: buffer)
+                if #available(macOS 26.0, *),
+                   let feed = capturedSTFeed as? MicTranscriberFeed {
+                    feed.feed(buffer)
+                }
+            }
+        } else {
+            inputNode.installTap(onBus: 0, bufferSize: 1024, format: newFormat) { [tapState] buffer, _ in
+                tapState.feed(buffer: buffer)
+            }
+        }
+
+        do {
+            audioEngine.prepare()
+            try audioEngine.start()
+            SessionLogger.shared.log("[Mic] route change: engine restarted successfully")
+        } catch {
+            SessionLogger.shared.log("[Mic] route change: engine restart failed — \(error)")
+        }
     }
 
     // MARK: - SpeechTranscriber mic session (Phase 2A)
@@ -1028,6 +1133,21 @@ private final class MicTranscriberFeed: @unchecked Sendable {
             self.targetFormat = nil
         }
         cont?.finish()
+    }
+
+    /// Rebuilds the AVAudioConverter for a new input format after an audio route change.
+    /// Called from the main actor before the new tap is installed.
+    /// Returns true if a new converter was successfully created; false if not armed or
+    /// the converter cannot be built (e.g. incompatible format pair).
+    func rebuildConverter(inputFormat: AVAudioFormat) -> Bool {
+        lock.withLock {
+            guard let tf = self.targetFormat,
+                  let newConverter = AVAudioConverter(from: inputFormat, to: tf) else {
+                return false
+            }
+            self.converter = newConverter
+            return true
+        }
     }
 
     /// Convert and forward one audio buffer. No-ops when not armed.

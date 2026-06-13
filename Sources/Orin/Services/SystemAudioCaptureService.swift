@@ -3,6 +3,7 @@ import CoreGraphics
 import CoreMedia
 import Foundation
 import OSLog
+import Security
 import Observation
 import ScreenCaptureKit
 import Speech
@@ -103,9 +104,41 @@ final class SystemAudioCaptureService: Service {
         // startSession() is idempotent — RecordingService may have already opened it.
         SessionLogger.shared.startSession()
 
+        // ── STEP_00: Identity and TCC probe ──────────────────────────────────
+        // Runs unconditionally before any guard so the data is always captured.
+        // CGRequestScreenCaptureAccess() is intentionally NOT called here — it
+        // shows a user-facing dialog and would change behavior.
+        let _bundleID     = Bundle.main.bundleIdentifier ?? "nil"
+        let _execPath     = Bundle.main.executablePath   ?? "nil"
+        let _cgPreflight  = CGPreflightScreenCaptureAccess()
+        let _speechAuth0  = SFSpeechRecognizer.authorizationStatus()
+        var _csInfo       = "unavailable"
+        var _sc0: SecCode?
+        if SecCodeCopySelf(SecCSFlags(), &_sc0) == errSecSuccess, let _sc0 {
+            var _stc0: SecStaticCode?
+            if SecCodeCopyStaticCode(_sc0, SecCSFlags(), &_stc0) == errSecSuccess, let _stc0 {
+                var _infoRef: CFDictionary?
+                // SecCSFlags rawValue 2 = kSecCSSigningInformation
+                if SecCodeCopySigningInformation(_stc0, SecCSFlags(rawValue: UInt32(2)), &_infoRef) == errSecSuccess,
+                   let _d = _infoRef as? [String: Any] {
+                    let _id   = _d[kSecCodeInfoIdentifier     as String] as? String ?? "none"
+                    let _team = _d[kSecCodeInfoTeamIdentifier as String] as? String ?? "no-team"
+                    _csInfo = "id=\(_id) team=\(_team)"
+                }
+            }
+        }
+        SessionLogger.shared.log(
+            "[Participant] STEP_00 START"
+            + " bundleID=\(_bundleID)"
+            + " execPath=\(_execPath)"
+            + " CGPreflightScreenCapture=\(_cgPreflight)"
+            + " speechAuth=\(_speechAuth0.rawValue)(0=notDetermined,1=denied,2=restricted,3=authorized)"
+            + " codesigning=[\(_csInfo)]"
+        )
+
         guard !isCapturing else {
             SessionLogger.shared.log(
-                "[Participant] EXIT_01 already capturing"
+                "[Participant] STEP_01 FAIL — already capturing"
                 + " auth=\(SFSpeechRecognizer.authorizationStatus().rawValue)"
                 + " recognizerAvail=\(speechRecognizer?.isAvailable ?? false)"
             )
@@ -117,41 +150,28 @@ final class SystemAudioCaptureService: Service {
 
         let speechAuth = SFSpeechRecognizer.authorizationStatus()
         SessionLogger.shared.log(
-            "[Participant] STEP_01 entered"
+            "[Participant] STEP_01 PASS — not already capturing"
             + " meetingID=\(String(describing: meetingID))"
             + " auth=\(speechAuth.rawValue)"
             + " recognizerNil=\(speechRecognizer == nil)"
             + " recognizerAvail=\(speechRecognizer?.isAvailable ?? false)"
         )
 
-        guard speechAuth == .authorized else {
-            SessionLogger.shared.log(
-                "[Participant] EXIT_02 speech not authorized"
-                + " auth=\(speechAuth.rawValue)"
-                + " recognizerAvail=\(speechRecognizer?.isAvailable ?? false)"
-                + " displays=N/A SCKit=not_called"
-            )
-            isCapturing = false
-            return
-        }
-
-        guard let recognizer = speechRecognizer, recognizer.isAvailable else {
-            SessionLogger.shared.log(
-                "[Participant] EXIT_03 recognizer nil or unavailable"
-                + " auth=\(speechAuth.rawValue)"
-                + " recognizerNil=\(speechRecognizer == nil)"
-                + " recognizerAvail=\(speechRecognizer?.isAvailable ?? false)"
-                + " displays=N/A SCKit=not_called"
-            )
-            isCapturing = false
-            return
-        }
-
+        // SFSpeechRecognizer authorization is not required for the SpeechTranscriber
+        // participant pipeline. The legacy guard (speechAuth == .authorized) was gating
+        // SCStream startup for no valid reason in Phase 2. Bypassed.
         SessionLogger.shared.log(
-            "[Participant] STEP_02 recognizer ready"
-            + " locale=\(recognizer.locale.identifier)"
-            + " available=\(recognizer.isAvailable)"
-            + " supportsOnDevice=\(recognizer.supportsOnDeviceRecognition)"
+            "[Participant] STEP_02 PASS — SFSpeechRecognizer auth check bypassed (SpeechTranscriber pipeline)"
+            + " auth=\(speechAuth.rawValue)"
+            + " CGPreflightScreenCapture=\(CGPreflightScreenCaptureAccess())"
+        )
+
+        // Recognizer is only used by the legacy SFSpeechRecognizer branch.
+        let recognizer = speechRecognizer
+        SessionLogger.shared.log(
+            "[Participant] STEP_03 PASS — proceeding to SCStream"
+            + " recognizerAvail=\(recognizer?.isAvailable ?? false)"
+            + " legacyActive=\(!FeatureFlags.useNewParticipantPipeline)"
         )
 
         // Fetch shareable content — requires Screen Recording permission.
@@ -159,7 +179,7 @@ final class SystemAudioCaptureService: Service {
         // enable Screen Recording in System Settings → Privacy & Security.
         let cgPreflight = CGPreflightScreenCaptureAccess()
         SessionLogger.shared.log(
-            "[Participant] STEP_03 calling SCShareableContent"
+            "[Participant] STEP_04 START — SCShareableContent query"
             + " CGPreflightScreenCaptureAccess=\(cgPreflight)"
         )
         let content: SCShareableContent
@@ -170,10 +190,9 @@ final class SystemAudioCaptureService: Service {
         } catch {
             let ns = error as NSError
             SessionLogger.shared.log(
-                "[Participant] EXIT_04 SCShareableContent threw"
+                "[Participant] STEP_04 FAIL — SCShareableContent threw"
                 + " auth=\(speechAuth.rawValue)"
-                + " recognizerAvail=\(recognizer.isAvailable)"
-                + " displays=N/A"
+                + " recognizerAvail=\(recognizer?.isAvailable ?? false)"
                 + " SCKit=domain:\(ns.domain) code:\(ns.code) desc:\(ns.localizedDescription)"
             )
             isCapturing = false
@@ -182,7 +201,7 @@ final class SystemAudioCaptureService: Service {
 
         let displayCount = content.displays.count
         SessionLogger.shared.log(
-            "[Participant] STEP_04 SCShareableContent ok"
+            "[Participant] STEP_04 PASS — SCShareableContent ok"
             + " displays=\(displayCount)"
             + " windows=\(content.windows.count)"
             + " apps=\(content.applications.count)"
@@ -190,16 +209,16 @@ final class SystemAudioCaptureService: Service {
 
         guard let display = content.displays.first else {
             SessionLogger.shared.log(
-                "[Participant] EXIT_05 no displays found"
+                "[Participant] STEP_05 FAIL — no displays found"
                 + " auth=\(speechAuth.rawValue)"
-                + " recognizerAvail=\(recognizer.isAvailable)"
+                + " recognizerAvail=\(recognizer?.isAvailable ?? false)"
                 + " displays=0 SCKit=ok"
             )
             isCapturing = false
             return
         }
 
-        SessionLogger.shared.log("[Participant] STEP_05 display selected id=\(display.displayID)")
+        SessionLogger.shared.log("[Participant] STEP_05 PASS — display selected id=\(display.displayID)")
 
         // Reset per-session state
         transcriptPrefix         = ""
@@ -210,9 +229,9 @@ final class SystemAudioCaptureService: Service {
         probeHeuristicExtraChars = 0
         RecognitionDiagnostics.shared.resetParticipantChannel(
             authStatus: speechAuth,
-            recognizerAvailable: recognizer.isAvailable,
-            supportsOnDevice: recognizer.supportsOnDeviceRecognition,
-            locale: recognizer.locale.identifier
+            recognizerAvailable: recognizer?.isAvailable ?? false,
+            supportsOnDevice: recognizer?.supportsOnDeviceRecognition ?? false,
+            locale: recognizer?.locale.identifier ?? "n/a"
         )
 
         // When the SpeechTranscriber pipeline is active, skip the legacy
@@ -224,15 +243,19 @@ final class SystemAudioCaptureService: Service {
         //      with stale legacy content, causing the participantChars oscillation
         //      observed in session logs.
         if !FeatureFlags.useNewParticipantPipeline {
-            let request = buildRecognitionRequest(recognizer: recognizer)
-            tapState.arm(request: request)
-            SessionLogger.shared.log(
-                "[Participant] STEP_06 recognition task creating"
-                + " taskHint=\(request.taskHint.rawValue)"
-                + " partialResults=\(request.shouldReportPartialResults)"
-                + " requiresOnDevice=\(request.requiresOnDeviceRecognition)"
-            )
-            startRecognitionTask(with: recognizer, request: request)
+            if let rec = recognizer, rec.isAvailable {
+                let request = buildRecognitionRequest(recognizer: rec)
+                tapState.arm(request: request)
+                SessionLogger.shared.log(
+                    "[Participant] STEP_06 recognition task creating"
+                    + " taskHint=\(request.taskHint.rawValue)"
+                    + " partialResults=\(request.shouldReportPartialResults)"
+                    + " requiresOnDevice=\(request.requiresOnDeviceRecognition)"
+                )
+                startRecognitionTask(with: rec, request: request)
+            } else {
+                SessionLogger.shared.log("[Participant] STEP_06 legacy pipeline skipped — recognizer unavailable")
+            }
         } else {
             SessionLogger.shared.log(
                 "[Participant] STEP_06 legacy recognizer disabled — useNewParticipantPipeline=YES"
@@ -268,7 +291,7 @@ final class SystemAudioCaptureService: Service {
         )
 
         SessionLogger.shared.log(
-            "[Participant] STEP_07 SCStream configured"
+            "[Participant] STEP_06 PASS — SCStream configured"
             + " capturesAudio=\(config.capturesAudio)"
             + " excludesCurrentProcess=\(config.excludesCurrentProcessAudio)"
         )
@@ -296,19 +319,22 @@ final class SystemAudioCaptureService: Service {
             stream      = newStream
             isCapturing = true
             isAvailable = true
+            let recAvail = recognizer?.isAvailable ?? false
+            let recOnDevice = recognizer?.supportsOnDeviceRecognition ?? false
             SessionLogger.shared.log(
-                "[Participant] STEP_08 stream started"
+                "[Participant] STEP_07 PASS — SCStream startCapture succeeded"
                 + " auth=\(speechAuth.rawValue)"
-                + " recognizerAvail=\(recognizer.isAvailable)"
-                + " supportsOnDevice=\(recognizer.supportsOnDeviceRecognition)"
+                + " recognizerAvail=\(recAvail)"
+                + " supportsOnDevice=\(recOnDevice)"
                 + " displays=\(displayCount)"
             )
         } catch {
             let ns = error as NSError
+            let recAvail2 = recognizer?.isAvailable ?? false
             SessionLogger.shared.log(
-                "[Participant] EXIT_06 SCStream.startCapture failed"
+                "[Participant] STEP_07 FAIL — SCStream.startCapture threw"
                 + " auth=\(speechAuth.rawValue)"
-                + " recognizerAvail=\(recognizer.isAvailable)"
+                + " recognizerAvail=\(recAvail2)"
                 + " displays=\(displayCount)"
                 + " SCKit=domain:\(ns.domain) code:\(ns.code) desc:\(ns.localizedDescription)"
             )
@@ -732,6 +758,10 @@ private final class SystemAudioStreamDelegate: NSObject, SCStreamOutput, SCStrea
     private let stFeed:    Any?    // ParticipantSTFeed when macOS 26+
     private let onStopped: (Error) -> Void
 
+    // Thread-safe first-buffer probe: proves SCStream is actually delivering audio.
+    private let firstBufferLock = NSLock()
+    private var firstBufferSeen = false
+
     init(tapState: SystemAudioTapState, stFeed: Any?, onStopped: @escaping (Error) -> Void) {
         self.tapState  = tapState
         self.stFeed    = stFeed
@@ -747,6 +777,23 @@ private final class SystemAudioStreamDelegate: NSObject, SCStreamOutput, SCStrea
     ) {
         guard outputType == .audio else { return }
         guard let pcm = convertToAVAudioPCMBuffer(sampleBuffer) else { return }
+
+        // Log STEP_08 exactly once — proves audio is flowing from SCStream.
+        firstBufferLock.lock()
+        let isFirst = !firstBufferSeen
+        if isFirst { firstBufferSeen = true }
+        firstBufferLock.unlock()
+        if isFirst {
+            let sr = pcm.format.sampleRate
+            let ch = pcm.format.channelCount
+            Task { @MainActor in
+                SessionLogger.shared.log(
+                    "[Participant] STEP_08 PASS — first audio buffer from SCStream"
+                    + " format=\(Int(sr))Hz/\(ch)ch frames=\(pcm.frameLength)"
+                )
+            }
+        }
+
         tapState.feed(pcm)                                          // legacy pipeline (always active)
         if #available(macOS 26.0, *),
            let feed = stFeed as? ParticipantSTFeed {
