@@ -33,17 +33,12 @@ struct AIConfiguration {
     var localOllamaEndpoint = "http://localhost:11434"
 }
 
-final class AIService: Service, @unchecked Sendable {
+final class AIService: Service {
     private var config: AIConfiguration
 
     static let openAIAccount    = "openai"
     static let anthropicAccount = "anthropic"
     static let geminiAccount    = "gemini"
-
-    // Availability cache: avoids one 3-second HTTP health-check per generate() call.
-    // Benign race between concurrent chunk tasks — worst case is a few redundant checks.
-    private var _ollamaAvailableUntil = Date.distantPast
-    private var _ollamaAvailableCached = false
 
     init(config: AIConfiguration) {
         self.config = config
@@ -111,20 +106,13 @@ final class AIService: Service, @unchecked Sendable {
     // MARK: - Ollama availability check
 
     func isOllamaAvailable(endpoint: String) async -> Bool {
-        if Date() < _ollamaAvailableUntil { return _ollamaAvailableCached }
         guard let url = URL(string: "\(endpoint)/api/tags") else { return false }
         var request = URLRequest(url: url)
         request.timeoutInterval = 3
         do {
             let (_, response) = try await URLSession.shared.data(for: request)
-            let available = (response as? HTTPURLResponse)?.statusCode == 200
-            _ollamaAvailableCached = available
-            _ollamaAvailableUntil = Date(timeIntervalSinceNow: available ? 30 : 5)
-            return available
+            return (response as? HTTPURLResponse)?.statusCode == 200
         } catch {
-            // Expected when Ollama is not running — fallback to next provider
-            _ollamaAvailableCached = false
-            _ollamaAvailableUntil = Date(timeIntervalSinceNow: 5)
             aiLogger.debug("Ollama availability check failed: \(error)")
             return false
         }
