@@ -328,7 +328,7 @@ def parse_response(text: str) -> dict:
         if not s or s in ("None", "- None"):
             continue
 
-        # Detect section header
+        # Pattern 1: ## SECTION HEADER or ** SECTION HEADER
         header_match = re.match(r'^[#*]+\s*(.*?)[\s:]*$', s)
         if header_match:
             candidate = header_match.group(1)
@@ -336,15 +336,25 @@ def parse_response(text: str) -> dict:
             if sec:
                 current = sec
                 continue
-        # Plain "SECTION:" header style
+
+        # Pattern 2: SECTION: inline-content  (e.g. "DECISIONS: None")
         colon_match = re.match(r'^([A-Z][A-Z\s]+):\s*(.*)', s)
         if colon_match:
             sec = _section_name(colon_match.group(1))
             if sec:
                 current = sec
                 inline = colon_match.group(2).strip()
-                if inline:
+                if inline and inline not in ("None", "- None"):
                     sections.get(current, []).append(inline)
+                continue
+
+        # Pattern 3: plain uppercase header with no markup (phi3 style)
+        # e.g. "ACTION ITEMS", "DECISIONS", "KEY POINTS"
+        plain_match = re.match(r'^([A-Z][A-Z\s]{3,})$', s)
+        if plain_match:
+            sec = _section_name(plain_match.group(1).strip())
+            if sec:
+                current = sec
                 continue
 
         if current == "actions":
@@ -381,10 +391,10 @@ def _parse_action_item_line(line: str) -> Optional[dict]:
         if len(kv) != 2:
             continue
         key, val = kv[0].strip().upper(), kv[1].strip()
-        if key == "OWNER":    result["owner"]    = val or "Team"
-        elif key == "TASK":   result["task"]     = val
-        elif key == "PRIORITY": result["priority"] = val.capitalize()
-        elif key == "DUE":    result["due"]      = "" if val.upper() in ("TBD", "") else val
+        if key in ("OWNER", "OWNERS"):  result["owner"]    = val or "Team"
+        elif key == "TASK":            result["task"]     = val
+        elif key == "PRIORITY":        result["priority"] = val.split()[0].capitalize() if val else "Medium"
+        elif key == "DUE":             result["due"]      = "" if val.upper() in ("TBD", "") else val
     return result if result["task"] else None
 
 

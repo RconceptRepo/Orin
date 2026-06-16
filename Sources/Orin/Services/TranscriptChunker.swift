@@ -369,11 +369,28 @@ enum TranscriptChunker {
         var analysis = ChunkAnalysis(index: 0)
         var currentSection = ""
 
+        // Accumulator for phi3's multi-line action item format:
+        //   Owners: x\nTask: y\nPriority: z | Due: TBD
+        // Flushed whenever a new item starts or the section ends.
+        var pendingOwner = "Team", pendingTask = "", pendingPriority = "Medium", pendingDue = ""
+
+        func flushPendingItem() {
+            guard !pendingTask.isEmpty else { return }
+            let raw = "[\(pendingOwner)] \(pendingTask)"
+            let item = ActionItemRecord(owner: pendingOwner, task: pendingTask,
+                                        priority: pendingPriority, dueDateText: pendingDue,
+                                        rawText: raw)
+            analysis.structuredActionItems.append(item)
+            analysis.actionItems.append(raw)
+            pendingOwner = "Team"; pendingTask = ""; pendingPriority = "Medium"; pendingDue = ""
+        }
+
         for line in text.components(separatedBy: "\n") {
             let s = line.trimmingCharacters(in: .whitespacesAndNewlines)
 
             var content = s
             if let (section, inline) = chunkSectionHeader(from: s) {
+                if currentSection == "actions" { flushPendingItem() }
                 currentSection = section
                 content = inline
             }
@@ -382,9 +399,36 @@ enum TranscriptChunker {
 
             switch currentSection {
             case "actions":
-                if let item = parseActionItemLine(content) {
-                    analysis.structuredActionItems.append(item)
-                    analysis.actionItems.append("[\(item.owner)] \(item.task)")
+                if content.contains("|") {
+                    // Pipe-delimited single-line format: OWNER: x | TASK: y | PRIORITY: z | DUE: w
+                    flushPendingItem()
+                    if let item = parseActionItemLine(content) {
+                        analysis.structuredActionItems.append(item)
+                        analysis.actionItems.append("[\(item.owner)] \(item.task)")
+                    }
+                } else {
+                    // Multi-line field format (phi3): Owners: / Task: / Priority: on separate lines
+                    let kv = content.split(separator: ":", maxSplits: 1).map(String.init)
+                    if kv.count == 2 {
+                        let key = kv[0].trimmingCharacters(in: .whitespaces).uppercased()
+                        let val = kv[1].trimmingCharacters(in: .whitespaces)
+                        switch key {
+                        case "OWNER", "OWNERS":
+                            if !pendingTask.isEmpty { flushPendingItem() }
+                            // Take first name when model writes "Me | Participant"
+                            pendingOwner = val.components(separatedBy: "|").first?
+                                .trimmingCharacters(in: .whitespaces) ?? "Team"
+                            if pendingOwner.isEmpty { pendingOwner = "Team" }
+                        case "TASK":
+                            pendingTask = val
+                        case "PRIORITY":
+                            pendingPriority = val.components(separatedBy: CharacterSet.whitespaces)
+                                .first?.capitalized ?? "Medium"
+                        case "DUE":
+                            pendingDue = (val.uppercased() == "TBD" || val.isEmpty) ? "" : val
+                        default: break
+                        }
+                    }
                 }
             case "decisions":
                 for item in splitBulletLine(content) { analysis.decisions.append(item) }
@@ -403,33 +447,64 @@ enum TranscriptChunker {
             default: break
             }
         }
+        flushPendingItem()  // flush any trailing multi-line item
         return analysis
     }
 
+    // MARK: - Section header detection
+
+    /// Detects a section header in either of two formats phi3 uses:
+    ///   Style 1 (markdown):  `## ACTION ITEMS` or `## Action Items:`
+    ///   Style 2 (plain):     `ACTION ITEMS:` or `DECISIONS MADE`
+    /// Returns `(sectionKey, inlineContent)` or nil if the line is not a header.
     private static func chunkSectionHeader(from line: String) -> (String, String)? {
-        guard line.hasPrefix("#") || line.hasPrefix("*") else { return nil }
-        var s = line
-        while let c = s.first, c == "#" || c == "*" || c == " " { s.removeFirst() }
-        let headerPart: String
-        var inlinePart = ""
-        if let colonIdx = s.firstIndex(of: ":") {
-            headerPart = String(s[s.startIndex..<colonIdx])
-            inlinePart = String(s[s.index(after: colonIdx)...])
-                .trimmingCharacters(in: .init(charactersIn: "*: "))
-        } else {
-            headerPart = s
+        // Style 1: ## or ** prefix
+        if line.hasPrefix("#") || line.hasPrefix("*") {
+            var s = line
+            while let c = s.first, c == "#" || c == "*" || c == " " { s.removeFirst() }
+            let headerPart: String
+            var inlinePart = ""
+            if let colonIdx = s.firstIndex(of: ":") {
+                headerPart = String(s[s.startIndex..<colonIdx])
+                inlinePart = String(s[s.index(after: colonIdx)...])
+                    .trimmingCharacters(in: .init(charactersIn: "*: "))
+            } else {
+                headerPart = s
+            }
+            let name = headerPart.trimmingCharacters(in: .init(charactersIn: "* ")).uppercased()
+            if let sec = sectionKey(for: name) { return (sec, inlinePart) }
         }
-        let name = headerPart.trimmingCharacters(in: .init(charactersIn: "* ")).uppercased()
-        let section: String
-        if name.hasPrefix("ACTION ITEM") || name == "ACTIONS"  { section = "actions" }
-        else if name.hasPrefix("DECISION")                     { section = "decisions" }
-        else if name.hasPrefix("OPEN Q")                       { section = "questions" }
-        else if name.hasPrefix("RISK")                         { section = "risks" }
-        else if name.hasPrefix("DEPEND")                       { section = "dependencies" }
-        else if name.hasPrefix("COMMIT")                       { section = "commitments" }
-        else if name.hasPrefix("KEY POINT")                    { section = "keyPoints" }
+
+        // Style 2: plain uppercase title (phi3 style), with optional trailing colon
+        // e.g. "ACTION ITEMS:", "DECISIONS MADE:", "KEY POINTS"
+        // Exclude known per-item data fields so "TASK: do thing" isn't treated as a section.
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let candidate: String
+        var inlinePart = ""
+        if let colonIdx = trimmed.firstIndex(of: ":") {
+            candidate = String(trimmed[trimmed.startIndex..<colonIdx])
+                .trimmingCharacters(in: .whitespaces).uppercased()
+            inlinePart = String(trimmed[trimmed.index(after: colonIdx)...])
+                .trimmingCharacters(in: .whitespaces)
+        } else {
+            candidate = trimmed.uppercased()
+        }
+        let dataFields: Set<String> = ["OWNER", "OWNERS", "TASK", "PRIORITY", "DUE"]
+        guard !dataFields.contains(candidate) else { return nil }
+        if let sec = sectionKey(for: candidate) { return (sec, inlinePart) }
+        return nil
+    }
+
+    private static func sectionKey(for name: String) -> String? {
+        if name.hasPrefix("ACTION ITEM") || name == "ACTIONS" { return "actions" }
+        else if name.hasPrefix("DECISION")                    { return "decisions" }
+        else if name.hasPrefix("OPEN Q")                      { return "questions" }
+        else if name.hasPrefix("RISK")                        { return "risks" }
+        else if name.hasPrefix("DEPEND")                      { return "dependencies" }
+        else if name.hasPrefix("COMMIT")                      { return "commitments" }
+        else if name.hasPrefix("KEY POINT")                   { return "keyPoints" }
         else { return nil }
-        return (section, inlinePart)
     }
 
     private static func splitBulletLine(_ line: String) -> [String] {
