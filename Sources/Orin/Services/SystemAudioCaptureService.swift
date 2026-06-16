@@ -262,11 +262,11 @@ final class SystemAudioCaptureService: Service {
             )
         }
 
-        // Phase 2B: start parallel SpeechTranscriber participant pipeline.
-        // Both pipelines receive every SCStream buffer simultaneously.
-        // FeatureFlags.useNewParticipantPipeline controls which one writes to TranscriptStore.
+        // Phase 2B: SpeechTranscriber participant pipeline — only when flag is enabled.
+        // Running ST alongside the legacy SFSpeechRecognizer pipeline causes two concurrent
+        // SpeechAnalyzer ML models which saturates CPU and hangs the system.
         participantSTTranscript = ""
-        if #available(macOS 26.0, *) {
+        if #available(macOS 26.0, *), FeatureFlags.useNewParticipantPipeline {
             await startParticipantSTSession()
         }
 
