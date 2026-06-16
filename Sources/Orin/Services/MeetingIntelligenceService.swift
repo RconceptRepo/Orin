@@ -63,6 +63,10 @@ final class MeetingIntelligenceService: Service {
         self.aiService = aiService
     }
 
+    /// Transcripts longer than this threshold do not use keyword fallback for action items.
+    /// Keyword proximity matching on long transcripts produces sentence fragments, not commitments.
+    static let keywordFallbackTranscriptThreshold = 3_000
+
     // MARK: - Segments-based analysis (preferred)
 
     func analyze(
@@ -271,10 +275,12 @@ final class MeetingIntelligenceService: Service {
         )
         let actionItems: [String]
         if validStructured.isEmpty {
-            actionItems = extractCleanLines(
-                from: transcript,
-                matching: ["action", "todo", "to do", "next step", "follow up", "need to", "should"]
-            )
+            // Keyword proximity on long transcripts produces sentence fragments, not commitments.
+            // Only apply for very short transcripts where AI had nothing meaningful to parse.
+            actionItems = transcript.count < Self.keywordFallbackTranscriptThreshold
+                ? extractCleanLines(from: transcript,
+                                    matching: ["action", "todo", "to do", "next step", "follow up", "need to", "should"])
+                : []
         } else {
             actionItems = validStructured.map { "[\($0.owner)] \($0.task)" }
         }
@@ -395,20 +401,20 @@ final class MeetingIntelligenceService: Service {
 
     // MARK: - Comprehensive Prompt Builder
 
-    private func buildComprehensivePrompt(title: String, transcript: String, meetingType: String) -> String {
-        let trimmedTranscript = transcript
-
-        return """
+    func buildComprehensivePrompt(title: String, transcript: String, meetingType: String) -> String {
+        """
         You are a meeting notes assistant. Fill in the five sections below using ONLY facts explicitly stated in the transcript. Do not infer. Do not write emails. Do not add commentary outside the sections.
 
         MEETING TITLE: \(title)
         TRANSCRIPT:
-        \(trimmedTranscript)
+        \(transcript)
 
         Fill in these five sections:
 
         ## SUMMARY
-        Write 2-3 sentences covering what was discussed.
+        Write 2-3 sentences synthesizing the main discussion topics, decisions reached, and outcomes.
+        Do NOT copy any line from the transcript verbatim. Do NOT begin with a speaker label (e.g. "Me:" or "Participant:").
+        If no meaningful discussion is present, write: Insufficient information for summary.
 
         ## DISCUSSION POINTS
         List each topic as a short bullet.
@@ -843,7 +849,9 @@ final class MeetingIntelligenceService: Service {
         let summary       = fallbackSummary(transcript)
         let decisions     = extractCleanLines(from: transcript, matching: ["decided", "decision", "agreed", "approved"])
         let commitments   = extractCleanLines(from: transcript, matching: ["i will", "i'll", "we will", "follow up", "will send"])
-        let actionItems   = extractCleanLines(from: transcript, matching: ["action", "todo", "to do", "next step", "follow up"])
+        let actionItems: [String] = transcript.count < Self.keywordFallbackTranscriptThreshold
+            ? extractCleanLines(from: transcript, matching: ["action", "todo", "to do", "next step", "follow up"])
+            : []
         let suggestedTasks = buildSuggestedTasks(title: title, commitments: commitments,
                                                  actionItems: actionItems, structuredItems: [])
         return MeetingAnalysis(

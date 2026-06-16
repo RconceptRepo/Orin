@@ -1008,12 +1008,12 @@ private struct MeetingMetaBadgeRow: View {
 
     var body: some View {
         let hasDuration     = durationText != nil
-        let hasActions      = !meeting.actionItems.isEmpty
+        let actionCount     = meeting.effectiveActionItemCount
         let hasSummary      = !meeting.summary.isEmpty
         let hasTranscript   = !meeting.transcript.isEmpty
 
         // Only render the row if there's at least one badge to show
-        if hasDuration || hasActions || hasSummary || hasTranscript {
+        if hasDuration || actionCount > 0 || hasSummary || hasTranscript {
             HStack(spacing: 6) {
                 if let dur = durationText {
                     MetaBadge(icon: "clock", label: dur, color: .secondary)
@@ -1021,8 +1021,8 @@ private struct MeetingMetaBadgeRow: View {
                 if hasSummary {
                     MetaBadge(icon: "sparkles", label: "Analyzed", color: .green)
                 }
-                if hasActions {
-                    MetaBadge(icon: "checklist", label: "\(meeting.actionItems.count)", color: .blue)
+                if actionCount > 0 {
+                    MetaBadge(icon: "checklist", label: "\(actionCount)", color: .blue)
                 }
                 if hasTranscript && !hasSummary {
                     MetaBadge(icon: "text.bubble", label: "Transcript", color: .secondary)
@@ -1805,7 +1805,7 @@ private struct MeetingDetailView: View {
         let hasTranscript  = !meeting.transcript.isEmpty
         let hasSummary     = !meeting.summary.isEmpty
         let hasRecording   = meeting.audioFilePath != nil
-        let actionCount    = meeting.actionItems.count
+        let actionCount    = meeting.effectiveActionItemCount
         let participantCount = meeting.participants.count
         let durationSecs   = meeting.durationSeconds
 
@@ -1977,7 +1977,6 @@ private struct MeetingDetailView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-        // When no structured items, the flat InsightCard("Action Items") falls back
     }
 
     private func startRecording() {
@@ -2018,8 +2017,9 @@ private struct MeetingDetailView: View {
         meeting.actionItems          = analysis.actionItems
         meeting.suggestedTaskTitles  = analysis.suggestedTasks
         meeting.commitments          = analysis.commitments.map { CommitmentItem(title: $0) }
-        if !analysis.structuredActionItems.isEmpty,
-           let data = try? JSONEncoder().encode(analysis.structuredActionItems),
+        // Always overwrite structuredActionItemsJSON — including with empty arrays.
+        // A conditional write left stale JSON from a prior analysis in place.
+        if let data = try? JSONEncoder().encode(analysis.structuredActionItems),
            let json = String(data: data, encoding: .utf8) {
             meeting.structuredActionItemsJSON = json
         }

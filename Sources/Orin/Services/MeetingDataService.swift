@@ -54,6 +54,9 @@ struct MeetingSnapshot: Codable, Identifiable {
     var actionItems: [String]
     var suggestedTaskTitles: [String]
     var acceptedSuggestedTaskTitles: [String]
+    /// JSON-encoded [ActionItemRecord] — canonical structured action items.
+    /// Nil for legacy exports produced before Phase 2 analysis.
+    var structuredActionItemsJSON: String?
     var audioFilePath: String?
     var tags: [String]
     var folderID: UUID?
@@ -70,6 +73,7 @@ struct MeetingSnapshot: Codable, Identifiable {
         actionItems = meeting.actionItems
         suggestedTaskTitles = meeting.suggestedTaskTitles
         acceptedSuggestedTaskTitles = meeting.acceptedSuggestedTaskTitles
+        structuredActionItemsJSON = meeting.structuredActionItemsJSON
         audioFilePath = meeting.audioFilePath
         tags = meeting.tags
         folderID = meeting.folderID
@@ -290,6 +294,7 @@ final class MeetingDataService: Service {
             meeting.actionItems                 = snapshot.actionItems
             meeting.suggestedTaskTitles         = snapshot.suggestedTaskTitles
             meeting.acceptedSuggestedTaskTitles = snapshot.acceptedSuggestedTaskTitles
+            meeting.structuredActionItemsJSON   = snapshot.structuredActionItemsJSON
             meeting.audioFilePath               = snapshot.audioFilePath
             meeting.tags                        = snapshot.tags
             meeting.folderID                    = snapshot.folderID
@@ -317,7 +322,7 @@ final class MeetingDataService: Service {
         \(bulletList(meeting.decisions))
 
         ## Action Items
-        \(bulletList(meeting.actionItems))
+        \(structuredActionItemsBulletList(meeting))
 
         ## Suggested Tasks
         \(bulletList(meeting.suggestedTaskTitles))
@@ -325,6 +330,22 @@ final class MeetingDataService: Service {
         ## Transcript
         \(meeting.transcript.isEmpty ? "No transcript." : meeting.transcript)
         """
+    }
+
+    /// Produces a markdown bullet list for action items.
+    /// Uses structured items (owner, task, priority, due) when available;
+    /// falls back to the flat string array for legacy meetings.
+    private func structuredActionItemsBulletList(_ meeting: MeetingItem) -> String {
+        let structured = meeting.structuredActionItems
+        guard !structured.isEmpty else { return bulletList(meeting.actionItems) }
+        return structured.map { item in
+            var line = "- **[\(item.owner)]** \(item.task)"
+            var meta: [String] = []
+            if !item.dueDateText.isEmpty { meta.append("Due: \(item.dueDateText)") }
+            if item.priority.lowercased() != "medium" { meta.append("Priority: \(item.priority)") }
+            if !meta.isEmpty { line += " _(\(meta.joined(separator: ", ")))_" }
+            return line
+        }.joined(separator: "\n")
     }
 
     private func plainText(for meeting: MeetingItem) -> String {

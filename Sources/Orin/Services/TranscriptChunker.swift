@@ -287,15 +287,46 @@ enum TranscriptChunker {
             "sure", "got it", "sounds good", "mm-hmm", "mm hmm",
             "uh huh", "alright", "all right", "noted", "understood",
             "absolutely", "definitely", "of course", "will do",
-            "thanks", "thank you", "correct", "exactly", "fair enough"
+            "thanks", "thank you", "correct", "exactly", "fair enough",
+            "makes sense", "that makes sense"
         ]
         guard !acknowledgements.contains(normalized) else { return false }
 
-        let wordCount = normalized
+        let words = normalized
             .components(separatedBy: .init(charactersIn: " .,;:!?-_\t\n\r"))
-            .filter { $0.trimmingCharacters(in: CharacterSet.alphanumerics.inverted).count >= 2 }
-            .count
-        return wordCount >= 3
+            .map { $0.trimmingCharacters(in: CharacterSet.alphanumerics.inverted) }
+            .filter { $0.count >= 2 }
+
+        // Must have at least 4 meaningful words to constitute a real commitment
+        guard words.count >= 4 else { return false }
+
+        // Must contain an action verb — distinguishes real commitments from noun phrases,
+        // discussion topics, and sentence fragments produced by keyword fallback.
+        let actionVerbs: Set<String> = [
+            // Base forms
+            "set", "write", "send", "share", "call", "schedule", "review",
+            "create", "build", "prepare", "update", "complete", "submit",
+            "connect", "contact", "arrange", "book", "confirm", "check",
+            "attend", "follow", "discuss", "present", "deliver", "provide",
+            "define", "document", "test", "deploy", "fix", "implement",
+            "coordinate", "ensure", "notify", "plan", "draft", "finalize", "finalise",
+            "research", "investigate", "analyse", "analyze", "report",
+            "handle", "manage", "make", "do", "get", "run", "add", "remove",
+            "move", "merge", "push", "pull", "open", "close", "assign",
+            "invite", "reach", "ask", "tell", "show", "verify",
+            // Gerunds / present participles
+            "setting", "writing", "sending", "sharing", "calling", "scheduling",
+            "reviewing", "creating", "building", "preparing", "updating",
+            "completing", "submitting", "connecting", "contacting", "arranging",
+            "confirming", "checking", "attending", "following", "discussing",
+            "presenting", "delivering", "providing", "defining", "documenting",
+            "testing", "deploying", "fixing", "implementing", "coordinating",
+            "ensuring", "notifying", "planning", "drafting", "finalizing", "finalising",
+            "researching", "reporting", "handling", "managing", "making", "getting",
+            "running", "adding", "removing", "moving", "merging", "pushing",
+            "opening", "closing", "assigning", "inviting", "reaching", "verifying"
+        ]
+        return words.contains { actionVerbs.contains($0) }
     }
 
     // MARK: - Prompt Builders
@@ -341,7 +372,7 @@ enum TranscriptChunker {
         """
     }
 
-    private static func buildSynthesisPrompt(
+    static func buildSynthesisPrompt(
         keyPointsText: String,
         decisionsCount: Int,
         actionsCount: Int,
@@ -360,6 +391,9 @@ enum TranscriptChunker {
         - Do not infer roles, job titles, candidate qualities, or team dynamics.
         - Do not describe the meeting type or the participants' relationship.
         - Write 2-4 sentences. Be specific. No filler phrases.
+        - Do NOT copy key-point text verbatim. Synthesize into cohesive sentences.
+        - Do NOT begin with a speaker label such as "Me:" or "Participant:".
+        - If the topic list is empty, write: Insufficient information for summary.
         """
     }
 

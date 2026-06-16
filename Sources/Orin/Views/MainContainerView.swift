@@ -301,9 +301,9 @@ struct MainContainerView: View {
         meeting.actionItems          = analysis.actionItems
         meeting.suggestedTaskTitles  = analysis.suggestedTasks
         meeting.commitments          = analysis.commitments.map { CommitmentItem(title: $0) }
-        // Persist structured action items as JSON
-        if !analysis.structuredActionItems.isEmpty,
-           let data = try? JSONEncoder().encode(analysis.structuredActionItems),
+        // Always overwrite structuredActionItemsJSON — including with empty arrays.
+        // A conditional write left stale JSON from a prior analysis in place.
+        if let data = try? JSONEncoder().encode(analysis.structuredActionItems),
            let json = String(data: data, encoding: .utf8) {
             meeting.structuredActionItemsJSON = json
         }

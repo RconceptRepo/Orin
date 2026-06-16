@@ -82,8 +82,13 @@ final class ActionItemFilterTests: XCTestCase {
 
     // MARK: - Real action items: must be accepted
 
-    func testAcceptsThreeWordTask() {
-        XCTAssertTrue(TranscriptChunker.isMeaningfulActionItem(task: "Send the proposal"))
+    func testRejectsThreeWordTask() {
+        // 3 words no longer meets the 4-word minimum
+        XCTAssertFalse(TranscriptChunker.isMeaningfulActionItem(task: "Send the proposal"))
+    }
+
+    func testAcceptsFourWordTask() {
+        XCTAssertTrue(TranscriptChunker.isMeaningfulActionItem(task: "Send the final proposal"))
     }
 
     func testAcceptsMotorCatchTask() {
@@ -126,7 +131,8 @@ final class ActionItemFilterTests: XCTestCase {
     }
 
     func testAcceptsLeadingWhitespaceTask() {
-        XCTAssertTrue(TranscriptChunker.isMeaningfulActionItem(task: "  Send the report  "))
+        // Whitespace trimming works — 4-word task with leading/trailing spaces
+        XCTAssertTrue(TranscriptChunker.isMeaningfulActionItem(task: "  Send the final report  "))
     }
 
     // MARK: - Edge cases
@@ -136,9 +142,9 @@ final class ActionItemFilterTests: XCTestCase {
         XCTAssertFalse(TranscriptChunker.isMeaningfulActionItem(task: "Fix bug"))
     }
 
-    func testAcceptsThreeShortWords() {
-        // "Fix the bug" has 3 words of ≥2 chars each
-        XCTAssertTrue(TranscriptChunker.isMeaningfulActionItem(task: "Fix the bug"))
+    func testRejectsThreeWords() {
+        // 3 words is below the 4-word minimum, regardless of verb presence
+        XCTAssertFalse(TranscriptChunker.isMeaningfulActionItem(task: "Fix the bug"))
     }
 
     func testRejectsNumbersAlone() {
@@ -196,5 +202,98 @@ final class ActionItemFilterTests: XCTestCase {
 
         XCTAssertEqual(deduped.count, 1)
         XCTAssertEqual(deduped[0].task, "Check motor catch tasks before onboarding")
+    }
+
+    // MARK: - New acknowledgements (expanded set)
+
+    func testRejectsMakesSense() {
+        XCTAssertFalse(TranscriptChunker.isMeaningfulActionItem(task: "Makes sense."))
+    }
+
+    func testRejectsThatMakesSense() {
+        XCTAssertFalse(TranscriptChunker.isMeaningfulActionItem(task: "That makes sense."))
+    }
+
+    // MARK: - Noun phrase without action verb: must be rejected
+
+    func testRejectsTotalCostingFragment() {
+        // Product Meeting false positive: 4 words but no action verb
+        XCTAssertFalse(TranscriptChunker.isMeaningfulActionItem(task: "the total costing and everything"))
+    }
+
+    func testRejectsNounPhraseWithoutVerb() {
+        // "the project timeline status" has 4 words but none are action verbs
+        XCTAssertFalse(TranscriptChunker.isMeaningfulActionItem(task: "the project timeline status"))
+    }
+
+    func testRejectsFourWordsArticleOpenNoVerb() {
+        XCTAssertFalse(TranscriptChunker.isMeaningfulActionItem(task: "the project scope discussion"))
+    }
+
+    // MARK: - Product Meeting action items: must be accepted
+
+    func testAcceptsShareContactAction() {
+        XCTAssertTrue(TranscriptChunker.isMeaningfulActionItem(
+            task: "Share Bishek's contact details with ETH"))
+    }
+
+    func testAcceptsSetUpMeetingAction() {
+        XCTAssertTrue(TranscriptChunker.isMeaningfulActionItem(
+            task: "Set up coaching centre meetings this weekend"))
+    }
+
+    func testAcceptsWriteProposalAction() {
+        XCTAssertTrue(TranscriptChunker.isMeaningfulActionItem(
+            task: "Write medical use case proposal within two days"))
+    }
+
+    func testAcceptsCallHandoverAction() {
+        XCTAssertTrue(TranscriptChunker.isMeaningfulActionItem(
+            task: "Call Praveen to discuss content handover"))
+    }
+
+    func testAcceptsAttendEventAction() {
+        XCTAssertTrue(TranscriptChunker.isMeaningfulActionItem(
+            task: "Attend November event for networking and connections"))
+    }
+
+    // MARK: - Summary prompt: anti-verbatim instructions present
+
+    func test_comprehensivePrompt_containsAntiVerbatimInstruction() {
+        let service = MeetingIntelligenceService(aiService: AIService(config: AIConfiguration(primaryProvider: .ollama)))
+        let prompt = service.buildComprehensivePrompt(
+            title: "Product Meeting",
+            transcript: "Me: Okay. Makes sense.",
+            meetingType: "general"
+        )
+        XCTAssertTrue(prompt.contains("Do NOT copy"),
+            "Prompt must instruct model not to copy transcript lines verbatim")
+        XCTAssertTrue(prompt.contains("speaker label"),
+            "Prompt must forbid beginning with a speaker label")
+        XCTAssertTrue(prompt.contains("Insufficient information for summary"),
+            "Prompt must specify fallback text when no meaningful discussion exists")
+    }
+
+    func test_synthesisPrompt_containsAntiVerbatimInstruction() {
+        let prompt = TranscriptChunker.buildSynthesisPrompt(
+            keyPointsText: "• Discussed budget constraints",
+            decisionsCount: 1,
+            actionsCount: 2,
+            title: "Team Meeting"
+        )
+        XCTAssertTrue(prompt.contains("Do NOT copy"),
+            "Synthesis prompt must instruct model not to copy key-point text verbatim")
+        XCTAssertTrue(prompt.contains("speaker label"),
+            "Synthesis prompt must forbid starting with a speaker label")
+        XCTAssertTrue(prompt.contains("Insufficient information for summary"),
+            "Synthesis prompt must specify fallback text for empty topic list")
+    }
+
+    // MARK: - Keyword fallback threshold constant
+
+    func test_keywordFallbackThreshold_is3000() {
+        // Product Meeting was 9,986 chars — well above this threshold.
+        // Confirms long meetings will not receive keyword-fallback action items.
+        XCTAssertEqual(MeetingIntelligenceService.keywordFallbackTranscriptThreshold, 3_000)
     }
 }

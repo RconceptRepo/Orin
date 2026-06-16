@@ -161,6 +161,16 @@ final class MeetingItem {
         return items
     }
 
+    /// Canonical action item count.
+    ///
+    /// When `structuredActionItemsJSON` has been written (even as `[]`), that field
+    /// is the source of truth — it reflects the most recent analysis result.
+    /// Falls back to the flat `actionItems` count only for legacy meetings whose
+    /// structured JSON was never populated (pre-Phase 2 analysis runs).
+    var effectiveActionItemCount: Int {
+        structuredActionItemsJSON != nil ? structuredActionItems.count : actionItems.count
+    }
+
     /// Decodes and returns the compact knowledge snapshot used by folder intelligence.
     var decodedKnowledgeSnapshot: MeetingKnowledgeSnapshot? {
         guard let json = meetingKnowledgeJSON,

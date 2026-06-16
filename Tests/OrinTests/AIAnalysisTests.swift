@@ -225,6 +225,7 @@ final class AIAnalysisTests: XCTestCase {
     func testMeetingAnalysisHasAllRequiredFields() {
         let analysis = MeetingAnalysis(
             summary: "Test summary",
+            conservativeSummary: "",
             meetingType: "Standup",
             decisions: ["Decided X"],
             openQuestions: ["What about Y?"],
@@ -233,7 +234,11 @@ final class AIAnalysisTests: XCTestCase {
             commitments: ["Alice will do B"],
             actionItems: ["Do C"],
             structuredActionItems: [ActionItemRecord(owner: "Alice", task: "Do C")],
-            suggestedTasks: ["Review D"]
+            suggestedTasks: ["Review D"],
+            evidencedDecisions: [],
+            evidencedDiscussionPoints: [],
+            evidencedFollowUps: [],
+            hallucinationReport: nil
         )
         XCTAssertEqual(analysis.summary, "Test summary")
         XCTAssertEqual(analysis.meetingType, "Standup")
