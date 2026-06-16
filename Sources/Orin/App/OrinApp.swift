@@ -176,6 +176,11 @@ struct OrinApp: App {
                     // restore the most-recent checkpoint text to the meeting model.
                     ServiceContainer.shared.resolve(TranscriptStore.self)
                         .recoverOrphan(in: modelContainer.mainContext)
+
+                    // Pre-warm the SpeechTranscriber ML model so the first recording
+                    // session skips the cold-load delay (typically 5–20s). Runs on a
+                    // background task; no mic access, no recording, no side effects.
+                    ServiceContainer.shared.resolve(RecordingService.self).prewarm()
                 }
                 // Final checkpoint on clean quit — captures any transcript not yet persisted
                 // by the 3-second timer. Runs synchronously on the main actor before the

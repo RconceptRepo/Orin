@@ -33,12 +33,17 @@ struct AIConfiguration {
     var localOllamaEndpoint = "http://localhost:11434"
 }
 
-final class AIService: Service {
+final class AIService: Service, @unchecked Sendable {
     private var config: AIConfiguration
 
     static let openAIAccount    = "openai"
     static let anthropicAccount = "anthropic"
     static let geminiAccount    = "gemini"
+
+    // Availability cache: avoids one 3-second HTTP health-check per generate() call.
+    // Benign race between concurrent chunk tasks — worst case is a few redundant checks.
+    private var _ollamaAvailableUntil = Date.distantPast
+    private var _ollamaAvailableCached = false
 
     init(config: AIConfiguration) {
         self.config = config
@@ -106,14 +111,20 @@ final class AIService: Service {
     // MARK: - Ollama availability check
 
     func isOllamaAvailable(endpoint: String) async -> Bool {
+        if Date() < _ollamaAvailableUntil { return _ollamaAvailableCached }
         guard let url = URL(string: "\(endpoint)/api/tags") else { return false }
         var request = URLRequest(url: url)
         request.timeoutInterval = 3
         do {
             let (_, response) = try await URLSession.shared.data(for: request)
-            return (response as? HTTPURLResponse)?.statusCode == 200
+            let available = (response as? HTTPURLResponse)?.statusCode == 200
+            _ollamaAvailableCached = available
+            _ollamaAvailableUntil = Date(timeIntervalSinceNow: available ? 30 : 5)
+            return available
         } catch {
             // Expected when Ollama is not running — fallback to next provider
+            _ollamaAvailableCached = false
+            _ollamaAvailableUntil = Date(timeIntervalSinceNow: 5)
             aiLogger.debug("Ollama availability check failed: \(error)")
             return false
         }
@@ -127,13 +138,13 @@ final class AIService: Service {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 60  // longer for comprehensive analysis
+        request.timeoutInterval = 90
 
         let payload: [String: Any] = [
-            "model": "mistral",
+            "model": "phi3",
             "prompt": prompt,
             "stream": false,
-            "options": ["num_predict": maxTokens]
+            "options": ["num_predict": maxTokens, "temperature": 0]
         ]
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: payload)
@@ -158,7 +169,8 @@ final class AIService: Service {
         let body: [String: Any] = [
             "model": "gpt-4o-mini",
             "messages": [["role": "user", "content": prompt]],
-            "max_tokens": maxTokens
+            "max_tokens": maxTokens,
+            "temperature": 0
         ]
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -186,6 +198,7 @@ final class AIService: Service {
         let body: [String: Any] = [
             "model": "claude-haiku-4-5-20251001",
             "max_tokens": maxTokens,
+            "temperature": 0,
             "messages": [["role": "user", "content": prompt]]
         ]
         do {
@@ -211,7 +224,7 @@ final class AIService: Service {
 
         let body: [String: Any] = [
             "contents": [["parts": [["text": prompt]]]],
-            "generationConfig": ["maxOutputTokens": maxTokens]
+            "generationConfig": ["maxOutputTokens": maxTokens, "temperature": 0]
         ]
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)

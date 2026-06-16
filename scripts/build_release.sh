@@ -96,9 +96,13 @@ ditto --norsrc "$SPM_BINARY"   "$STAGED_APP/Contents/MacOS/Orin"
 
 # ── 3. Sign ───────────────────────────────────────────────────────────────────
 
-log "Applying ad-hoc signature..."
+log "Applying ad-hoc signature with stable designated requirement..."
+# --requirement overrides the auto-generated cdhash-pinned DR with a bundle-ID-based DR.
+# Without this, every build generates a new CDHash, invalidating the TCC ScreenCapture
+# csreq and forcing a re-grant. With this, TCC matches on identifier, not CDHash.
 codesign --force --deep --sign "-" \
     --entitlements "$ENTITLEMENTS" \
+    --requirement '=designated => identifier "com.rconcept.orin"' \
     "$STAGED_APP" 2>&1 || die "codesign failed"
 
 if codesign -d --entitlements :- "$STAGED_APP" 2>/dev/null | \

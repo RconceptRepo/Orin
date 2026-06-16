@@ -91,6 +91,7 @@ struct MeetingsView: View {
                     onExport: { export(meeting: selectedMeeting, format: $0) },
                     onMoveToFolder: { folder in move(selectedMeeting, to: folder) }
                 )
+                .id(selectedMeeting.id)   // fresh @State (incl. isAnalyzing) per meeting
                 .frame(minWidth: 620, maxHeight: .infinity)
             } else {
                 ContentUnavailableView(

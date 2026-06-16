@@ -270,8 +270,28 @@ struct MainContainerView: View {
             return
         }
 
-        print("[AutoAnalysis] starting for '\(meeting.title)' elapsed=\(Int(elapsed))s")
-        let analysis = await intelligence.analyze(title: meeting.title, transcript: meeting.transcript)
+        // Fetch segments for this meeting. TranscriptStore.finalize() has already called
+        // buildTimelineSegments() before this function runs, so segments are available.
+        // Use the same routing logic as MeetingDetailView: segment-first, blob fallback.
+        let meetingID = meeting.id
+        let segmentDescriptor = FetchDescriptor<TranscriptSegment>(
+            predicate: #Predicate { $0.meetingId == meetingID },
+            sortBy: [SortDescriptor(\.timestamp), SortDescriptor(\.sequenceIndex)]
+        )
+        let segments = (try? modelContext.fetch(segmentDescriptor)) ?? []
+        print("[AutoAnalysis] starting for '\(meeting.title)' elapsed=\(Int(elapsed))s segments=\(segments.count)")
+
+        let analysis: MeetingAnalysis
+        if !segments.isEmpty {
+            analysis = await intelligence.analyze(
+                title: meeting.title,
+                segments: segments,
+                meetingStart: meeting.date,
+                fallbackTranscript: meeting.transcript
+            )
+        } else {
+            analysis = await intelligence.analyze(title: meeting.title, transcript: meeting.transcript)
+        }
         meeting.summary              = analysis.summary
         meeting.meetingType          = analysis.meetingType
         meeting.decisions            = analysis.decisions
@@ -288,9 +308,9 @@ struct MainContainerView: View {
             meeting.structuredActionItemsJSON = json
         }
         modelContext.safeSave(context: "auto-analysis")
-        // Build and persist knowledge snapshot for folder intelligence
-        persistKnowledgeSnapshot(for: meeting)
-        print("[AutoAnalysis] complete — summary chars=\(analysis.summary.count) decisions=\(analysis.decisions.count) actions=\(analysis.actionItems.count)")
+        // Build and persist knowledge snapshot (includes evidence + hallucination report)
+        persistKnowledgeSnapshot(for: meeting, evidence: analysis.evidence)
+        print("[AutoAnalysis] complete — summary chars=\(analysis.summary.count) conservative=\(analysis.conservativeSummary.count) decisions=\(analysis.decisions.count) actions=\(analysis.actionItems.count)")
     }
 
     // MARK: - Knowledge snapshot
@@ -298,8 +318,10 @@ struct MainContainerView: View {
     /// Builds a `MeetingKnowledgeSnapshot` from the meeting's current analysis fields
     /// and persists it as JSON.  Called after every successful analysis so folder
     /// intelligence can use compact structured data instead of raw transcripts.
-    private func persistKnowledgeSnapshot(for meeting: MeetingItem) {
-        let snapshot = MeetingKnowledgeSnapshot(from: meeting)
+    private func persistKnowledgeSnapshot(for meeting: MeetingItem,
+                                           evidence: MeetingAnalysisEvidence? = nil) {
+        var snapshot = MeetingKnowledgeSnapshot(from: meeting)
+        if let evidence { snapshot.applyEvidence(from: evidence) }
         guard let data = try? JSONEncoder().encode(snapshot),
               let json = String(data: data, encoding: .utf8) else { return }
         meeting.meetingKnowledgeJSON = json

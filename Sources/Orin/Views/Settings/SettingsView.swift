@@ -85,6 +85,8 @@ struct SettingsView: View {
             openAIConfigured    = AIKeychainService.hasKey(for: AIService.openAIAccount)
             anthropicConfigured = AIKeychainService.hasKey(for: AIService.anthropicAccount)
             geminiConfigured    = AIKeychainService.hasKey(for: AIService.geminiAccount)
+            // Auto-probe Ollama so status reflects reality without manual "Test Connection"
+            Task { await aiTester.testOllama(endpoint: ollamaEndpoint) }
         }
     }
 

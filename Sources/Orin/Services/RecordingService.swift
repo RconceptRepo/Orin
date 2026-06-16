@@ -1074,6 +1074,38 @@ final class RecordingService: Service {
             + "Ensure the app is signed and running in its expected sandbox container."
         }
     }
+
+    // MARK: - SpeechTranscriber pre-warm (macOS 26+)
+
+    /// Loads the SpeechTranscriber ML model into the system memory cache without
+    /// starting recording or requesting microphone access.
+    ///
+    /// Call once at app launch. The underlying model is shared across the process —
+    /// after this returns, `startMicSTSession` and `startParticipantSTSession` skip
+    /// the cold-load phase (~5–20s) and run warm (~0.3s). The temporary analyzer
+    /// created here is discarded immediately after `prepareToAnalyze` returns;
+    /// no audio streams, no mic tap, no side effects.
+    func prewarm() {
+        guard #available(macOS 26.0, *) else { return }
+        Task.detached(priority: .background) {
+            let t0 = Date()
+            print("[Prewarm] SpeechTranscriber — loading model (cold start)")
+            let locale     = VocabularyProvider.speechLocale
+            let transcriber = SpeechTranscriber(locale: locale, preset: .progressiveTranscription)
+            let analyzer    = SpeechAnalyzer(modules: [transcriber])
+            guard let bestFmt = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
+                print("[Prewarm] no compatible audio format — prewarm skipped")
+                return
+            }
+            do {
+                try await analyzer.prepareToAnalyze(in: bestFmt)
+                let elapsed = Date().timeIntervalSince(t0)
+                print("[Prewarm] model ready — elapsed=\(String(format: "%.2f", elapsed))s fmt=\(Int(bestFmt.sampleRate))Hz/\(bestFmt.channelCount)ch")
+            } catch {
+                print("[Prewarm] prepareToAnalyze failed: \(error)")
+            }
+        }
+    }
 }
 
 // MARK: - MicSTError (Phase 2A)

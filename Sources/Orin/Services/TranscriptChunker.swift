@@ -58,6 +58,79 @@ enum TranscriptChunker {
 
     // MARK: - Chunking
 
+    /// Splits `segments` into overlapping chunks at speaker-change boundaries.
+    ///
+    /// Each chunk is a formatted timeline string (via `ConversationTimelineBuilder.formatted`).
+    /// Chunks are built by accumulating utterances until `chunkSize` is reached, then
+    /// snapping back to the last speaker-change boundary so no utterance is split.
+    /// The last `utteranceOverlap` utterances of each chunk are carried into the next
+    /// chunk to preserve cross-boundary context.
+    ///
+    /// When both speakers exist in the source, every chunk is guaranteed to contain at
+    /// least one utterance from each speaker — the speaker-boundary split point ensures
+    /// a completed alternation is always included before the cut.
+    ///
+    /// Returns a single-element array when estimated length ≤ `singleCallThreshold`.
+    static func chunks(of segments: [TranscriptSegment], meetingStart: Date?) -> [String] {
+        guard !segments.isEmpty else { return [] }
+
+        let estimatedLength = segments.reduce(0) { $0 + $1.text.count + 20 }
+        guard estimatedLength > singleCallThreshold else {
+            return [ConversationTimelineBuilder.formatted(segments, meetingStart: meetingStart)]
+        }
+
+        let utteranceOverlap = 3
+        var result: [String] = []
+        var startIndex = 0
+
+        while startIndex < segments.count {
+            var accumulated = 0
+            var endIndex = startIndex
+
+            while endIndex < segments.count {
+                accumulated += segments[endIndex].text.count + 20
+                if accumulated >= chunkSize { break }
+                endIndex += 1
+            }
+
+            if endIndex >= segments.count {
+                endIndex = segments.count - 1
+            } else {
+                endIndex = lastSpeakerBoundary(in: segments, from: startIndex, upTo: endIndex)
+            }
+
+            let chunkSegments = Array(segments[startIndex...endIndex])
+            let chunkText = ConversationTimelineBuilder.formatted(chunkSegments, meetingStart: meetingStart)
+            result.append(chunkText)
+
+            let chunkIdx  = result.count
+            let lines     = chunkText.components(separatedBy: "\n").filter { !$0.isEmpty }
+            let meCount   = lines.filter { $0.contains("] Me:") }.count
+            let parCount  = lines.filter { $0.contains("] Participant:") }.count
+            print("[Chunker] chunk \(chunkIdx): \(chunkText.count) chars | \(lines.count) utterances | Me=\(meCount) Participant=\(parCount)")
+            print("[Chunker]   first: \(lines.first.map { String($0.prefix(110)) } ?? "(empty)")")
+            print("[Chunker]   last:  \(lines.last.map { String($0.prefix(110)) } ?? "(empty)")")
+
+            let nextStart = endIndex + 1
+            guard nextStart < segments.count else { break }
+            startIndex = max(nextStart - utteranceOverlap, startIndex + 1)
+        }
+
+        return result
+    }
+
+    /// Returns the index of the last segment that ends a completed speaker turn,
+    /// walking backwards from `end` to find a speaker-change boundary.
+    /// Falls back to `end` if no boundary is found (single-speaker section).
+    private static func lastSpeakerBoundary(in segments: [TranscriptSegment], from start: Int, upTo end: Int) -> Int {
+        for i in stride(from: end, through: start + 1, by: -1) {
+            if segments[i].speakerLabel != segments[i - 1].speakerLabel {
+                return i - 1
+            }
+        }
+        return end
+    }
+
     /// Splits `transcript` into overlapping chunks aligned to line boundaries.
     ///
     /// Lines starting with a timestamp (`[MM:SS]`) are preferred split points so that
@@ -104,7 +177,7 @@ enum TranscriptChunker {
         aiService: AIService
     ) async -> ChunkAnalysis {
         let prompt = buildExtractionPrompt(chunk: chunk, index: index, total: totalChunks, meetingType: meetingType)
-        let result = await aiService.generate(prompt: prompt, maxTokens: 800)
+        let result = await aiService.generate(prompt: prompt, maxTokens: 500)
 
         if result.fallbackUsed || result.text.isEmpty {
             log.warning("chunk \(index + 1)/\(totalChunks): AI unavailable — using keyword fallback")
@@ -112,6 +185,10 @@ enum TranscriptChunker {
         }
 
         var analysis = parseChunkResponse(result.text)
+        analysis.structuredActionItems = analysis.structuredActionItems
+            .filter { isMeaningfulActionItem(task: $0.task) }
+        analysis.actionItems = analysis.structuredActionItems
+            .map { "[\($0.owner)] \($0.task)" }
         analysis.index = index
         log.debug("chunk \(index + 1)/\(totalChunks): decisions=\(analysis.decisions.count) actions=\(analysis.structuredActionItems.count) keyPoints=\(analysis.keyPoints.count)")
         return analysis
@@ -140,11 +217,10 @@ enum TranscriptChunker {
             keyPointsText: keyPointsText,
             decisionsCount: allDecisions.count,
             actionsCount: allActions.count,
-            title: title,
-            meetingType: meetingType
+            title: title
         )
 
-        let result = await aiService.generate(prompt: prompt, maxTokens: 600)
+        let result = await aiService.generate(prompt: prompt, maxTokens: 350)
         if result.fallbackUsed || result.text.isEmpty {
             log.warning("synthesis: AI unavailable — using key-points fallback summary")
             return keyPointsSummary(from: chunks)
@@ -190,6 +266,38 @@ enum TranscriptChunker {
         return kept
     }
 
+    // MARK: - Action Item Filtering
+
+    /// Returns `true` when `task` has enough substance to be a real action item.
+    ///
+    /// Rejects tasks that are:
+    ///   - Pure acknowledgements ("yeah", "right", "okay", "sounds good", etc.)
+    ///   - Fewer than 3 meaningful words (words of ≥ 2 non-punctuation characters)
+    ///
+    /// Called from both the chunked path (`analyzeChunk`) and the single-call path
+    /// (`MeetingIntelligenceService.analyzeSingleCall`) so the rule is applied once,
+    /// in one place, for both pipelines.
+    static func isMeaningfulActionItem(task: String) -> Bool {
+        let normalized = task
+            .lowercased()
+            .trimmingCharacters(in: .init(charactersIn: ".,!? \t\n\r"))
+
+        let acknowledgements: Set<String> = [
+            "yeah", "yes", "no", "right", "okay", "ok", "yep", "nope",
+            "sure", "got it", "sounds good", "mm-hmm", "mm hmm",
+            "uh huh", "alright", "all right", "noted", "understood",
+            "absolutely", "definitely", "of course", "will do",
+            "thanks", "thank you", "correct", "exactly", "fair enough"
+        ]
+        guard !acknowledgements.contains(normalized) else { return false }
+
+        let wordCount = normalized
+            .components(separatedBy: .init(charactersIn: " .,;:!?-_\t\n\r"))
+            .filter { $0.trimmingCharacters(in: CharacterSet.alphanumerics.inverted).count >= 2 }
+            .count
+        return wordCount >= 3
+    }
+
     // MARK: - Prompt Builders
 
     private static func buildExtractionPrompt(
@@ -208,7 +316,10 @@ enum TranscriptChunker {
         Respond with EXACTLY these sections. Write "None" for empty sections.
 
         ## ACTION ITEMS
-        [OWNER: [name or Team] | TASK: [imperative description] | PRIORITY: [High/Medium/Low] | DUE: [date or TBD]]
+        Only output an action item when a speaker explicitly commits to a specific task, follow-up, or deliverable.
+        Do NOT include acknowledgements (yeah, right, okay, sure), opinions, discussion topics, or unanswered questions.
+        Write "None" if no explicit commitments exist.
+        Format: OWNER: [name or Team] | TASK: [verb-first task] | PRIORITY: [High/Medium/Low] | DUE: [date or TBD]
 
         ## DECISIONS
         [- each decision made]
@@ -234,23 +345,21 @@ enum TranscriptChunker {
         keyPointsText: String,
         decisionsCount: Int,
         actionsCount: Int,
-        title: String,
-        meetingType: String
+        title: String
     ) -> String {
         """
-        Write an executive summary for this \(meetingType): "\(title)"
+        Write a factual summary for the meeting titled "\(title)".
 
-        The meeting covered the following topics:
+        The meeting covered these topics:
         \(keyPointsText)
 
-        Total outcomes across the meeting:
-        - Decisions made: \(decisionsCount)
-        - Action items assigned: \(actionsCount)
+        There were \(decisionsCount) decision(s) and \(actionsCount) action item(s) identified.
 
-        \(MeetingIntelligenceService.typeSpecificContext(for: meetingType))
-
-        Write a 3-5 sentence executive summary. Be specific. No filler phrases like
-        "the team discussed" or "various topics were covered."
+        Rules:
+        - Use ONLY the topics listed above. Do not add context not present in the list.
+        - Do not infer roles, job titles, candidate qualities, or team dynamics.
+        - Do not describe the meeting type or the participants' relationship.
+        - Write 2-4 sentences. Be specific. No filler phrases.
         """
     }
 
@@ -262,40 +371,75 @@ enum TranscriptChunker {
 
         for line in text.components(separatedBy: "\n") {
             let s = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            if s.hasPrefix("## ACTION ITEMS")  { currentSection = "actions";      continue }
-            if s.hasPrefix("## DECISIONS")     { currentSection = "decisions";    continue }
-            if s.hasPrefix("## OPEN QUESTIONS"){ currentSection = "questions";    continue }
-            if s.hasPrefix("## RISKS")         { currentSection = "risks";        continue }
-            if s.hasPrefix("## DEPENDENCIES")  { currentSection = "dependencies"; continue }
-            if s.hasPrefix("## COMMITMENTS")   { currentSection = "commitments";  continue }
-            if s.hasPrefix("## KEY POINTS")    { currentSection = "keyPoints";    continue }
 
-            guard !s.isEmpty, s != "None", s != "- None" else { continue }
+            var content = s
+            if let (section, inline) = chunkSectionHeader(from: s) {
+                currentSection = section
+                content = inline
+            }
+
+            guard !content.isEmpty, content != "None", content != "- None" else { continue }
 
             switch currentSection {
             case "actions":
-                if let item = parseActionItemLine(s) {
+                if let item = parseActionItemLine(content) {
                     analysis.structuredActionItems.append(item)
                     analysis.actionItems.append("[\(item.owner)] \(item.task)")
                 }
             case "decisions":
-                analysis.decisions.append(s.hasPrefix("- ") ? String(s.dropFirst(2)) : s)
+                for item in splitBulletLine(content) { analysis.decisions.append(item) }
             case "questions":
-                analysis.openQuestions.append(s.hasPrefix("- ") ? String(s.dropFirst(2)) : s)
+                for item in splitBulletLine(content) { analysis.openQuestions.append(item) }
             case "risks":
-                analysis.risks.append(s.hasPrefix("- ") ? String(s.dropFirst(2)) : s)
+                for item in splitBulletLine(content) { analysis.risks.append(item) }
             case "dependencies":
-                analysis.dependencies.append(s.hasPrefix("- ") ? String(s.dropFirst(2)) : s)
+                for item in splitBulletLine(content) { analysis.dependencies.append(item) }
             case "commitments":
-                analysis.commitments.append(s.hasPrefix("- ") ? String(s.dropFirst(2)) : s)
+                for item in splitBulletLine(content) { analysis.commitments.append(item) }
             case "keyPoints":
-                let cleaned = s.hasPrefix("- ") ? String(s.dropFirst(2))
-                    : (s.hasPrefix("• ") ? String(s.dropFirst(2)) : s)
+                let cleaned = content.hasPrefix("- ") ? String(content.dropFirst(2))
+                    : (content.hasPrefix("• ") ? String(content.dropFirst(2)) : content)
                 if !cleaned.isEmpty { analysis.keyPoints.append(cleaned) }
             default: break
             }
         }
         return analysis
+    }
+
+    private static func chunkSectionHeader(from line: String) -> (String, String)? {
+        guard line.hasPrefix("#") || line.hasPrefix("*") else { return nil }
+        var s = line
+        while let c = s.first, c == "#" || c == "*" || c == " " { s.removeFirst() }
+        let headerPart: String
+        var inlinePart = ""
+        if let colonIdx = s.firstIndex(of: ":") {
+            headerPart = String(s[s.startIndex..<colonIdx])
+            inlinePart = String(s[s.index(after: colonIdx)...])
+                .trimmingCharacters(in: .init(charactersIn: "*: "))
+        } else {
+            headerPart = s
+        }
+        let name = headerPart.trimmingCharacters(in: .init(charactersIn: "* ")).uppercased()
+        let section: String
+        if name.hasPrefix("ACTION ITEM") || name == "ACTIONS"  { section = "actions" }
+        else if name.hasPrefix("DECISION")                     { section = "decisions" }
+        else if name.hasPrefix("OPEN Q")                       { section = "questions" }
+        else if name.hasPrefix("RISK")                         { section = "risks" }
+        else if name.hasPrefix("DEPEND")                       { section = "dependencies" }
+        else if name.hasPrefix("COMMIT")                       { section = "commitments" }
+        else if name.hasPrefix("KEY POINT")                    { section = "keyPoints" }
+        else { return nil }
+        return (section, inlinePart)
+    }
+
+    private static func splitBulletLine(_ line: String) -> [String] {
+        if !line.hasPrefix("- ") { return [line] }
+        return line.components(separatedBy: " - ")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .compactMap { part -> String? in
+                guard !part.isEmpty, part != "None" else { return nil }
+                return part.hasPrefix("- ") ? String(part.dropFirst(2)) : part
+            }
     }
 
     private static func parseActionItemLine(_ line: String) -> ActionItemRecord? {

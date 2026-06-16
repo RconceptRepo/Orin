@@ -9,8 +9,10 @@
 #   5. Launches the updated app
 #   6. Logs success/failure to release/update.log
 #
-# TCC permissions are preserved because bundle ID (com.rconcept.orin) stays constant.
-# No tccutil reset or Screen Recording re-grant is needed between updates.
+# TCC permissions persist because build_release.sh signs with --requirement 'identifier
+# "com.rconcept.orin"', giving a stable designated requirement that survives CDHash changes.
+# Ad-hoc signing without --requirement auto-generates a cdhash-pinned DR that breaks TCC
+# on every build. Screen Recording re-grant is only needed if the DR ever changes.
 #
 # Usage:
 #   ./update-orin.sh                # standard update

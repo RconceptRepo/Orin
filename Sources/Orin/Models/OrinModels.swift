@@ -230,6 +230,51 @@ enum MeetingType: String, CaseIterable, Codable {
     }
 }
 
+// MARK: - ConfidenceLevel
+
+enum ConfidenceLevel: String, Codable {
+    case high   = "HIGH"
+    case medium = "MEDIUM"
+    case low    = "LOW"
+}
+
+// MARK: - EvidencedItem
+
+/// A single extracted fact paired with its confidence and the verbatim
+/// transcript quote that supports it.  Used for hallucination measurement.
+struct EvidencedItem: Codable, Identifiable {
+    var id: UUID
+    var text: String
+    var confidence: ConfidenceLevel
+    /// Verbatim words from the transcript the model cited as its source.
+    var snippet: String
+    /// True when `snippet` is actually present (substring) in the original transcript.
+    var isSupported: Bool
+
+    init(text: String, confidence: ConfidenceLevel,
+         snippet: String, isSupported: Bool = false) {
+        id              = UUID()
+        self.text       = text
+        self.confidence = confidence
+        self.snippet    = snippet
+        self.isSupported = isSupported
+    }
+}
+
+// MARK: - HallucinationReport
+
+/// Per-analysis hallucination metric.  An item is "unsupported" when its
+/// SOURCE snippet cannot be found verbatim in the original transcript.
+struct HallucinationReport: Codable {
+    var modelUsed: String
+    var totalItems: Int
+    var supportedItems: Int
+    var unsupportedItems: Int
+    /// Fraction of items not traceable to the transcript (0.0 = none, 1.0 = all).
+    var hallucinationRate: Double
+    var analysisTimestamp: Date
+}
+
 // MARK: - ActionItemRecord
 
 /// Structured action item extracted from a meeting transcript by AI.
@@ -246,15 +291,26 @@ struct ActionItemRecord: Codable, Identifiable {
     var dueDateText: String
     /// Original line(s) from the transcript that this item was extracted from.
     var rawText: String
+    /// AI-assigned confidence that this action item is real (default .medium for old records).
+    var confidence: ConfidenceLevel
+    /// Verbatim transcript quote the model cited as its source.
+    var snippet: String
+    /// True when `snippet` is found verbatim in the original transcript.
+    var isSupported: Bool
 
     init(owner: String, task: String, priority: String = "Medium",
-         dueDateText: String = "", rawText: String = "") {
-        id           = UUID()
-        self.owner   = owner
-        self.task    = task
-        self.priority = priority
+         dueDateText: String = "", rawText: String = "",
+         confidence: ConfidenceLevel = .medium, snippet: String = "",
+         isSupported: Bool = true) {
+        id               = UUID()
+        self.owner       = owner
+        self.task        = task
+        self.priority    = priority
         self.dueDateText = dueDateText
-        self.rawText = rawText
+        self.rawText     = rawText
+        self.confidence  = confidence
+        self.snippet     = snippet
+        self.isSupported = isSupported
     }
 }
 
@@ -280,12 +336,20 @@ struct MeetingKnowledgeSnapshot: Codable {
     var risks: [String]
     var dependencies: [String]
     var commitments: [String]
-    var actionItems: [String]                       // flat strings
+    var actionItems: [String]
     var structuredActionItems: [ActionItemRecord]
     var durationSeconds: TimeInterval
     var participants: [String]
 
-    /// Creates a snapshot from the current state of a MeetingItem.
+    // Evidence-based analysis fields (populated after confidence-first analysis)
+    var conservativeSummary: String = ""
+    var evidencedDecisions: [EvidencedItem] = []
+    var evidencedDiscussionPoints: [EvidencedItem] = []
+    var evidencedFollowUps: [EvidencedItem] = []
+    var hallucinationReport: HallucinationReport? = nil
+
+    /// Creates a base snapshot from a MeetingItem's stored fields.
+    /// Evidence fields are filled in separately via `applyEvidence(_:)`.
     init(from meeting: MeetingItem) {
         meetingId             = meeting.id
         title                 = meeting.title
@@ -302,6 +366,25 @@ struct MeetingKnowledgeSnapshot: Codable {
         durationSeconds       = meeting.durationSeconds
         participants          = meeting.participants
     }
+
+    mutating func applyEvidence(from analysis: MeetingAnalysisEvidence) {
+        conservativeSummary       = analysis.conservativeSummary
+        evidencedDecisions        = analysis.evidencedDecisions
+        evidencedDiscussionPoints = analysis.evidencedDiscussionPoints
+        evidencedFollowUps        = analysis.evidencedFollowUps
+        hallucinationReport       = analysis.hallucinationReport
+    }
+}
+
+/// Lightweight carrier for the evidence-specific fields of a MeetingAnalysis.
+/// Passed from the service layer to the persistence layer without coupling
+/// MeetingKnowledgeSnapshot to the full MeetingAnalysis type.
+struct MeetingAnalysisEvidence {
+    var conservativeSummary: String
+    var evidencedDecisions: [EvidencedItem]
+    var evidencedDiscussionPoints: [EvidencedItem]
+    var evidencedFollowUps: [EvidencedItem]
+    var hallucinationReport: HallucinationReport?
 }
 
 // MARK: - TranscriptChunk

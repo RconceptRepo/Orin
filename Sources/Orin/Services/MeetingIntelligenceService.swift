@@ -5,15 +5,30 @@ import OSLog
 
 struct MeetingAnalysis {
     var summary: String
+    var conservativeSummary: String
     var meetingType: String
     var decisions: [String]
     var openQuestions: [String]
     var risks: [String]
     var dependencies: [String]
     var commitments: [String]
-    var actionItems: [String]                       // flat strings (backward compat)
-    var structuredActionItems: [ActionItemRecord]   // structured (owner/task/priority/due)
+    var actionItems: [String]
+    var structuredActionItems: [ActionItemRecord]
     var suggestedTasks: [String]
+    var evidencedDecisions: [EvidencedItem]
+    var evidencedDiscussionPoints: [EvidencedItem]
+    var evidencedFollowUps: [EvidencedItem]
+    var hallucinationReport: HallucinationReport?
+
+    var evidence: MeetingAnalysisEvidence {
+        MeetingAnalysisEvidence(
+            conservativeSummary:       conservativeSummary,
+            evidencedDecisions:        evidencedDecisions,
+            evidencedDiscussionPoints: evidencedDiscussionPoints,
+            evidencedFollowUps:        evidencedFollowUps,
+            hallucinationReport:       hallucinationReport
+        )
+    }
 }
 
 // MARK: - MeetingIntelligenceService
@@ -60,7 +75,22 @@ final class MeetingIntelligenceService: Service {
             return await analyze(title: title, transcript: fallbackTranscript)
         }
         let timelineText = ConversationTimelineBuilder.formatted(segments, meetingStart: meetingStart)
-        return await analyze(title: title, transcript: timelineText)
+        let meCount  = segments.filter { $0.speakerLabel == "Me" }.count
+        let parCount = segments.filter { $0.speakerLabel != "Me" }.count
+        print("[MeetingIntelligence] transcript chars=\(timelineText.count) segments=\(segments.count) Me=\(meCount) Participant=\(parCount) for '\(title)'")
+
+        // Long meetings: route directly to segment-aware chunker (utterance boundaries, not newlines)
+        if timelineText.count > TranscriptChunker.singleCallThreshold {
+            let meetingType = MeetingIntelligenceService.detectMeetingType(title: title, transcript: timelineText)
+            let chunks = TranscriptChunker.chunks(of: segments, meetingStart: meetingStart)
+            print("[MeetingIntelligence] segment-aware chunking: \(segments.count) segments → \(chunks.count) chunks")
+            return await analyzeChunked(title: title, chunks: chunks, meetingType: meetingType)
+        }
+
+        return await analyzeSingleCall(
+            title: title, transcript: timelineText,
+            meetingType: MeetingIntelligenceService.detectMeetingType(title: title, transcript: timelineText)
+        )
     }
 
     // MARK: - String-based analysis
@@ -95,17 +125,34 @@ final class MeetingIntelligenceService: Service {
         meetingType: String
     ) async -> MeetingAnalysis {
         let chunks = TranscriptChunker.chunks(of: transcript)
+        return await analyzeChunked(title: title, chunks: chunks, meetingType: meetingType)
+    }
+
+    private func analyzeChunked(
+        title: String,
+        chunks: [String],
+        meetingType: String
+    ) async -> MeetingAnalysis {
         log.info("chunked analysis: \(chunks.count) chunks for title='\(title)'")
 
-        // Phase 1: Extract from each chunk
-        var chunkAnalyses: [ChunkAnalysis] = []
-        for (i, chunk) in chunks.enumerated() {
-            let ca = await TranscriptChunker.analyzeChunk(
-                chunk, index: i, totalChunks: chunks.count,
-                meetingType: meetingType, aiService: aiService
-            )
-            chunkAnalyses.append(ca)
+        // Phase 1: Extract from all chunks concurrently.
+        // Cloud APIs process requests in parallel; Ollama queues and serializes internally
+        // so total inference time is the same but network overhead overlaps.
+        let service = aiService
+        var ordered = [ChunkAnalysis?](repeating: nil, count: chunks.count)
+        await withTaskGroup(of: (Int, ChunkAnalysis).self) { group in
+            for (i, chunk) in chunks.enumerated() {
+                group.addTask {
+                    let ca = await TranscriptChunker.analyzeChunk(
+                        chunk, index: i, totalChunks: chunks.count,
+                        meetingType: meetingType, aiService: service
+                    )
+                    return (i, ca)
+                }
+            }
+            for await (i, ca) in group { ordered[i] = ca }
         }
+        let chunkAnalyses = ordered.compactMap { $0 }
 
         // Phase 2: Merge and deduplicate
         let allDecisions      = TranscriptChunker.deduplicateStrings(chunkAnalyses.flatMap(\.decisions))
@@ -130,17 +177,58 @@ final class MeetingIntelligenceService: Service {
 
         log.info("chunked analysis complete: summary=\(summary.count)chars decisions=\(allDecisions.count) actions=\(allStructured.count) risks=\(allRisks.count)")
 
+        // --- Proof-run diagnostic dump ---
+        let fullTranscript = chunks.joined(separator: "\n")
+        print("[ProofRun] ── FINAL SUMMARY ──────────────────────────────────────────")
+        print(summary)
+        print("[ProofRun] ── ACTION ITEMS (\(allStructured.count)) ──────────────────────────────")
+        if allStructured.isEmpty {
+            print("  (none)")
+        } else {
+            for item in allStructured {
+                print("  [\(item.owner)] \(item.task) | priority=\(item.priority) due=\(item.dueDateText.isEmpty ? "TBD" : item.dueDateText)")
+            }
+        }
+        print("[ProofRun] ── DECISIONS (\(allDecisions.count)) ──────────────────────────────────")
+        if allDecisions.isEmpty {
+            print("  (none)")
+        } else {
+            for d in allDecisions { print("  • \(d)") }
+        }
+        print("[ProofRun] ── HALLUCINATION CHECK ──────────────────────────────────────")
+        let transcriptLower = fullTranscript.lowercased()
+        let summaryWords = summary.components(separatedBy: .whitespacesAndNewlines)
+            .map { $0.trimmingCharacters(in: .punctuationCharacters) }
+            .filter { w in w.count >= 4 && w.first?.isUppercase == true && w != title }
+        var flagged: [String] = []
+        for word in summaryWords {
+            if !transcriptLower.contains(word.lowercased()) && !flagged.contains(word) {
+                flagged.append(word)
+            }
+        }
+        if flagged.isEmpty {
+            print("  PASS — all summary terms found in transcript")
+        } else {
+            print("  FLAGGED terms not found in transcript: \(flagged.joined(separator: ", "))")
+        }
+        print("[ProofRun] ─────────────────────────────────────────────────────────────")
+
         return MeetingAnalysis(
-            summary:               summary,
-            meetingType:           meetingType,
-            decisions:             allDecisions,
-            openQuestions:         allOpenQuestions,
-            risks:                 allRisks,
-            dependencies:          allDependencies,
-            commitments:           allCommitments,
-            actionItems:           allActionItems,
-            structuredActionItems: allStructured,
-            suggestedTasks:        suggestedTasks
+            summary:                   summary,
+            conservativeSummary:       "",
+            meetingType:               meetingType,
+            decisions:                 allDecisions,
+            openQuestions:             allOpenQuestions,
+            risks:                     allRisks,
+            dependencies:              allDependencies,
+            commitments:               allCommitments,
+            actionItems:               allActionItems,
+            structuredActionItems:     allStructured,
+            suggestedTasks:            suggestedTasks,
+            evidencedDecisions:        [],
+            evidencedDiscussionPoints: [],
+            evidencedFollowUps:        [],
+            hallucinationReport:       nil
         )
     }
 
@@ -155,46 +243,95 @@ final class MeetingIntelligenceService: Service {
         let prompt = buildComprehensivePrompt(title: title, transcript: transcript, meetingType: meetingType)
 
         // Step 2: Single AI call
-        let result = await aiService.generate(prompt: prompt, maxTokens: 1500)
+        let result = await aiService.generate(prompt: prompt, maxTokens: 900)
+
+        log.info("AI response: fallback=\(result.fallbackUsed) chars=\(result.text.count) preview='\(result.text.prefix(120))'")
 
         if result.fallbackUsed || result.text.isEmpty {
             log.warning("AI unavailable — using keyword fallback")
             return keywordFallback(title: title, transcript: transcript, meetingType: meetingType)
         }
 
-        // Step 3: Parse structured response
-        let parsed = parseComprehensiveResponse(result.text)
+        // Dump raw phi3 response for debugging — read at /tmp/orin_phi3_raw.txt
+        try? result.text.write(to: URL(fileURLWithPath: "/tmp/orin_phi3_raw.txt"),
+                               atomically: true, encoding: .utf8)
 
-        // If parsing produced almost nothing, run keyword fallback for missing sections
+        // Step 3: Parse structured response (pass transcript for snippet verification)
+        let parsed = parseComprehensiveResponse(result.text, transcript: transcript)
+
         let decisions     = parsed.decisions.isEmpty
             ? extractCleanLines(from: transcript, matching: ["decided", "decision", "agreed", "approved", "will proceed", "confirmed"])
             : parsed.decisions
         let commitments   = parsed.commitments.isEmpty
             ? extractCleanLines(from: transcript, matching: ["i will", "i'll", "we will", "will send", "will prepare", "will schedule"])
             : parsed.commitments
-        let actionItems   = parsed.structuredActionItems.isEmpty
-            ? extractCleanLines(from: transcript, matching: ["action", "todo", "to do", "next step", "follow up", "need to", "should"])
-            : parsed.structuredActionItems.map { "[\($0.owner)] \($0.task)" }
+        // Filter then deduplicate — mirrors what the chunked path does per-chunk.
+        var validStructured = TranscriptChunker.deduplicateActionItems(
+            parsed.structuredActionItems.filter { TranscriptChunker.isMeaningfulActionItem(task: $0.task) }
+        )
+        let actionItems: [String]
+        if validStructured.isEmpty {
+            actionItems = extractCleanLines(
+                from: transcript,
+                matching: ["action", "todo", "to do", "next step", "follow up", "need to", "should"]
+            )
+        } else {
+            actionItems = validStructured.map { "[\($0.owner)] \($0.task)" }
+        }
         let suggestedTasks = buildSuggestedTasks(
-            title: title,
-            commitments: commitments,
-            actionItems: actionItems,
-            structuredItems: parsed.structuredActionItems
+            title: title, commitments: commitments,
+            actionItems: actionItems, structuredItems: validStructured
         )
 
-        log.info("analysis complete type='\(meetingType)' decisions=\(decisions.count) actions=\(parsed.structuredActionItems.count) questions=\(parsed.openQuestions.count) risks=\(parsed.risks.count)")
+        // Swift-side evidence computation: check each extracted item against the
+        // original transcript. phi3 extracts items; we measure whether they're real.
+        let evidencedDecisions = evidenceItems(parsed.decisions, in: transcript)
+        let evidencedPoints    = evidenceItems(
+            parsed.evidencedDiscussionPoints.map { $0.text }, in: transcript)
+        let evidencedFollowUps = evidenceItems(
+            parsed.evidencedFollowUps.map { $0.text }, in: transcript)
+        for i in validStructured.indices {
+            validStructured[i].isSupported =
+                snippetSupported(validStructured[i].task, in: transcript)
+            validStructured[i].confidence =
+                validStructured[i].isSupported ? .high : .low
+        }
+
+        let report = computeHallucinationReport(
+            decisions: evidencedDecisions,
+            points:    evidencedPoints,
+            followUps: evidencedFollowUps,
+            actions:   validStructured
+        )
+
+        // Conservative summary: only HIGH-confidence (transcript-supported) items.
+        let highFacts = (evidencedDecisions + evidencedPoints + evidencedFollowUps)
+            .filter { $0.confidence == .high }.map { $0.text }
+        let conservativeSummary = highFacts.isEmpty
+            ? parsed.summary
+            : highFacts.prefix(3).joined(separator: ". ") + "."
+
+        print("[HallucinationReport] model=phi3 total=\(report.totalItems) supported=\(report.supportedItems) unsupported=\(report.unsupportedItems) rate=\(String(format: "%.0f", report.hallucinationRate * 100))%")
+        print("[HallucinationReport] currentSummary=\(parsed.summary.count)chars conservativeSummary=\(conservativeSummary.count)chars")
+
+        log.info("analysis complete type='\(meetingType)' decisions=\(decisions.count) actions=\(validStructured.count) hallucination=\(String(format: "%.0f", report.hallucinationRate * 100))%")
 
         return MeetingAnalysis(
-            summary:               parsed.summary.isEmpty ? fallbackSummary(transcript) : parsed.summary,
-            meetingType:           meetingType,
-            decisions:             decisions,
-            openQuestions:         parsed.openQuestions,
-            risks:                 parsed.risks,
-            dependencies:          parsed.dependencies,
-            commitments:           commitments,
-            actionItems:           actionItems,
-            structuredActionItems: parsed.structuredActionItems,
-            suggestedTasks:        suggestedTasks
+            summary:                   parsed.summary.isEmpty ? fallbackSummary(transcript) : parsed.summary,
+            conservativeSummary:       conservativeSummary,
+            meetingType:               meetingType,
+            decisions:                 decisions,
+            openQuestions:             parsed.openQuestions,
+            risks:                     parsed.risks,
+            dependencies:              parsed.dependencies,
+            commitments:               commitments,
+            actionItems:               actionItems,
+            structuredActionItems:     validStructured,
+            suggestedTasks:            suggestedTasks,
+            evidencedDecisions:        evidencedDecisions,
+            evidencedDiscussionPoints: evidencedPoints,
+            evidencedFollowUps:        evidencedFollowUps,
+            hallucinationReport:       report
         )
     }
 
@@ -259,53 +396,34 @@ final class MeetingIntelligenceService: Service {
     // MARK: - Comprehensive Prompt Builder
 
     private func buildComprehensivePrompt(title: String, transcript: String, meetingType: String) -> String {
-        let typeContext = Self.typeSpecificContext(for: meetingType)
-
-        // Single-call path only reaches here for transcripts ≤ singleCallThreshold (12 000 chars).
-        // No truncation needed — the routing in analyze() guarantees this.
         let trimmedTranscript = transcript
 
         return """
-        You are analyzing a meeting recording. Respond with ONLY the structured sections below.
+        You are a meeting notes assistant. Fill in the five sections below using ONLY facts explicitly stated in the transcript. Do not infer. Do not write emails. Do not add commentary outside the sections.
 
         MEETING TITLE: \(title)
-        MEETING TYPE: \(meetingType)
-
-        \(typeContext)
-
         TRANSCRIPT:
         \(trimmedTranscript)
 
-        ---
-        Respond using EXACTLY this format. Keep each section concise and factual.
-        Do not add commentary outside the section headers.
+        Fill in these five sections:
 
         ## SUMMARY
-        [3-5 sentence executive summary. Be specific to this meeting type. No bullet points.]
+        Write 2-3 sentences covering what was discussed.
+
+        ## DISCUSSION POINTS
+        List each topic as a short bullet.
 
         ## ACTION ITEMS
-        [One per line in format: OWNER: [name or Team] | TASK: [imperative description] | PRIORITY: [High/Medium/Low] | DUE: [date if mentioned, else TBD]]
-        [Write "None" if no action items were discussed]
+        Only create an action item when a speaker explicitly commits to a specific task, follow-up, or deliverable.
+        Do NOT create action items from acknowledgements (yeah, right, okay, sure), opinions, discussion topics, or questions without an owner.
+        Write "None" if no explicit commitments were made.
+        For each real action item: OWNER: name | TASK: verb-first task | PRIORITY: High/Medium/Low | DUE: date or TBD
 
         ## DECISIONS
-        [One decision per line starting with "- ". Only explicitly agreed decisions.]
-        [Write "- None" if no decisions were made]
+        List each decision as a short bullet.
 
-        ## OPEN QUESTIONS
-        [One per line starting with "- ". Questions raised but not resolved.]
-        [Write "- None" if no open questions]
-
-        ## RISKS
-        [One per line starting with "- ". Risks, concerns, or potential blockers mentioned.]
-        [Write "- None" if no risks mentioned]
-
-        ## DEPENDENCIES
-        [One per line starting with "- ". Things the team is waiting on from others.]
-        [Write "- None" if no dependencies mentioned]
-
-        ## COMMITMENTS
-        [One per line starting with "- ". Personal commitments made, e.g. "Alice will send the report by Monday".]
-        [Write "- None" if no commitments made]
+        ## FOLLOW-UPS
+        List each follow-up as a short bullet.
         """
     }
 
@@ -388,85 +506,293 @@ final class MeetingIntelligenceService: Service {
 
     private struct ParsedResponse {
         var summary = ""
+        var conservativeSummary = ""
         var structuredActionItems: [ActionItemRecord] = []
         var decisions: [String] = []
         var openQuestions: [String] = []
         var risks: [String] = []
         var dependencies: [String] = []
         var commitments: [String] = []
+        var evidencedDecisions: [EvidencedItem] = []
+        var evidencedDiscussionPoints: [EvidencedItem] = []
+        var evidencedFollowUps: [EvidencedItem] = []
     }
 
-    private func parseComprehensiveResponse(_ text: String) -> ParsedResponse {
+    private func parseComprehensiveResponse(_ text: String, transcript: String) -> ParsedResponse {
         var result = ParsedResponse()
         var currentSection = ""
-
-        let lines = text.components(separatedBy: "\n")
         var summaryLines: [String] = []
+        var conservativeLines: [String] = []
+        var preSectionLines: [String] = []   // phi3 often outputs summary before first ## header
 
-        for line in lines {
+        for line in text.components(separatedBy: "\n") {
             let stripped = line.trimmingCharacters(in: .whitespacesAndNewlines)
 
-            // Section header detection
-            if stripped.hasPrefix("## SUMMARY")       { currentSection = "summary";       continue }
-            if stripped.hasPrefix("## ACTION ITEMS")  { currentSection = "actions";       continue }
-            if stripped.hasPrefix("## DECISIONS")     { currentSection = "decisions";     continue }
-            if stripped.hasPrefix("## OPEN QUESTIONS"){ currentSection = "questions";     continue }
-            if stripped.hasPrefix("## RISKS")         { currentSection = "risks";         continue }
-            if stripped.hasPrefix("## DEPENDENCIES")  { currentSection = "dependencies";  continue }
-            if stripped.hasPrefix("## COMMITMENTS")   { currentSection = "commitments";   continue }
+            var content = stripped
+            if let (section, inline) = sectionHeader(from: stripped) {
+                currentSection = section
+                content = inline
+            }
 
-            guard !stripped.isEmpty, stripped != "None", stripped != "- None" else { continue }
+            guard !content.isEmpty, content != "None", content != "- None" else { continue }
+
+            // Filter phi3 instruction echoes, null results, and email hallucinations
+            let lower = content.lowercased()
+            if lower.hasPrefix("no explicit") || lower.hasPrefix("no clear")
+               || lower.hasPrefix("no follow") || lower.hasPrefix("none of the")
+               || lower.contains("not mentioned") || lower.contains("no action item")
+               || lower.contains("sentences summary")
+               || lower.hasPrefix("dear ") || lower.hasPrefix("subject:")
+               || lower.hasPrefix("to: ") || lower.hasPrefix("from: ")
+               || lower.hasPrefix("i hope") || lower.hasPrefix("i trust this")
+               || lower.hasPrefix("[text]")
+               || lower.contains("decision after meeting")
+               || lower.contains("decision made immediately")
+               || lower.contains("decision agreed upon immediately")
+               || lower.contains("prior transcript") || lower.contains("not provided herein") { continue }
 
             switch currentSection {
             case "summary":
-                summaryLines.append(stripped)
+                summaryLines.append(content)
+
+            case "conservativeSummary":
+                conservativeLines.append(content)
 
             case "actions":
-                if let item = parseActionItemLine(stripped) {
+                let (conf, withoutConf) = extractConfidence(from: content)
+                let (itemText, snippet) = extractSnippet(from: withoutConf)
+                if var item = parseActionItemLine(itemText) {
+                    item.confidence  = conf
+                    item.snippet     = snippet
+                    item.isSupported = snippetSupported(snippet, in: transcript)
                     result.structuredActionItems.append(item)
                 }
 
             case "decisions":
-                if stripped.hasPrefix("- ") {
-                    result.decisions.append(String(stripped.dropFirst(2)))
-                } else {
-                    result.decisions.append(stripped)
-                }
+                let (conf, withoutConf) = extractConfidence(from: content)
+                let (itemText, snippet) = extractSnippet(from: withoutConf)
+                let clean = itemText.hasPrefix("- ") ? String(itemText.dropFirst(2)) : itemText
+                guard !clean.isEmpty else { break }
+                result.decisions.append(clean)
+                result.evidencedDecisions.append(EvidencedItem(
+                    text: clean, confidence: conf, snippet: snippet,
+                    isSupported: snippetSupported(snippet, in: transcript)))
+
+            case "discussionPoints":
+                let (conf, withoutConf) = extractConfidence(from: content)
+                let (itemText, snippet) = extractSnippet(from: withoutConf)
+                let clean = itemText.hasPrefix("- ") ? String(itemText.dropFirst(2)) : itemText
+                guard !clean.isEmpty else { break }
+                result.evidencedDiscussionPoints.append(EvidencedItem(
+                    text: clean, confidence: conf, snippet: snippet,
+                    isSupported: snippetSupported(snippet, in: transcript)))
+
+            case "followUps":
+                let (conf, withoutConf) = extractConfidence(from: content)
+                let (itemText, snippet) = extractSnippet(from: withoutConf)
+                let clean = itemText.hasPrefix("- ") ? String(itemText.dropFirst(2)) : itemText
+                guard !clean.isEmpty else { break }
+                result.evidencedFollowUps.append(EvidencedItem(
+                    text: clean, confidence: conf, snippet: snippet,
+                    isSupported: snippetSupported(snippet, in: transcript)))
 
             case "questions":
-                if stripped.hasPrefix("- ") {
-                    result.openQuestions.append(String(stripped.dropFirst(2)))
-                } else {
-                    result.openQuestions.append(stripped)
-                }
+                let (_, rest) = extractConfidence(from: content)
+                let (itemText, _) = extractSnippet(from: rest)
+                let clean = itemText.hasPrefix("- ") ? String(itemText.dropFirst(2)) : itemText
+                if !clean.isEmpty { result.openQuestions.append(clean) }
 
             case "risks":
-                if stripped.hasPrefix("- ") {
-                    result.risks.append(String(stripped.dropFirst(2)))
-                } else {
-                    result.risks.append(stripped)
-                }
+                let (_, rest) = extractConfidence(from: content)
+                let (itemText, _) = extractSnippet(from: rest)
+                let clean = itemText.hasPrefix("- ") ? String(itemText.dropFirst(2)) : itemText
+                if !clean.isEmpty { result.risks.append(clean) }
 
             case "dependencies":
-                if stripped.hasPrefix("- ") {
-                    result.dependencies.append(String(stripped.dropFirst(2)))
-                } else {
-                    result.dependencies.append(stripped)
-                }
+                let (_, rest) = extractConfidence(from: content)
+                let (itemText, _) = extractSnippet(from: rest)
+                let clean = itemText.hasPrefix("- ") ? String(itemText.dropFirst(2)) : itemText
+                if !clean.isEmpty { result.dependencies.append(clean) }
 
             case "commitments":
-                if stripped.hasPrefix("- ") {
-                    result.commitments.append(String(stripped.dropFirst(2)))
-                } else {
-                    result.commitments.append(stripped)
-                }
+                let (_, rest) = extractConfidence(from: content)
+                let (itemText, _) = extractSnippet(from: rest)
+                let clean = itemText.hasPrefix("- ") ? String(itemText.dropFirst(2)) : itemText
+                if !clean.isEmpty { result.commitments.append(clean) }
+
             default:
-                break
+                // Collect substantive pre-header text — phi3 sometimes outputs its
+                // summary as free text before the first section marker.
+                // Cap at 3 lines so a malformed response doesn't dump everything here.
+                if currentSection == "" && content.count > 40 && preSectionLines.count < 3 {
+                    preSectionLines.append(content)
+                }
             }
         }
 
-        result.summary = summaryLines.joined(separator: " ")
+        // Use pre-header text as summary when phi3 didn't emit a recognised SUMMARY header
+        if summaryLines.isEmpty {
+            summaryLines = preSectionLines
+        }
+
+        result.summary             = summaryLines.joined(separator: " ")
+        result.conservativeSummary = conservativeLines.joined(separator: " ")
         return result
+    }
+
+    // MARK: - Section Header Detection
+
+    // Normalises any LLM header style → (sectionName, inlineContent).
+    // Handles: "## SUMMARY", "**EXECUTIVE SUMMARY:**", "[SUMMARY]", "[ACTION ITEMS] text"
+    private func sectionHeader(from line: String) -> (String, String)? {
+        if line.hasPrefix("#") || line.hasPrefix("*") {
+            var s = line
+            while let c = s.first, c == "#" || c == "*" || c == " " { s.removeFirst() }
+            let headerPart: String
+            var inlinePart = ""
+            if let colonIdx = s.firstIndex(of: ":") {
+                headerPart = String(s[s.startIndex..<colonIdx])
+                inlinePart = String(s[s.index(after: colonIdx)...])
+                    .trimmingCharacters(in: .init(charactersIn: "*: "))
+            } else {
+                headerPart = s
+            }
+            let name = headerPart.trimmingCharacters(in: .init(charactersIn: "* ")).uppercased()
+            guard let section = sectionName(from: name) else { return nil }
+            return (section, inlinePart)
+        }
+
+        // [SECTION NAME] or [SECTION NAME] inline content
+        if line.hasPrefix("["), let close = line.firstIndex(of: "]") {
+            let bracketContent = String(line[line.index(after: line.startIndex)..<close])
+                .trimmingCharacters(in: .whitespaces).uppercased()
+            if bracketContent.hasPrefix("END") { return nil }   // [END OF SECTION] markers
+            let inlinePart = String(line[line.index(after: close)...])
+                .trimmingCharacters(in: .init(charactersIn: " :"))
+            guard let section = sectionName(from: bracketContent) else { return nil }
+            return (section, inlinePart)
+        }
+
+        // Plain "SECTION NAME: inline content" (no prefix markers) — phi3 sometimes
+        // emits raw headers like "SUMMARY: text" or "ACTION ITEMS:  "
+        if let colonIdx = line.firstIndex(of: ":") {
+            let candidate = String(line[..<colonIdx]).trimmingCharacters(in: .whitespaces).uppercased()
+            // Only match if candidate is a known section name (avoids "OWNER:", "Me:", etc.)
+            if let section = sectionName(from: candidate) {
+                let inlinePart = String(line[line.index(after: colonIdx)...])
+                    .trimmingCharacters(in: .whitespaces)
+                return (section, inlinePart)
+            }
+        }
+
+        return nil
+    }
+
+    private func sectionName(from name: String) -> String? {
+        if name.hasPrefix("CONSERVATIVE")                            { return "conservativeSummary" }
+        if name.hasPrefix("CURRENT SUMMARY")
+        || name.hasPrefix("EXECUTIVE SUMMARY")
+        || name == "SUMMARY"                                         { return "summary" }
+        if name.hasPrefix("DISCUSSION POINT")                        { return "discussionPoints" }
+        if name.hasPrefix("ACTION ITEM") || name == "ACTIONS"        { return "actions" }
+        if name.hasPrefix("DECISION")                                { return "decisions" }
+        if name.hasPrefix("FOLLOW")                                  { return "followUps" }
+        if name.hasPrefix("OPEN Q")                                  { return "questions" }
+        if name.hasPrefix("RISK")                                    { return "risks" }
+        if name.hasPrefix("DEPEND")                                  { return "dependencies" }
+        if name.hasPrefix("COMMIT")                                  { return "commitments" }
+        return nil
+    }
+
+    // MARK: - Evidence Extraction Helpers
+
+    // Strips a leading [HIGH/MEDIUM/LOW] marker from a line.
+    private func extractConfidence(from line: String) -> (ConfidenceLevel, String) {
+        let s = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        let upper = s.uppercased()
+        for (tag, level) in [("[HIGH]", ConfidenceLevel.high),
+                              ("[MEDIUM]", .medium),
+                              ("[LOW]", .low)] {
+            if upper.hasPrefix(tag) {
+                let rest = String(s.dropFirst(tag.count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                return (level, rest)
+            }
+        }
+        return (.medium, s)
+    }
+
+    // Splits a line at "| SOURCE: ..." and returns (content, snippet).
+    private func extractSnippet(from line: String) -> (String, String) {
+        guard let range = line.range(of: "| SOURCE:", options: .caseInsensitive) else {
+            return (line.trimmingCharacters(in: .whitespacesAndNewlines), "")
+        }
+        let content = String(line[line.startIndex..<range.lowerBound])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let raw = String(line[range.upperBound...])
+            .trimmingCharacters(in: .init(charactersIn: " \"'"))
+        let snippet = raw.hasSuffix("\"") || raw.hasSuffix("'")
+            ? String(raw.dropLast()) : raw
+        return (content, snippet)
+    }
+
+    // Converts plain text items into EvidencedItems with Swift-computed confidence.
+    private func evidenceItems(_ items: [String], in transcript: String) -> [EvidencedItem] {
+        items.compactMap { text -> EvidencedItem? in
+            let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !cleaned.isEmpty else { return nil }
+            let supported = snippetSupported(cleaned, in: transcript)
+            return EvidencedItem(
+                text:        cleaned,
+                confidence:  supported ? .high : .low,
+                snippet:     cleaned,
+                isSupported: supported
+            )
+        }
+    }
+
+    // Returns true when a verbatim or near-verbatim match of `snippet` exists in `transcript`.
+    private func snippetSupported(_ snippet: String, in transcript: String) -> Bool {
+        guard !snippet.isEmpty else { return false }
+        let norm = snippet.lowercased().trimmingCharacters(in: .init(charactersIn: "\"' .,"))
+        let t    = transcript.lowercased()
+        if t.contains(norm) { return true }
+        // Partial match: first 4 consecutive words
+        let words = norm.split(separator: " ").map(String.init)
+        guard words.count >= 3 else { return t.contains(norm) }
+        for i in 0..<max(1, words.count - 2) {
+            let window = words[i..<min(i + 4, words.count)].joined(separator: " ")
+            if t.contains(window) { return true }
+        }
+        return false
+    }
+
+    // Builds a hallucination report from all evidenced items in this analysis.
+    private func computeHallucinationReport(
+        decisions: [EvidencedItem],
+        points: [EvidencedItem],
+        followUps: [EvidencedItem],
+        actions: [ActionItemRecord]
+    ) -> HallucinationReport {
+        var total = 0
+        var supported = 0
+        for item in decisions + points + followUps {
+            total += 1
+            if item.isSupported { supported += 1 }
+        }
+        for item in actions {
+            total += 1
+            if item.isSupported { supported += 1 }
+        }
+        let rate = total > 0 ? Double(total - supported) / Double(total) : 0.0
+        return HallucinationReport(
+            modelUsed: "phi3",
+            totalItems: total,
+            supportedItems: supported,
+            unsupportedItems: total - supported,
+            hallucinationRate: rate,
+            analysisTimestamp: Date()
+        )
     }
 
     // MARK: - Action Item Line Parser
@@ -491,8 +817,16 @@ final class MeetingIntelligenceService: Service {
             let value = kv[1].trimmingCharacters(in: .whitespaces)
             switch key {
             case "OWNER":    owner    = value.isEmpty ? "Team" : value
-            case "TASK":     task     = value
-            case "PRIORITY": priority = value.isEmpty ? "Medium" : value.capitalized
+            case "TASK":
+                // Strip embedded "Priority: ..." or "Due: ..." that phi3 appends inside the task value
+                var taskVal = value
+                for suffix in [". Priority:", "; Priority:", ". Due:", "; Due:", ". priority:"] {
+                    if let r = taskVal.range(of: suffix, options: .caseInsensitive) {
+                        taskVal = String(taskVal[..<r.lowerBound])
+                    }
+                }
+                task = taskVal.trimmingCharacters(in: .whitespacesAndNewlines)
+            case "PRIORITY": priority = value.isEmpty ? "Medium" : value.components(separatedBy: "/").first?.trimmingCharacters(in: .whitespaces).capitalized ?? "Medium"
             case "DUE":      dueDate  = (value.uppercased() == "TBD" || value.isEmpty) ? "" : value
             default: break
             }
@@ -513,24 +847,33 @@ final class MeetingIntelligenceService: Service {
         let suggestedTasks = buildSuggestedTasks(title: title, commitments: commitments,
                                                  actionItems: actionItems, structuredItems: [])
         return MeetingAnalysis(
-            summary:               summary,
-            meetingType:           meetingType,
-            decisions:             decisions,
-            openQuestions:         [],
-            risks:                 [],
-            dependencies:          [],
-            commitments:           commitments,
-            actionItems:           actionItems,
-            structuredActionItems: [],
-            suggestedTasks:        suggestedTasks
+            summary:                   summary,
+            conservativeSummary:       "",
+            meetingType:               meetingType,
+            decisions:                 decisions,
+            openQuestions:             [],
+            risks:                     [],
+            dependencies:              [],
+            commitments:               commitments,
+            actionItems:               actionItems,
+            structuredActionItems:     [],
+            suggestedTasks:            suggestedTasks,
+            evidencedDecisions:        [],
+            evidencedDiscussionPoints: [],
+            evidencedFollowUps:        [],
+            hallucinationReport:       nil
         )
     }
 
     private func emptyAnalysis() -> MeetingAnalysis {
-        MeetingAnalysis(summary: "", meetingType: MeetingType.general.rawValue,
-                        decisions: [], openQuestions: [], risks: [], dependencies: [],
-                        commitments: [], actionItems: [], structuredActionItems: [],
-                        suggestedTasks: [])
+        MeetingAnalysis(
+            summary: "", conservativeSummary: "",
+            meetingType: MeetingType.general.rawValue,
+            decisions: [], openQuestions: [], risks: [], dependencies: [],
+            commitments: [], actionItems: [], structuredActionItems: [],
+            suggestedTasks: [], evidencedDecisions: [], evidencedDiscussionPoints: [],
+            evidencedFollowUps: [], hallucinationReport: nil
+        )
     }
 
     // MARK: - Helpers
