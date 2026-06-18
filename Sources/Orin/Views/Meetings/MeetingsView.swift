@@ -1994,6 +1994,7 @@ private struct MeetingDetailView: View {
         }
     }
 
+    @MainActor
     private func analyze() async {
         isAnalyzing = true
         // Prefer segment-based analysis (conversation timeline) when available.
@@ -2008,6 +2009,7 @@ private struct MeetingDetailView: View {
         } else {
             analysis = await intelligence.analyze(title: meeting.title, transcript: meeting.transcript)
         }
+        let saveStart = ContinuousClock.now
         meeting.summary              = analysis.summary
         meeting.meetingType          = analysis.meetingType
         meeting.decisions            = analysis.decisions
@@ -2030,6 +2032,9 @@ private struct MeetingDetailView: View {
             meeting.meetingKnowledgeJSON = snapshotJSON
             modelContext.safeSave(context: "meeting knowledge snapshot")
         }
+        let saveDuration = ContinuousClock.now - saveStart
+        AnalysisPerfLogger.phase("SwiftData save",
+            duration: Double(saveDuration.components.seconds) + Double(saveDuration.components.attoseconds) / 1e18)
         isAnalyzing = false
     }
 

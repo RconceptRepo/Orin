@@ -4,7 +4,7 @@ import Foundation
 import Observation
 import OSLog
 
-@Observable
+@Observable @MainActor
 final class MeetingDetectorService: Service {
 
     // MARK: - Nested Types
@@ -160,22 +160,24 @@ final class MeetingDetectorService: Service {
     // MARK: - Dependencies
 
     /// Provides EventKit event data for the calendar-based detection path.
-    private let calendarService: CalendarService
+    @ObservationIgnored nonisolated(unsafe) private let calendarService: CalendarService
 
     /// Platform-agnostic calendar abstraction.  When set, `detectFromCalendar()`
     /// uses this provider instead of querying `calendarService` directly.
     /// Defaults to `nil` (legacy path) until registered in `OrinApp`.
-    var calendarProvider: (any CalendarProvider)?
+    /// `nonisolated(unsafe)` because detection methods are `nonisolated` (run on
+    /// cooperative pool) and only READ this after it is set once at app startup.
+    @ObservationIgnored nonisolated(unsafe) var calendarProvider: (any CalendarProvider)?
 
     /// Window-title inspector.  When set, `detectNativeApp()` checks call-specific
     /// window titles to award `fromWindowTitle` confidence score.
     /// Defaults to `nil` — detection degrades to process-only (existing behavior).
-    var accessibilityProvider: (any AccessibilityProvider)?
+    @ObservationIgnored nonisolated(unsafe) var accessibilityProvider: (any AccessibilityProvider)?
 
     /// Microphone activity inspector.  When set, each detection cycle checks
     /// whether another app has claimed the mic and awards `microphoneActivityScore`.
     /// Defaults to `nil` — mic score stays 0 (existing behavior).
-    var audioActivityProvider: (any AudioActivityProvider)?
+    @ObservationIgnored nonisolated(unsafe) var audioActivityProvider: (any AudioActivityProvider)?
 
     // MARK: - Testing Support
 
@@ -183,20 +185,20 @@ final class MeetingDetectorService: Service {
     ///
     /// **For testing only.** Set before calling `startMonitoring()` to inject synthetic
     /// `EKEvent` objects without requiring real calendar authorization.
-    @ObservationIgnored
+    @ObservationIgnored nonisolated(unsafe)
     var _calendarEventProviderOverride: ((Date, Date) -> [EKEvent])?
 
     /// Overrides all NSAppleScript execution in the browser detection path.
     ///
     /// **For testing only.** The closure receives the raw AppleScript source string and
     /// returns the desired `BrowserScriptOutcome`. `nil` (default) uses real execution.
-    @ObservationIgnored
+    @ObservationIgnored nonisolated(unsafe)
     var _browserScriptExecutorOverride: ((String) async -> BrowserScriptOutcome)?
 
     /// Overrides the set of running browser bundle IDs checked in `detectBrowserMeeting()`.
     ///
     /// **For testing only.** `nil` (default) reads from `NSWorkspace.shared.runningApplications`.
-    @ObservationIgnored
+    @ObservationIgnored nonisolated(unsafe)
     var _runningBrowserIDsOverride: Set<String>?
 
     // MARK: - Lifecycle
@@ -214,7 +216,7 @@ final class MeetingDetectorService: Service {
     func startMonitoring() {
         guard timer == nil else { return }
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-            self?.poll()
+            MainActor.assumeIsolated { self?.poll() }
         }
         poll()
     }
@@ -252,7 +254,7 @@ final class MeetingDetectorService: Service {
         print("[AutoStop] fast poll enabled (3 s interval)")
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
-            self?.poll()
+            MainActor.assumeIsolated { self?.poll() }
         }
         poll()   // immediate check so first detection fires within ≤ 3 s, not 3+3
     }
@@ -264,7 +266,7 @@ final class MeetingDetectorService: Service {
         print("[AutoStop] fast poll disabled — restoring 30 s interval")
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-            self?.poll()
+            MainActor.assumeIsolated { self?.poll() }
         }
     }
 
@@ -308,7 +310,7 @@ final class MeetingDetectorService: Service {
 
     // MARK: - Detection pipeline (background-safe)
 
-    private func detectMeeting() async -> (app: String, key: String, confidence: DetectionConfidence)? {
+    nonisolated private func detectMeeting() async -> (app: String, key: String, confidence: DetectionConfidence)? {
         // Priority order: native app > calendar event > browser tab.
         //
         // Native apps are the most reliable signal (the meeting software is running).
@@ -350,7 +352,7 @@ final class MeetingDetectorService: Service {
     ///
     /// 30 if `accessibilityProvider` is set AND a call-specific window title
     /// is on-screen.  0 otherwise (no provider or no matching title).
-    private func windowTitleScore(for bundleID: String, appName: String) -> Int {
+    nonisolated private func windowTitleScore(for bundleID: String, appName: String) -> Int {
         guard let provider = accessibilityProvider,
               let keywords = callWindowKeywords[bundleID],
               provider.hasWindow(appNamed: appName, withTitleContaining: keywords)
@@ -360,7 +362,7 @@ final class MeetingDetectorService: Service {
 
     /// Returns the detected app name, session key, and bundle ID.
     /// Bundle ID is needed by `detectMeeting()` to look up call-window keywords.
-    private func detectNativeApp() -> (app: String, key: String, bundleID: String)? {
+    nonisolated private func detectNativeApp() -> (app: String, key: String, bundleID: String)? {
         let running = NSWorkspace.shared.runningApplications
         for config in nativeApps {
             guard let match = running.first(where: { $0.bundleIdentifier == config.bundleID }) else { continue }
@@ -376,7 +378,7 @@ final class MeetingDetectorService: Service {
     }
 
     /// Best-effort check using CGWindowList; silently returns false if Screen Recording permission is absent.
-    private func slackHasActiveCall() -> Bool {
+    nonisolated private func slackHasActiveCall() -> Bool {
         guard let list = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
         ) as? [[String: Any]] else { return false }
@@ -403,7 +405,7 @@ final class MeetingDetectorService: Service {
     ///
     /// Returns `nil` when calendar access is denied, no events exist in the window,
     /// or no events contain a recognised meeting URL.
-    func detectFromCalendar() -> (app: String, key: String)? {
+    nonisolated func detectFromCalendar() -> (app: String, key: String)? {
         let now         = Date()
         let windowStart = now.addingTimeInterval(-(2 * 60))   // 2 minutes before now
         let windowEnd   = now.addingTimeInterval(  5 * 60)    // 5 minutes ahead
@@ -463,7 +465,7 @@ final class MeetingDetectorService: Service {
 
     /// Extracts meeting info from a platform-agnostic `CalendarEventDescriptor`.
     /// Used by the CalendarProvider detection path.
-    func extractMeetingInfo(from descriptor: CalendarEventDescriptor) -> (platform: String, stableURL: String)? {
+    nonisolated func extractMeetingInfo(from descriptor: CalendarEventDescriptor) -> (platform: String, stableURL: String)? {
         let candidates: [String] = [
             descriptor.url?.absoluteString,
             descriptor.notes,
@@ -487,7 +489,7 @@ final class MeetingDetectorService: Service {
     /// Fields are checked in priority order: `EKEvent.url` → `notes` → `location`.
     ///
     /// `internal` access so the test target can exercise it directly.
-    func extractMeetingInfo(from event: EKEvent) -> (platform: String, stableURL: String)? {
+    nonisolated func extractMeetingInfo(from event: EKEvent) -> (platform: String, stableURL: String)? {
         let candidates: [String] = [
             event.url?.absoluteString,
             event.notes,
@@ -507,7 +509,7 @@ final class MeetingDetectorService: Service {
     }
 
     /// Maps a URL pattern to its human-readable platform name.
-    private func platformName(for pattern: String) -> String {
+    nonisolated private func platformName(for pattern: String) -> String {
         if pattern.contains("google") { return "Google Meet"       }
         if pattern.contains("zoom")   { return "Zoom"              }
         if pattern.contains("teams")  { return "Microsoft Teams"   }
@@ -526,7 +528,7 @@ final class MeetingDetectorService: Service {
     /// - `.scriptError`: logged at warning level; status left unchanged
     ///
     /// `internal` access so tests can call it directly with injected hooks.
-    func detectBrowserMeeting() async -> (app: String, key: String)? {
+    nonisolated func detectBrowserMeeting() async -> (app: String, key: String)? {
         let runningIDs = _runningBrowserIDsOverride
             ?? Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
 
@@ -613,7 +615,7 @@ final class MeetingDetectorService: Service {
     ///
     /// The test hook `_browserScriptExecutorOverride` bypasses real execution — inject it
     /// in unit tests to simulate any permission or error scenario without running AppleScript.
-    private func executeScript(_ source: String) async -> BrowserScriptOutcome {
+    nonisolated private func executeScript(_ source: String) async -> BrowserScriptOutcome {
         if let override = _browserScriptExecutorOverride {
             return await override(source)
         }
@@ -677,7 +679,7 @@ final class MeetingDetectorService: Service {
 
     // MARK: - URL helpers
 
-    func firstMeetingURL(in urlString: String) -> String? {
+    nonisolated func firstMeetingURL(in urlString: String) -> String? {
         for url in urlString.components(separatedBy: "\n") {
             for pattern in meetingURLPatterns where url.contains(pattern) {
                 return stableKey(url: url, pattern: pattern)
@@ -702,7 +704,7 @@ final class MeetingDetectorService: Service {
     ///   This collapses opaque join-link paths like `/19%3a…/0` into a single stable key.
     ///
     /// Query strings and fragment identifiers are stripped before either rule is applied.
-    func stableKey(url: String, pattern: String) -> String {
+    nonisolated func stableKey(url: String, pattern: String) -> String {
         guard let range = url.range(of: pattern) else { return String(url.prefix(80)) }
         let fromPattern = String(url[range.lowerBound...])
 

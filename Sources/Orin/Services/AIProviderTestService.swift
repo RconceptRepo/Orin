@@ -47,35 +47,64 @@ final class AIProviderTestService: Service, @unchecked Sendable {
         let json = (try? JSONSerialization.jsonObject(with: tagData)) as? [String: Any]
         let models = (json?["models"] as? [[String: Any]])?.compactMap { $0["name"] as? String } ?? []
         guard !models.isEmpty else {
-            ollamaStatus = .failed(reason: "Ollama is running but no models are installed. Run: ollama pull llama3")
+            ollamaStatus = .failed(reason: "Ollama is running but no models are installed. Run: ollama pull phi3")
             return
         }
-        let modelName = models.first(where: { $0.hasPrefix("llama3") }) ?? models[0]
+        // Use mistral for the test — it's the model used for analysis. Fall back to phi3, then first available.
+        let modelName = models.first(where: { $0.hasPrefix("mistral") })
+            ?? models.first(where: { $0.hasPrefix("phi3") })
+            ?? models[0]
 
-        // Step 3: inference test — confirms the model actually responds
+        // Step 3: inference test — confirms the model actually responds.
+        // Retries once if the model is still loading (Ollama returns 404/500 briefly on first use).
         guard let genURL = URL(string: "\(endpoint)/api/generate") else {
             ollamaStatus = .connected
             return
         }
-        var genReq = URLRequest(url: genURL)
-        genReq.httpMethod = "POST"
-        genReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        genReq.timeoutInterval = 20
-        genReq.httpBody = try? JSONSerialization.data(withJSONObject: [
-            "model": modelName, "prompt": "Say hello.", "stream": false
-        ])
 
+        let inferenceRequest = makeInferenceRequest(genURL: genURL, modelName: modelName)
+        let (ok, loading) = await runInference(request: inferenceRequest)
+        if ok {
+            ollamaStatus = .connected
+        } else if loading {
+            // Model is warming up — wait and retry once
+            ollamaStatus = .testing
+            try? await Task.sleep(nanoseconds: 8_000_000_000)  // 8 seconds
+            let retryRequest = makeInferenceRequest(genURL: genURL, modelName: modelName)
+            let (ok2, _) = await runInference(request: retryRequest)
+            ollamaStatus = ok2
+                ? .connected
+                : .failed(reason: "Model '\(modelName)' is still loading. Please wait a moment, then Test again.")
+        } else {
+            ollamaStatus = .failed(reason: "Ollama inference failed for '\(modelName)'. Check Ollama logs.")
+        }
+    }
+
+    // MARK: - Ollama inference helpers
+
+    private func makeInferenceRequest(genURL: URL, modelName: String) -> URLRequest {
+        var r = URLRequest(url: genURL)
+        r.httpMethod = "POST"
+        r.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        r.timeoutInterval = 30
+        r.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "model": modelName, "prompt": "Hi.", "stream": false,
+            "options": ["num_predict": 5]
+        ])
+        return r
+    }
+
+    @MainActor
+    private func runInference(request: URLRequest) async -> (Bool, Bool) {
+        // Returns (success, isLoading)
         do {
-            let (_, genResponse) = try await URLSession.shared.data(for: genReq)
-            if (genResponse as? HTTPURLResponse)?.statusCode == 200 {
-                ollamaStatus = .connected
-            } else {
-                ollamaStatus = .failed(reason: "Ollama inference failed. The model may still be loading — try again.")
-            }
+            let (_, resp) = try await URLSession.shared.data(for: request)
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            return (code == 200, code == 404 || code == 500 || code == 503)
         } catch let err as URLError where err.code == .timedOut {
-            ollamaStatus = .failed(reason: "Inference timed out. Model is likely still loading — try again in a moment.")
+            return (false, true)
         } catch {
-            ollamaStatus = .failed(reason: "Inference error: \(error.localizedDescription)")
+            return (false, false)
         }
     }
 

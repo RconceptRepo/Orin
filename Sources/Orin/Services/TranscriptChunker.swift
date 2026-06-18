@@ -597,8 +597,13 @@ enum TranscriptChunker {
     }
 
     private static func keyPointsSummary(from chunks: [ChunkAnalysis]) -> String {
-        let points = chunks.sorted { $0.index < $1.index }.flatMap(\.keyPoints).prefix(6)
-        return points.joined(separator: " ")
+        let points = chunks.sorted { $0.index < $1.index }
+            .flatMap(\.keyPoints)
+            .map { MeetingIntelligenceService.cleanTranscriptLine($0) }
+            .filter { !$0.isEmpty }
+            .prefix(6)
+        guard !points.isEmpty else { return "" }
+        return points.joined(separator: ". ")
     }
 
     // MARK: - Private helpers

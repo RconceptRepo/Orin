@@ -81,20 +81,35 @@ final class MeetingIntelligenceService: Service {
         let timelineText = ConversationTimelineBuilder.formatted(segments, meetingStart: meetingStart)
         let meCount  = segments.filter { $0.speakerLabel == "Me" }.count
         let parCount = segments.filter { $0.speakerLabel != "Me" }.count
+        let wordCount = timelineText.split(separator: " ").count
+        let meetingShortID = String(title.prefix(20).replacingOccurrences(of: " ", with: "-"))
         print("[MeetingIntelligence] transcript chars=\(timelineText.count) segments=\(segments.count) Me=\(meCount) Participant=\(parCount) for '\(title)'")
+        let analysisStart = ContinuousClock.now
+        AnalysisPerfLogger.start(
+            meetingID: meetingShortID,
+            chars: timelineText.count,
+            words: wordCount,
+            model: aiService.resolvedOllamaModel()
+        )
 
         // Long meetings: route directly to segment-aware chunker (utterance boundaries, not newlines)
+        let result: MeetingAnalysis
         if timelineText.count > TranscriptChunker.singleCallThreshold {
             let meetingType = MeetingIntelligenceService.detectMeetingType(title: title, transcript: timelineText)
             let chunks = TranscriptChunker.chunks(of: segments, meetingStart: meetingStart)
             print("[MeetingIntelligence] segment-aware chunking: \(segments.count) segments → \(chunks.count) chunks")
-            return await analyzeChunked(title: title, chunks: chunks, meetingType: meetingType)
+            AnalysisPerfLogger.event("routing=chunked chunks=\(chunks.count)")
+            result = await analyzeChunked(title: title, chunks: chunks, meetingType: meetingType)
+        } else {
+            AnalysisPerfLogger.event("routing=singleCall chars=\(timelineText.count)")
+            result = await analyzeSingleCall(
+                title: title, transcript: timelineText,
+                meetingType: MeetingIntelligenceService.detectMeetingType(title: title, transcript: timelineText)
+            )
         }
-
-        return await analyzeSingleCall(
-            title: title, transcript: timelineText,
-            meetingType: MeetingIntelligenceService.detectMeetingType(title: title, transcript: timelineText)
-        )
+        let totalDuration = ContinuousClock.now - analysisStart
+        AnalysisPerfLogger.finish(totalDuration: Double(totalDuration.components.seconds) + Double(totalDuration.components.attoseconds) / 1e18)
+        return result
     }
 
     // MARK: - String-based analysis
@@ -246,8 +261,8 @@ final class MeetingIntelligenceService: Service {
         // Step 1: Build comprehensive structured prompt
         let prompt = buildComprehensivePrompt(title: title, transcript: transcript, meetingType: meetingType)
 
-        // Step 2: Single AI call
-        let result = await aiService.generate(prompt: prompt, maxTokens: 900)
+        // Step 2: Single AI call — 1500 tokens gives phi3 room to complete all five sections
+        let result = await aiService.generate(prompt: prompt, maxTokens: 1500)
 
         log.info("AI response: fallback=\(result.fallbackUsed) chars=\(result.text.count) preview='\(result.text.prefix(120))'")
 
@@ -805,18 +820,30 @@ final class MeetingIntelligenceService: Service {
 
     /// Parses a single action item line in the format:
     /// `OWNER: Alice | TASK: Send proposal | PRIORITY: High | DUE: Friday`
+    /// Also handles newline-separated or comma-separated variants that phi3 sometimes emits.
     private func parseActionItemLine(_ line: String) -> ActionItemRecord? {
-        let parts = line.components(separatedBy: "|").map {
+        // phi3 sometimes uses commas or newlines instead of pipes — normalise first
+        let normalised = line
+            .replacingOccurrences(of: #",\s*(OWNER|TASK|PRIORITY|DUE):"#, with: " | $1:", options: .regularExpression)
+            .replacingOccurrences(of: #"\n\s*(OWNER|TASK|PRIORITY|DUE):"#, with: " | $1:", options: .regularExpression)
+        let parts = normalised.components(separatedBy: "|").map {
             $0.trimmingCharacters(in: .whitespaces)
         }
-        guard parts.count >= 2 else { return nil }
+        // If no pipes, check if the line itself starts with TASK: (phi3 sometimes omits OWNER)
+        let effectiveParts: [String]
+        if parts.count < 2, normalised.uppercased().hasPrefix("TASK:") {
+            effectiveParts = ["OWNER: Team", normalised, "PRIORITY: Medium", "DUE: TBD"]
+        } else {
+            guard parts.count >= 2 else { return nil }
+            effectiveParts = parts
+        }
 
         var owner = "Team"
         var task = ""
         var priority = "Medium"
         var dueDate = ""
 
-        for part in parts {
+        for part in effectiveParts {
             let kv = part.split(separator: ":", maxSplits: 1).map(String.init)
             guard kv.count == 2 else { continue }
             let key   = kv[0].trimmingCharacters(in: .whitespaces).uppercased()
@@ -889,10 +916,15 @@ final class MeetingIntelligenceService: Service {
     private func fallbackSummary(_ transcript: String) -> String {
         let sentences = transcript
             .replacingOccurrences(of: "\n", with: " ")
+            // Strip timestamp prefixes like [00:09] or [1:23:45]
+            .replacingOccurrences(of: #"\[\d{1,2}:\d{2}(?::\d{2})?\]\s*"#, with: "", options: .regularExpression)
+            // Strip speaker labels like "Me: " or "Participant: "
+            .replacingOccurrences(of: #"[A-Za-z][A-Za-z ]{0,20}:\s*"#, with: "", options: .regularExpression)
             .split(separator: ".")
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        return sentences.prefix(3).joined(separator: ". ") + (sentences.isEmpty ? "" : ".")
+            .filter { $0.count > 10 }
+        guard !sentences.isEmpty else { return "" }
+        return sentences.prefix(3).joined(separator: ". ") + "."
     }
 
     /// Extracts lines matching any of the given keywords, then strips transcript

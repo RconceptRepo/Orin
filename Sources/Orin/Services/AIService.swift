@@ -72,21 +72,38 @@ final class AIService: Service {
 
         if await isOllamaAvailable(endpoint: endpoint) {
             if let result = await callOllama(prompt: prompt, maxTokens: maxTokens) {
+                AnalysisPerfLogger.event("provider=ollama SUCCESS")
                 return (result, false)
             }
+            // Ollama is up but the call failed — model may still be loading. Retry once after a pause.
+            aiLogger.info("Ollama call failed on first attempt — waiting 10s then retrying")
+            AnalysisPerfLogger.event("Ollama first attempt failed — sleeping 10s before retry")
+            try? await Task.sleep(nanoseconds: 10_000_000_000)
+            if let result = await callOllama(prompt: prompt, maxTokens: maxTokens) {
+                AnalysisPerfLogger.event("provider=ollama SUCCESS (retry)")
+                return (result, false)
+            }
+            AnalysisPerfLogger.event("Ollama both attempts failed — falling through to cloud providers")
+        } else {
+            AnalysisPerfLogger.event("Ollama not available (health check failed) — skipping to cloud providers")
         }
+
         if let key = AIKeychainService.load(account: Self.openAIAccount),
            let result = await callOpenAI(prompt: prompt, key: key, maxTokens: maxTokens) {
+            AnalysisPerfLogger.event("provider=openai SUCCESS (fallback)")
             return (result, false)
         }
         if let key = AIKeychainService.load(account: Self.anthropicAccount),
            let result = await callAnthropic(prompt: prompt, key: key, maxTokens: maxTokens) {
+            AnalysisPerfLogger.event("provider=anthropic SUCCESS (fallback)")
             return (result, false)
         }
         if let key = AIKeychainService.load(account: Self.geminiAccount),
            let result = await callGemini(prompt: prompt, key: key, maxTokens: maxTokens) {
+            AnalysisPerfLogger.event("provider=gemini SUCCESS (fallback)")
             return (result, false)
         }
+        AnalysisPerfLogger.event("ALL providers failed — analysis will use keyword fallback")
         return ("", true)
     }
 
@@ -126,21 +143,38 @@ final class AIService: Service {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 90
+        request.timeoutInterval = 60
 
+        let model = resolvedOllamaModel()
         let payload: [String: Any] = [
-            "model": "phi3",
+            "model": model,
             "prompt": prompt,
             "stream": false,
             "options": ["num_predict": maxTokens, "temperature": 0]
         ]
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+            AnalysisPerfLogger.event("Ollama request started model=\(model) promptChars=\(prompt.count) maxTokens=\(maxTokens)")
+            let ollamaStart = ContinuousClock.now
             let (data, response) = try await URLSession.shared.data(for: request)
-            guard (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+            let ollamaDuration = ContinuousClock.now - ollamaStart
+            guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+                let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+                AnalysisPerfLogger.event(String(format: "Ollama response HTTP %d duration=%.2fs", code, Double(ollamaDuration.components.seconds)))
+                return nil
+            }
             let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-            return (json?["response"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let text = (json?["response"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            AnalysisPerfLogger.event(String(format: "Ollama response OK duration=%.2fs responseChars=%d",
+                Double(ollamaDuration.components.seconds) + Double(ollamaDuration.components.attoseconds) / 1e18,
+                text?.count ?? 0))
+            return text
+        } catch let err as URLError where err.code == .timedOut {
+            AnalysisPerfLogger.event("Ollama request TIMED OUT (60s) model=\(model)")
+            aiLogger.warning("Ollama request timed out — trying next provider")
+            return nil
         } catch {
+            AnalysisPerfLogger.event("Ollama request FAILED error=\(error.localizedDescription)")
             aiLogger.warning("Ollama request failed: \(error) — trying next provider")
             return nil
         }
@@ -238,5 +272,10 @@ final class AIService: Service {
     private func resolvedOllamaEndpoint() -> String {
         let stored = UserDefaults.standard.string(forKey: "orin.ai.ollamaEndpoint") ?? ""
         return stored.isEmpty ? config.localOllamaEndpoint : stored
+    }
+
+    func resolvedOllamaModel() -> String {
+        let stored = UserDefaults.standard.string(forKey: "orin.ai.ollamaModel") ?? ""
+        return stored.isEmpty ? "mistral" : stored
     }
 }

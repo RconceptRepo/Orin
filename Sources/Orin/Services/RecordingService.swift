@@ -108,7 +108,7 @@ final class RecordingService: Service {
     /// background framework work that corrupts the allocator in test environments.
     /// Only accessed from `@MainActor` paths so the non-thread-safe `lazy` is safe.
     @ObservationIgnored
-    private lazy var speechRecognizer: SFSpeechRecognizer? = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+    private lazy var speechRecognizer: SFSpeechRecognizer? = SFSpeechRecognizer(locale: Locale(identifier: "en-IN"))
 
     private var recognitionTask: SFSpeechRecognitionTask?
 
@@ -344,7 +344,7 @@ final class RecordingService: Service {
                 authStatus: .notDetermined,
                 recognizerAvailable: false,
                 supportsOnDevice: true,
-                locale: "en-US"
+                locale: VocabularyProvider.speechLocale.identifier
             )
             SessionLogger.shared.log("[Mic-ST] SpeechTranscriber pipeline active — no SFSpeechRecognizer")
         }
