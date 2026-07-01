@@ -271,6 +271,7 @@ final class TranscriptRecoveryIntegrityTests: XCTestCase {
 
 // MARK: - 5: Meeting Detection (confidence scoring)
 
+@MainActor
 final class MeetingDetectionConfidenceTests: XCTestCase {
 
     func testZeroConfidenceDoesNotMeetThreshold() {

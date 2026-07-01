@@ -106,6 +106,12 @@
 		F3DCE86023601535F7485EAE /* AIService.swift in Sources */ = {isa = PBXBuildFile; fileRef = F3F38D274FDDCA2B4FA56AF5 /* AIService.swift */; };
 		F7052B04A9470FAB71774A26 /* SubtaskViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 18DC9754F525A9E6432EF404 /* SubtaskViews.swift */; };
 		FB42C5F416E59B1994522F34 /* MeetingRetentionServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A519815D1797F65D2E41CFEB /* MeetingRetentionServiceTests.swift */; };
+		BB11223344556677889900BB /* InferenceTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA11223344556677889900AA /* InferenceTypes.swift */; };
+		BB11223344556677889901BB /* InferenceProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA11223344556677889901AA /* InferenceProvider.swift */; };
+		BB11223344556677889902BB /* OllamaProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA11223344556677889902AA /* OllamaProvider.swift */; };
+		BB11223344556677889903BB /* CloudInferenceProviders.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA11223344556677889903AA /* CloudInferenceProviders.swift */; };
+		BB11223344556677889904BB /* InferenceWorker.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA11223344556677889904AA /* InferenceWorker.swift */; };
+		EE11223344556677889900EE /* AnalysisPerfLogger.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD11223344556677889900DD /* AnalysisPerfLogger.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -220,6 +226,12 @@
 		EE7024A35009A41633374520 /* CalendarProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CalendarProvider.swift; sourceTree = "<group>"; };
 		EF4616D86E866C525734D4E9 /* TranscriptStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranscriptStore.swift; sourceTree = "<group>"; };
 		F3F38D274FDDCA2B4FA56AF5 /* AIService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIService.swift; sourceTree = "<group>"; };
+		AA11223344556677889900AA /* InferenceTypes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InferenceTypes.swift; sourceTree = "<group>"; };
+		AA11223344556677889901AA /* InferenceProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InferenceProvider.swift; sourceTree = "<group>"; };
+		AA11223344556677889902AA /* OllamaProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OllamaProvider.swift; sourceTree = "<group>"; };
+		AA11223344556677889903AA /* CloudInferenceProviders.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudInferenceProviders.swift; sourceTree = "<group>"; };
+		AA11223344556677889904AA /* InferenceWorker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InferenceWorker.swift; sourceTree = "<group>"; };
+		DD11223344556677889900DD /* AnalysisPerfLogger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnalysisPerfLogger.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -359,6 +371,7 @@
 				419C0B2001EEC71F06302C26 /* AIKeychainService.swift */,
 				AE1B657B52B03300F5D101AF /* AIProviderTestService.swift */,
 				F3F38D274FDDCA2B4FA56AF5 /* AIService.swift */,
+				CC11223344556677889900CC /* Inference */,
 				0E7E78CF43C46C926AF9CDB3 /* AssistantService.swift */,
 				9E0206D0366B05401AAE9A24 /* CalendarService.swift */,
 				253900A20A87FAE82EBA328D /* ConversationTimelineBuilder.swift */,
@@ -380,6 +393,7 @@
 				A78171A0ABE98ECFFF7EDF4B /* ReflowEngine.swift */,
 				A14FBA9CA7EBFE84C7062F7F /* RolloverEngine.swift */,
 				DF24AD348FFD3F5C712902D4 /* SessionLogger.swift */,
+				DD11223344556677889900DD /* AnalysisPerfLogger.swift */,
 				97D81766A517328A38CE1B7A /* SystemAudioCaptureService.swift */,
 				F3A7D2E891C4B5067B2E3F1A /* VocabularyProvider.swift */,
 				80025ABA474F4BAA712815C4 /* TapState.swift */,
@@ -514,6 +528,18 @@
 			path = macOS;
 			sourceTree = "<group>";
 		};
+		CC11223344556677889900CC /* Inference */ = {
+			isa = PBXGroup;
+			children = (
+				AA11223344556677889900AA /* InferenceTypes.swift */,
+				AA11223344556677889901AA /* InferenceProvider.swift */,
+				AA11223344556677889902AA /* OllamaProvider.swift */,
+				AA11223344556677889903AA /* CloudInferenceProviders.swift */,
+				AA11223344556677889904AA /* InferenceWorker.swift */,
+			);
+			path = Inference;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -597,6 +623,11 @@
 				84F58F415CD031675D735A72 /* AIKeychainService.swift in Sources */,
 				55C540FA8DDC27A0101F9F4D /* AIProviderTestService.swift in Sources */,
 				F3DCE86023601535F7485EAE /* AIService.swift in Sources */,
+				BB11223344556677889900BB /* InferenceTypes.swift in Sources */,
+				BB11223344556677889901BB /* InferenceProvider.swift in Sources */,
+				BB11223344556677889902BB /* OllamaProvider.swift in Sources */,
+				BB11223344556677889903BB /* CloudInferenceProviders.swift in Sources */,
+				BB11223344556677889904BB /* InferenceWorker.swift in Sources */,
 				97D69830053A3DD56AA30A05 /* AccessibilityProvider.swift in Sources */,
 				F2B857000B80615D1614BDF7 /* AllTasksView.swift in Sources */,
 				9B1484778A294010459993C6 /* AssistantService.swift in Sources */,
@@ -651,6 +682,7 @@
 				91671C715D26FE58663AB01E /* SCKitSystemAudioProvider.swift in Sources */,
 				0FD53F32D188FC8EBA87E916 /* ServiceContainer.swift in Sources */,
 				25DC8730674D167DD0832FE0 /* SessionLogger.swift in Sources */,
+				EE11223344556677889900EE /* AnalysisPerfLogger.swift in Sources */,
 				DB958B769923F4167AA575AA /* SettingsView.swift in Sources */,
 				AD41317432DD47CDBCD9D4AD /* SourceChannelSpeakerProvider.swift in Sources */,
 				F7052B04A9470FAB71774A26 /* SubtaskViews.swift in Sources */,

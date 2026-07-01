@@ -174,17 +174,25 @@ enum TranscriptChunker {
         index: Int,
         totalChunks: Int,
         meetingType: String,
-        aiService: AIService
+        worker: InferenceWorker
     ) async -> ChunkAnalysis {
         let prompt = buildExtractionPrompt(chunk: chunk, index: index, total: totalChunks, meetingType: meetingType)
-        let result = await aiService.generate(prompt: prompt, maxTokens: 500)
+        let responseText: String
+        let wasFallback: Bool
+        do {
+            let response = try await worker.infer(InferenceRequest(prompt: prompt, maxTokens: 500))
+            responseText = response.text
+            wasFallback = response.fallbackUsed
+        } catch {
+            responseText = ""
+            wasFallback = true
+        }
 
-        if result.fallbackUsed || result.text.isEmpty {
+        if wasFallback || responseText.isEmpty {
             log.warning("chunk \(index + 1)/\(totalChunks): AI unavailable — using keyword fallback")
             return keywordChunkFallback(chunk, index: index)
         }
-
-        var analysis = parseChunkResponse(result.text)
+        var analysis = parseChunkResponse(responseText)
         analysis.structuredActionItems = analysis.structuredActionItems
             .filter { isMeaningfulActionItem(task: $0.task) }
         analysis.actionItems = analysis.structuredActionItems
@@ -204,7 +212,7 @@ enum TranscriptChunker {
         chunks: [ChunkAnalysis],
         title: String,
         meetingType: String,
-        aiService: AIService
+        worker: InferenceWorker
     ) async -> String {
         let allDecisions = deduplicateStrings(chunks.flatMap(\.decisions))
         let allActions   = deduplicateActionItems(chunks.flatMap(\.structuredActionItems))
@@ -220,13 +228,18 @@ enum TranscriptChunker {
             title: title
         )
 
-        let result = await aiService.generate(prompt: prompt, maxTokens: 350)
-        if result.fallbackUsed || result.text.isEmpty {
+        let synthesisText: String
+        do {
+            let response = try await worker.infer(InferenceRequest(prompt: prompt, maxTokens: 350))
+            synthesisText = response.text
+        } catch {
+            synthesisText = ""
+        }
+        if synthesisText.isEmpty {
             log.warning("synthesis: AI unavailable — using key-points fallback summary")
             return keyPointsSummary(from: chunks)
         }
-        return result.text
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return synthesisText.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     // MARK: - Deduplication

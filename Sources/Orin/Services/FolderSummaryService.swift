@@ -29,7 +29,7 @@ final class FolderSummaryService: Service {
         folderName: String,
         folderID: UUID,
         meetings: [MeetingItem],
-        aiService: AIService
+        worker: InferenceWorker
     ) async -> FolderSummaryItem {
         let item = FolderSummaryItem(folderID: folderID)
         item.meetingCount = meetings.count
@@ -46,10 +46,16 @@ final class FolderSummaryService: Service {
         let prompt = buildPrompt(folderName: folderName, meetings: promptMeetings)
 
         // Generate overall summary via AI (with fallback)
-        let summaryResult = await aiService.generateSummary(for: prompt)
-        item.overallSummary = summaryResult.fallbackUsed
+        let summaryText: String
+        do {
+            let response = try await worker.infer(InferenceRequest(prompt: prompt, maxTokens: 512))
+            summaryText = response.text
+        } catch {
+            summaryText = ""
+        }
+        item.overallSummary = summaryText.isEmpty
             ? buildFallbackSummary(folderName: folderName, meetings: promptMeetings)
-            : summaryResult.text
+            : summaryText
 
         let minOccurrences = max(2, meetings.count / 3)
 

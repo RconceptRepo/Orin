@@ -56,7 +56,19 @@ struct OrinApp: App {
         services.register(RecordingService(), for: RecordingService.self)
         let aiService = AIService(config: AIConfiguration(primaryProvider: .ollama))
         services.register(aiService, for: AIService.self)
-        services.register(MeetingIntelligenceService(aiService: aiService), for: MeetingIntelligenceService.self)
+
+        // Build the inference subsystem: providers in cascade order, then the worker.
+        // Cloud providers read their API keys from keychain at call time — no rebuild
+        // required when the user adds keys in Settings.
+        let inferenceProviders: [any InferenceProvider] = [
+            OllamaProvider(),
+            OpenAIProvider(),
+            AnthropicProvider(),
+            GeminiProvider()
+        ]
+        let inferenceWorker = InferenceWorker(providers: inferenceProviders)
+        services.register(inferenceWorker, for: InferenceWorker.self)
+        services.register(MeetingIntelligenceService(worker: inferenceWorker), for: MeetingIntelligenceService.self)
         services.register(ReflowEngine(), for: ReflowEngine.self)
         services.register(DailyBriefService(), for: DailyBriefService.self)
         services.register(VoiceCommandService(), for: VoiceCommandService.self)

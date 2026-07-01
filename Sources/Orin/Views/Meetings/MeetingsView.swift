@@ -39,7 +39,7 @@ struct MeetingsView: View {
     private let dataService            = ServiceContainer.shared.resolve(MeetingDataService.self)
     private let recurringService       = ServiceContainer.shared.resolve(RecurringMeetingService.self)
     private let folderSummaryService   = ServiceContainer.shared.resolve(FolderSummaryService.self)
-    private let aiService              = ServiceContainer.shared.resolve(AIService.self)
+    private let inferenceWorker        = ServiceContainer.shared.resolve(InferenceWorker.self)
 
     // Convenience: folder selected for detail view
     private var selectedFolder: MeetingFolderItem? {
@@ -607,7 +607,7 @@ struct MeetingsView: View {
             folderName: folder.name,
             folderID:   folder.id,
             meetings:   folderMeetings,
-            aiService:  aiService
+            worker:     inferenceWorker
         )
         modelContext.insert(summary)
         modelContext.safeSave(context: "folder summary")

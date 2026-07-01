@@ -146,24 +146,18 @@ final class AIProviderTests: XCTestCase {
         }
     }
 
-    // MARK: - Fallback chain: generateSummary returns fallbackUsed when nothing is available
+    // MARK: - Fallback chain: InferenceWorker throws allProvidersFailed when nothing is available
 
-    func testGenerateSummaryReturnsFallbackUsedWhenNoProvidersAvailable() async {
-        // Use a non-existent Ollama endpoint so local AI is unavailable.
-        // If no API keys are in keychain, all providers fail and fallbackUsed should be true.
-        let noKeysInKeychain = AIKeychainService.load(account: AIService.openAIAccount) == nil
-            && AIKeychainService.load(account: AIService.anthropicAccount) == nil
-            && AIKeychainService.load(account: AIService.geminiAccount) == nil
-
-        guard noKeysInKeychain else { return } // developer machine with real keys — skip
-
-        let config = AIConfiguration(
-            primaryProvider: .ollama,
-            localOllamaEndpoint: "http://127.0.0.1:19999"
-        )
-        let service = AIService(config: config)
-        let result = await service.generateSummary(for: "test transcript")
-        XCTAssertTrue(result.fallbackUsed, "Expected fallbackUsed=true when no provider is reachable")
-        XCTAssertFalse(result.text.isEmpty, "Error message must not be empty")
+    func testInferenceWorkerThrowsWhenAllProvidersFail() async {
+        let mock = MockInferenceProvider(shouldFail: true, simulatedDelaySeconds: 0)
+        let worker = InferenceWorker(providers: [mock])
+        do {
+            _ = try await worker.infer(InferenceRequest(prompt: "test", maxTokens: 10))
+            XCTFail("Expected InferenceError.allProvidersFailed but infer() returned a value")
+        } catch InferenceError.allProvidersFailed {
+            // expected
+        } catch {
+            XCTFail("Expected InferenceError.allProvidersFailed but got \(error)")
+        }
     }
 }

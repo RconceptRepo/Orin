@@ -56,11 +56,11 @@ struct MeetingAnalysis {
 
 final class MeetingIntelligenceService: Service {
 
-    private let aiService: AIService
+    private let worker: InferenceWorker
     private let log = Logger(subsystem: "com.clavrit.orin", category: "MeetingIntelligence")
 
-    init(aiService: AIService) {
-        self.aiService = aiService
+    init(worker: InferenceWorker) {
+        self.worker = worker
     }
 
     /// Transcripts longer than this threshold do not use keyword fallback for action items.
@@ -85,11 +85,15 @@ final class MeetingIntelligenceService: Service {
         let meetingShortID = String(title.prefix(20).replacingOccurrences(of: " ", with: "-"))
         print("[MeetingIntelligence] transcript chars=\(timelineText.count) segments=\(segments.count) Me=\(meCount) Participant=\(parCount) for '\(title)'")
         let analysisStart = ContinuousClock.now
+        let ollamaModel: String = {
+            let stored = UserDefaults.standard.string(forKey: "orin.ai.ollamaModel") ?? ""
+            return stored.isEmpty ? "mistral" : stored
+        }()
         AnalysisPerfLogger.start(
             meetingID: meetingShortID,
             chars: timelineText.count,
             words: wordCount,
-            model: aiService.resolvedOllamaModel()
+            model: ollamaModel
         )
 
         // Long meetings: route directly to segment-aware chunker (utterance boundaries, not newlines)
@@ -154,22 +158,17 @@ final class MeetingIntelligenceService: Service {
     ) async -> MeetingAnalysis {
         log.info("chunked analysis: \(chunks.count) chunks for title='\(title)'")
 
-        // Phase 1: Extract from all chunks concurrently.
-        // Cloud APIs process requests in parallel; Ollama queues and serializes internally
-        // so total inference time is the same but network overhead overlaps.
-        let service = aiService
+        // Phase 1: Extract from each chunk sequentially.
+        // InferenceWorker enforces maxConcurrentJobs=1; sequential submission here
+        // eliminates the thundering-herd that previously overwhelmed Ollama with 41
+        // concurrent requests, causing cascade timeouts.
         var ordered = [ChunkAnalysis?](repeating: nil, count: chunks.count)
-        await withTaskGroup(of: (Int, ChunkAnalysis).self) { group in
-            for (i, chunk) in chunks.enumerated() {
-                group.addTask {
-                    let ca = await TranscriptChunker.analyzeChunk(
-                        chunk, index: i, totalChunks: chunks.count,
-                        meetingType: meetingType, aiService: service
-                    )
-                    return (i, ca)
-                }
-            }
-            for await (i, ca) in group { ordered[i] = ca }
+        for (i, chunk) in chunks.enumerated() {
+            let ca = await TranscriptChunker.analyzeChunk(
+                chunk, index: i, totalChunks: chunks.count,
+                meetingType: meetingType, worker: worker
+            )
+            ordered[i] = ca
         }
         let chunkAnalyses = ordered.compactMap { $0 }
 
@@ -186,7 +185,7 @@ final class MeetingIntelligenceService: Service {
 
         // Phase 3: Synthesize executive summary
         let summary = await TranscriptChunker.synthesize(
-            chunks: chunkAnalyses, title: title, meetingType: meetingType, aiService: aiService
+            chunks: chunkAnalyses, title: title, meetingType: meetingType, worker: worker
         )
 
         let suggestedTasks = buildSuggestedTasks(
@@ -262,21 +261,32 @@ final class MeetingIntelligenceService: Service {
         let prompt = buildComprehensivePrompt(title: title, transcript: transcript, meetingType: meetingType)
 
         // Step 2: Single AI call — 1500 tokens gives phi3 room to complete all five sections
-        let result = await aiService.generate(prompt: prompt, maxTokens: 1500)
+        let inferenceText: String
+        let inferenceFallback: Bool
+        do {
+            let response = try await worker.infer(
+                InferenceRequest(meetingID: nil, prompt: prompt, maxTokens: 1500)
+            )
+            inferenceText = response.text
+            inferenceFallback = response.fallbackUsed
+        } catch {
+            inferenceText = ""
+            inferenceFallback = true
+        }
 
-        log.info("AI response: fallback=\(result.fallbackUsed) chars=\(result.text.count) preview='\(result.text.prefix(120))'")
+        log.info("AI response: fallback=\(inferenceFallback) chars=\(inferenceText.count) preview='\(inferenceText.prefix(120))'")
 
-        if result.fallbackUsed || result.text.isEmpty {
+        if inferenceFallback || inferenceText.isEmpty {
             log.warning("AI unavailable — using keyword fallback")
             return keywordFallback(title: title, transcript: transcript, meetingType: meetingType)
         }
 
         // Dump raw phi3 response for debugging — read at /tmp/orin_phi3_raw.txt
-        try? result.text.write(to: URL(fileURLWithPath: "/tmp/orin_phi3_raw.txt"),
-                               atomically: true, encoding: .utf8)
+        try? inferenceText.write(to: URL(fileURLWithPath: "/tmp/orin_phi3_raw.txt"),
+                                 atomically: true, encoding: .utf8)
 
         // Step 3: Parse structured response (pass transcript for snippet verification)
-        let parsed = parseComprehensiveResponse(result.text, transcript: transcript)
+        let parsed = parseComprehensiveResponse(inferenceText, transcript: transcript)
 
         let decisions     = parsed.decisions.isEmpty
             ? extractCleanLines(from: transcript, matching: ["decided", "decision", "agreed", "approved", "will proceed", "confirmed"])
