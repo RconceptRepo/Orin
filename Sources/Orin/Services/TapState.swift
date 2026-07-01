@@ -18,9 +18,21 @@ import Speech
 ///
 /// `disarm` must be called **after** `removeTap` returns so no `feed` call can
 /// be in-flight while the resources are being released.
-/// `@unchecked Sendable` is safe: every stored property is read or written
-/// exclusively under `lock` (NSLock), which serialises access from both the
-/// Core-Audio I/O thread (`feed`) and the MainActor (`arm`/`disarm`/`updateRequest`).
+///
+/// ## Thread-safety model
+///
+/// Lock-protected properties (`audioFile`, `recognitionRequest`, `_audioFileURL`,
+/// `_hasWriteFailure`) are accessed under `lock` (NSLock) from both the Core-Audio
+/// I/O thread and MainActor. NSLock is safe here because `endAudio()` — the XPC
+/// call that triggers an unbounded kernel round-trip — is always called OUTSIDE the
+/// lock (see `updateRequest` and `disarm`).
+///
+/// RT-thread counters (`_rtBuffersReceived`, `_rtBuffersAppended`) are NOT protected
+/// by a lock. They are written ONLY in `feed()` (Core-Audio I/O thread) and read
+/// ONLY after `removeTap()` returns (@MainActor). `removeTap()` is a synchronous
+/// barrier: when it returns, the RT thread has exited the tap closure for the last
+/// time, making all prior RT writes visible to the caller without any further
+/// synchronization. Doc 14 §9.1 RULE-RT-02.
 final class TapState: @unchecked Sendable {
 
     // MARK: - Lock-protected storage
@@ -36,6 +48,16 @@ final class TapState: @unchecked Sendable {
     /// Reset to `false` in `arm` so each new recording session starts clean.
     private var _hasWriteFailure = false
 
+    // MARK: - RT-thread counters (no lock — see ownership contract above)
+
+    /// Total audio buffers received by the tap callback. Written only on the
+    /// Core-Audio I/O thread; read only by @MainActor after `removeTap()` returns.
+    private var _rtBuffersReceived: Int = 0
+
+    /// Buffers successfully appended to the recognition request. Same threading
+    /// contract as `_rtBuffersReceived`.
+    private var _rtBuffersAppended: Int = 0
+
     // MARK: - Public interface
 
     /// The URL written to during the active recording.
@@ -46,6 +68,15 @@ final class TapState: @unchecked Sendable {
     /// Thread-safe; read after `disarm` returns to determine whether the recording
     /// is likely incomplete or corrupt before saving the file path to the model.
     var hadWriteFailure: Bool { lock.withLock { _hasWriteFailure } }
+
+    /// Total audio buffers the tap received this session.
+    /// Read ONLY after `removeTap()` has returned (@MainActor). The removeTap()
+    /// barrier guarantees all RT writes are visible before this is called.
+    var buffersReceived: Int { _rtBuffersReceived }
+
+    /// Buffers that were appended to the active recognition request this session.
+    /// Same read constraint as `buffersReceived`.
+    var buffersAppended: Int { _rtBuffersAppended }
 
 #if DEBUG
     // MARK: - Testing support
@@ -72,6 +103,10 @@ final class TapState: @unchecked Sendable {
         audioFile: AVAudioFile,
         recognitionRequest: SFSpeechAudioBufferRecognitionRequest? = nil
     ) {
+        // Reset RT counters before installTap. Safe: arm() is called on @MainActor
+        // before installTap(), so no RT thread is writing to these yet.
+        _rtBuffersReceived = 0
+        _rtBuffersAppended = 0
         lock.withLock {
             self.audioFile          = audioFile
             self._audioFileURL      = audioFile.url
@@ -103,11 +138,13 @@ final class TapState: @unchecked Sendable {
     /// read by `stopRecording` after this call returns.
     /// Call on MainActor **after** `removeTap` returns.
     func disarm() {
+        var old: SFSpeechAudioBufferRecognitionRequest?
         lock.withLock {
-            recognitionRequest?.endAudio()
+            old                = recognitionRequest
             recognitionRequest = nil
             audioFile          = nil
         }
+        old?.endAudio()  // outside lock — XPC call; mirrors updateRequest() pattern (RULE-RT-02)
     }
 
     /// Deliver a captured audio buffer. Called on the Core-Audio I/O thread.
@@ -115,15 +152,20 @@ final class TapState: @unchecked Sendable {
     /// Write errors are recorded in `hadWriteFailure` so `stopRecording` can surface
     /// them to the user instead of silently producing an incomplete or empty file.
     func feed(buffer: AVAudioPCMBuffer) {
+        var didAppend = false
         lock.withLock {
-            let didAppend = recognitionRequest != nil
+            didAppend = recognitionRequest != nil
             recognitionRequest?.append(buffer)
-            RecognitionDiagnostics.shared.micBufferReceived(appended: didAppend)
             do {
                 try audioFile?.write(from: buffer)
             } catch {
                 _hasWriteFailure = true
             }
         }
+        // No lock needed: written only here (Core-Audio I/O thread), read only by
+        // @MainActor after removeTap() returns. removeTap() is the synchronization
+        // barrier; when it returns, all RT writes are visible. (RULE-RT-02)
+        _rtBuffersReceived &+= 1
+        if didAppend { _rtBuffersAppended &+= 1 }
     }
 }

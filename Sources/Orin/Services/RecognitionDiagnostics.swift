@@ -3,16 +3,20 @@ import Speech
 
 /// Shared diagnostic counter store for both recognition channels (mic + participant).
 ///
-/// All increment methods are safe to call from any thread — the audio I/O thread
-/// calls them via TapState.feed / SystemAudioTapState.feed, and the recognition
-/// callback closures call them from a MainActor Task.
+/// Buffer counts are written via `setMicBufferCounts` and `setParticipantBufferCounts`
+/// after recording stops (i.e. after `removeTap`/stream-stop returns). This avoids
+/// acquiring NSLock from the Core-Audio IO thread on every buffer callback.
+///
+/// All other increment methods are called from @MainActor or background Task contexts
+/// (never from the RT audio thread), so the NSLock overhead is acceptable there.
 ///
 /// Usage:
-///   RecognitionDiagnostics.shared.resetMicChannel(...)      // in startRecording
-///   RecognitionDiagnostics.shared.resetParticipantChannel(...)  // in startCapturing
-///   RecognitionDiagnostics.shared.micBufferReceived(appended:)  // in TapState.feed
-///   RecognitionDiagnostics.shared.save(logPath:)            // in stopRecording
-///   RecognitionDiagnostics.shared.saveCoverageReport(...)   // in stopRecording
+///   RecognitionDiagnostics.shared.resetMicChannel(...)             // in startRecording
+///   RecognitionDiagnostics.shared.resetParticipantChannel(...)     // in startCapturing
+///   RecognitionDiagnostics.shared.setMicBufferCounts(...)          // in stopRecording, after removeTap
+///   RecognitionDiagnostics.shared.setParticipantBufferCounts(...)  // in stopCapturing, after stream stop
+///   RecognitionDiagnostics.shared.save(logPath:)                   // in stopRecording
+///   RecognitionDiagnostics.shared.saveCoverageReport(...)          // in stopRecording
 final class RecognitionDiagnostics: @unchecked Sendable {
 
     static let shared = RecognitionDiagnostics()
@@ -161,10 +165,13 @@ final class RecognitionDiagnostics: @unchecked Sendable {
 
     // MARK: - Mic increments
 
-    func micBufferReceived(appended: Bool) {
+    /// Write the final mic buffer counts collected by TapState's RT-thread counters.
+    /// Call on @MainActor after `removeTap()` returns — the removeTap() call is the
+    /// synchronization barrier that makes the RT-thread writes visible here.
+    func setMicBufferCounts(received: Int, appended: Int) {
         lock.withLock {
-            _micAudioBuffers += 1
-            if appended { _micBuffersAppended += 1 }
+            _micAudioBuffers   = received
+            _micBuffersAppended = appended
         }
     }
 
@@ -182,10 +189,12 @@ final class RecognitionDiagnostics: @unchecked Sendable {
 
     // MARK: - Participant increments
 
-    func participantBufferReceived(appended: Bool) {
+    /// Write the final participant buffer counts collected by SystemAudioTapState's
+    /// RT-thread counters. Call on @MainActor after capture has stopped.
+    func setParticipantBufferCounts(received: Int, appended: Int) {
         lock.withLock {
-            _participantAudioBuffers += 1
-            if appended { _participantBuffersAppended += 1 }
+            _participantAudioBuffers    = received
+            _participantBuffersAppended = appended
         }
     }
 

@@ -380,6 +380,14 @@ final class SystemAudioCaptureService: Service {
         recognitionTask = nil
         tapState.disarm()
 
+        // SCStream has stopped delivering audio (stream.stopCapture() was called above,
+        // and the SCStream output queue serialises all callbacks). The RT-thread buffer
+        // counters in tapState are now fully visible on @MainActor.
+        RecognitionDiagnostics.shared.setParticipantBufferCounts(
+            received: tapState.buffersReceived,
+            appended: tapState.buffersAppended
+        )
+
         // Phase 2B: tear down parallel SpeechTranscriber pipeline
         if #available(macOS 26.0, *) {
             let capturedSTAnalyzer    = participantSTAnalyzer as? SpeechAnalyzer
@@ -651,8 +659,17 @@ final class SystemAudioCaptureService: Service {
         }
 
         let (stream, continuation) = AsyncStream<AnalyzerInput>.makeStream(bufferingPolicy: .unbounded)
+        // SCStreamConfiguration sets sampleRate=48000, channelCount=2; SCStream always
+        // delivers Float32 non-interleaved for system audio. Pre-building the converter
+        // here (on @MainActor) avoids a heap allocation on the first SCStream callback.
+        let scStreamSourceFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 48000,
+            channels: 2,
+            interleaved: false
+        )!
         let feed = ParticipantSTFeed()
-        feed.arm(continuation: continuation, targetFormat: bestFmt)
+        feed.arm(continuation: continuation, sourceFormat: scStreamSourceFormat, targetFormat: bestFmt)
         participantSTFeed        = feed
         participantSTAnalyzer    = analyzer
         participantSTTranscriber = transcriber
@@ -710,11 +727,44 @@ final class SystemAudioCaptureService: Service {
 ///
 /// Modelled after `TapState` (used by `RecordingService` for mic audio).
 /// All methods are safe to call from any thread.
+/// Thread-safe bridge between the SCStream sample-handler queue (real-time) and the
+/// `SFSpeechAudioBufferRecognitionRequest` for the participant audio channel.
+///
+/// ## Thread-safety model
+///
+/// Lock-protected property (`recognitionRequest`) is accessed under `lock` from both
+/// the SCStream sample-handler thread (`feed`) and @MainActor (`arm`/`disarm`/
+/// `updateRequest`). `endAudio()` is always called OUTSIDE the lock because it
+/// triggers an unbounded XPC round-trip to `com.apple.speech.speechsynthesisd`; holding
+/// NSLock across that call blocks the SCStream audio delivery thread and can cause a
+/// HAL deadline miss, leading to `std::terminate()`. (Doc 14 §9.1 RULE-RT-02)
+///
+/// RT-thread counters (`_rtBuffersReceived`, `_rtBuffersAppended`) are NOT protected
+/// by a lock. They are written ONLY in `feed()` (SCStream sample-handler thread) and
+/// read ONLY after stream capture stops (@MainActor). The stream-stop boundary is the
+/// synchronization barrier; after it completes, all RT writes are visible.
 private final class SystemAudioTapState: @unchecked Sendable {
     private let lock = NSLock()
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
 
+    // MARK: - RT-thread counters (no lock — see class doc above)
+
+    private var _rtBuffersReceived: Int = 0
+    private var _rtBuffersAppended: Int = 0
+
+    /// Total SCStream audio buffers received this capture session.
+    /// Read ONLY after capture has stopped (@MainActor).
+    var buffersReceived: Int { _rtBuffersReceived }
+
+    /// Buffers successfully appended to the recognition request this session.
+    /// Same read constraint as `buffersReceived`.
+    var buffersAppended: Int { _rtBuffersAppended }
+
     func arm(request: SFSpeechAudioBufferRecognitionRequest) {
+        // Reset RT counters before the stream starts. Safe: arm() is @MainActor,
+        // no SCStream callbacks are in-flight yet.
+        _rtBuffersReceived = 0
+        _rtBuffersAppended = 0
         lock.withLock { recognitionRequest = request }
     }
 
@@ -728,18 +778,24 @@ private final class SystemAudioTapState: @unchecked Sendable {
     }
 
     func disarm() {
+        var old: SFSpeechAudioBufferRecognitionRequest?
         lock.withLock {
-            recognitionRequest?.endAudio()
+            old                = recognitionRequest
             recognitionRequest = nil
         }
+        old?.endAudio()  // outside lock — XPC call; mirrors updateRequest() pattern (RULE-RT-02)
     }
 
     func feed(_ buffer: AVAudioPCMBuffer) {
+        var didAppend = false
         lock.withLock {
-            let didAppend = recognitionRequest != nil
+            didAppend = recognitionRequest != nil
             recognitionRequest?.append(buffer)
-            RecognitionDiagnostics.shared.participantBufferReceived(appended: didAppend)
         }
+        // No lock needed: written only here (SCStream thread), read only by
+        // @MainActor after capture stops. (RULE-RT-02)
+        _rtBuffersReceived &+= 1
+        if didAppend { _rtBuffersAppended &+= 1 }
     }
 }
 
@@ -761,6 +817,17 @@ private final class SystemAudioStreamDelegate: NSObject, SCStreamOutput, SCStrea
     // Thread-safe first-buffer probe: proves SCStream is actually delivering audio.
     private let firstBufferLock = NSLock()
     private var firstBufferSeen = false
+
+    // Cached AVAudioFormat for convertToAVAudioPCMBuffer. SCStream uses a fixed
+    // audio format for the lifetime of a capture session (48kHz Float32 stereo as
+    // configured in SCStreamConfiguration). Extracting AVAudioFormat from each
+    // CMSampleBuffer allocates a new ObjC object on the hot path; caching after the
+    // first buffer eliminates that allocation from all subsequent callbacks.
+    //
+    // Thread-safety: only accessed within stream(_:didOutputSampleBuffer:of:), which
+    // SCKit serialises on a single private queue for the lifetime of the stream.
+    // No lock required. (Same sequencing-barrier model as RT-thread counters.)
+    private var cachedAudioFormat: AVAudioFormat?
 
     init(tapState: SystemAudioTapState, stFeed: Any?, onStopped: @escaping (Error) -> Void) {
         self.tapState  = tapState
@@ -814,11 +881,23 @@ private final class SystemAudioStreamDelegate: NSObject, SCStreamOutput, SCStrea
     ///
     /// Returns `nil` on any conversion failure; the tap silently drops the buffer
     /// rather than crashing or stopping the recording pipeline.
+    ///
+    /// `AVAudioFormat` is cached after the first successful buffer to avoid an ObjC
+    /// allocation on every callback. SCStream uses a fixed audio format for the
+    /// lifetime of a capture session so the cache is always valid.
     private func convertToAVAudioPCMBuffer(_ sample: CMSampleBuffer) -> AVAudioPCMBuffer? {
-        guard let formatDesc = CMSampleBufferGetFormatDescription(sample) else { return nil }
-        guard var asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc)?.pointee
-        else { return nil }
-        guard let format = AVAudioFormat(streamDescription: &asbd) else { return nil }
+        let format: AVAudioFormat
+        if let cached = cachedAudioFormat {
+            format = cached
+        } else {
+            // First buffer: extract and cache the format.
+            guard let formatDesc = CMSampleBufferGetFormatDescription(sample) else { return nil }
+            guard var asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc)?.pointee
+            else { return nil }
+            guard let extracted = AVAudioFormat(streamDescription: &asbd) else { return nil }
+            cachedAudioFormat = extracted
+            format = extracted
+        }
 
         let frames = AVAudioFrameCount(CMSampleBufferGetNumSamples(sample))
         guard frames > 0 else { return nil }
@@ -840,8 +919,9 @@ private final class SystemAudioStreamDelegate: NSObject, SCStreamOutput, SCStrea
 ///
 /// Accepts stereo 48 kHz Float32 buffers from SCStream and resamples them to the
 /// format required by SpeechTranscriber (16 kHz Int16 mono). The AVAudioConverter
-/// is created lazily on the first `feed` call once the source format is known;
-/// subsequent calls reuse the same converter.
+/// is created in `arm()` on @MainActor — before any SCStream callbacks fire — so
+/// the hot-path `feed()` never performs heap allocation for the converter itself.
+/// (RULE-RT-03: no heap allocation inside real-time callbacks)
 ///
 /// `@unchecked Sendable`: every property is accessed exclusively under `lock` (NSLock).
 @available(macOS 26.0, *)
@@ -849,20 +929,30 @@ private final class ParticipantSTFeed: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: AsyncStream<AnalyzerInput>.Continuation?
     private var targetFormat: AVAudioFormat?
-    private var converter:    AVAudioConverter?   // lazy — built on first feed
+    private var converter:    AVAudioConverter?   // pre-built in arm(); never nil while armed
 
     /// Arm for a new capture session.
+    ///
+    /// The `AVAudioConverter` is built here on @MainActor, before SCStream starts
+    /// delivering buffers. If the first buffer arrives with an unexpected source
+    /// format (format mismatch), `feed()` will rebuild the converter once — still
+    /// on the SCStream queue, but only for the anomalous first buffer.
+    ///
     /// - Parameters:
     ///   - continuation: The AsyncStream continuation to yield resampled buffers into.
+    ///   - sourceFormat: Expected SCStream delivery format (e.g. 48 kHz Float32 stereo).
     ///   - targetFormat: The SpeechTranscriber-compatible format (e.g. 16 kHz Int16 mono).
     func arm(
         continuation: AsyncStream<AnalyzerInput>.Continuation,
+        sourceFormat: AVAudioFormat,
         targetFormat: AVAudioFormat
     ) {
+        // Build converter on @MainActor before installTap — zero RT-thread allocation.
+        let newConverter = AVAudioConverter(from: sourceFormat, to: targetFormat)
         lock.withLock {
             self.continuation = continuation
             self.targetFormat = targetFormat
-            self.converter    = nil   // reset so the converter is rebuilt from the new source format
+            self.converter    = newConverter
         }
     }
 
@@ -885,8 +975,11 @@ private final class ParticipantSTFeed: @unchecked Sendable {
             guard let cont = continuation,
                   let tgt  = targetFormat else { return }
 
-            // Build converter once we know the source format (lazy, first call only).
-            if converter == nil {
+            // Nominal path: converter pre-built in arm(); no allocation here.
+            // Edge case: source format changed (should never happen in a session) —
+            // rebuild converter once. This is an RT-thread allocation but only in
+            // the anomalous case; the steady state is zero allocation.
+            if converter.map({ !$0.inputFormat.isEqual(buffer.format) }) ?? true {
                 converter = AVAudioConverter(from: buffer.format, to: tgt)
             }
             guard let conv = converter else { return }

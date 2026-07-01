@@ -555,6 +555,13 @@ final class RecordingService: Service {
         let finalChars = transcript.count
         logger.info("stopped url=\(self.recordingURL?.lastPathComponent ?? "nil", privacy: .public) chars=\(finalChars)")
         SessionLogger.shared.log("[Mic] stopped url=\(self.recordingURL?.lastPathComponent ?? "nil") chars=\(finalChars)")
+        // removeTap() at line above is the synchronization barrier: all RT-thread
+        // writes to tapState's buffer counters are visible here. Write them to
+        // RecognitionDiagnostics in a single lock acquisition (no per-buffer locking).
+        RecognitionDiagnostics.shared.setMicBufferCounts(
+            received: tapState.buffersReceived,
+            appended: tapState.buffersAppended
+        )
         RecognitionDiagnostics.shared.setMicFinalGeneration(recognitionGeneration)
         let diagSummary = RecognitionDiagnostics.shared.save(logPath: SessionLogger.shared.currentLogPath)
         RecognitionDiagnostics.shared.saveCoverageReport(
