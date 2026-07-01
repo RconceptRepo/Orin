@@ -29,7 +29,7 @@ final class FolderSummaryService: Service {
         folderName: String,
         folderID: UUID,
         meetings: [MeetingItem],
-        worker: InferenceWorker
+        scheduler: InferenceScheduler
     ) async -> FolderSummaryItem {
         let item = FolderSummaryItem(folderID: folderID)
         item.meetingCount = meetings.count
@@ -48,7 +48,7 @@ final class FolderSummaryService: Service {
         // Generate overall summary via AI (with fallback)
         let summaryText: String
         do {
-            let response = try await worker.infer(InferenceRequest(prompt: prompt, maxTokens: 512))
+            let response = try await scheduler.infer(InferenceRequest(prompt: prompt, maxTokens: 512))
             summaryText = response.text
         } catch {
             summaryText = ""

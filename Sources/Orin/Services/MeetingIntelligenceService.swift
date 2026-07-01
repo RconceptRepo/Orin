@@ -56,11 +56,11 @@ struct MeetingAnalysis {
 
 final class MeetingIntelligenceService: Service {
 
-    private let worker: InferenceWorker
+    private let scheduler: InferenceScheduler
     private let log = Logger(subsystem: "com.clavrit.orin", category: "MeetingIntelligence")
 
-    init(worker: InferenceWorker) {
-        self.worker = worker
+    init(scheduler: InferenceScheduler) {
+        self.scheduler = scheduler
     }
 
     /// Transcripts longer than this threshold do not use keyword fallback for action items.
@@ -166,7 +166,7 @@ final class MeetingIntelligenceService: Service {
         for (i, chunk) in chunks.enumerated() {
             let ca = await TranscriptChunker.analyzeChunk(
                 chunk, index: i, totalChunks: chunks.count,
-                meetingType: meetingType, worker: worker
+                meetingType: meetingType, scheduler: scheduler
             )
             ordered[i] = ca
         }
@@ -185,7 +185,7 @@ final class MeetingIntelligenceService: Service {
 
         // Phase 3: Synthesize executive summary
         let summary = await TranscriptChunker.synthesize(
-            chunks: chunkAnalyses, title: title, meetingType: meetingType, worker: worker
+            chunks: chunkAnalyses, title: title, meetingType: meetingType, scheduler: scheduler
         )
 
         let suggestedTasks = buildSuggestedTasks(
@@ -264,7 +264,7 @@ final class MeetingIntelligenceService: Service {
         let inferenceText: String
         let inferenceFallback: Bool
         do {
-            let response = try await worker.infer(
+            let response = try await scheduler.infer(
                 InferenceRequest(meetingID: nil, prompt: prompt, maxTokens: 1500)
             )
             inferenceText = response.text

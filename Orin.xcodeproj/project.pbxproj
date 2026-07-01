@@ -111,6 +111,12 @@
 		BB11223344556677889902BB /* OllamaProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA11223344556677889902AA /* OllamaProvider.swift */; };
 		BB11223344556677889903BB /* CloudInferenceProviders.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA11223344556677889903AA /* CloudInferenceProviders.swift */; };
 		BB11223344556677889904BB /* InferenceWorker.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA11223344556677889904AA /* InferenceWorker.swift */; };
+		BB21223344556677889900BB /* InferencePriority.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA21223344556677889900AA /* InferencePriority.swift */; };
+		BB21223344556677889901BB /* InferenceSystemSnapshot.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA21223344556677889901AA /* InferenceSystemSnapshot.swift */; };
+		BB21223344556677889902BB /* InferenceConcurrencyController.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA21223344556677889902AA /* InferenceConcurrencyController.swift */; };
+		BB21223344556677889903BB /* InferenceResourceMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA21223344556677889903AA /* InferenceResourceMonitor.swift */; };
+		BB21223344556677889904BB /* PersistentInferenceJob.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA21223344556677889904AA /* PersistentInferenceJob.swift */; };
+		BB21223344556677889905BB /* InferenceScheduler.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA21223344556677889905AA /* InferenceScheduler.swift */; };
 		EE11223344556677889900EE /* AnalysisPerfLogger.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD11223344556677889900DD /* AnalysisPerfLogger.swift */; };
 /* End PBXBuildFile section */
 
@@ -231,6 +237,12 @@
 		AA11223344556677889902AA /* OllamaProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OllamaProvider.swift; sourceTree = "<group>"; };
 		AA11223344556677889903AA /* CloudInferenceProviders.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudInferenceProviders.swift; sourceTree = "<group>"; };
 		AA11223344556677889904AA /* InferenceWorker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InferenceWorker.swift; sourceTree = "<group>"; };
+		AA21223344556677889900AA /* InferencePriority.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InferencePriority.swift; sourceTree = "<group>"; };
+		AA21223344556677889901AA /* InferenceSystemSnapshot.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InferenceSystemSnapshot.swift; sourceTree = "<group>"; };
+		AA21223344556677889902AA /* InferenceConcurrencyController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InferenceConcurrencyController.swift; sourceTree = "<group>"; };
+		AA21223344556677889903AA /* InferenceResourceMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InferenceResourceMonitor.swift; sourceTree = "<group>"; };
+		AA21223344556677889904AA /* PersistentInferenceJob.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PersistentInferenceJob.swift; sourceTree = "<group>"; };
+		AA21223344556677889905AA /* InferenceScheduler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InferenceScheduler.swift; sourceTree = "<group>"; };
 		DD11223344556677889900DD /* AnalysisPerfLogger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnalysisPerfLogger.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -536,6 +548,12 @@
 				AA11223344556677889902AA /* OllamaProvider.swift */,
 				AA11223344556677889903AA /* CloudInferenceProviders.swift */,
 				AA11223344556677889904AA /* InferenceWorker.swift */,
+				AA21223344556677889900AA /* InferencePriority.swift */,
+				AA21223344556677889901AA /* InferenceSystemSnapshot.swift */,
+				AA21223344556677889902AA /* InferenceConcurrencyController.swift */,
+				AA21223344556677889903AA /* InferenceResourceMonitor.swift */,
+				AA21223344556677889904AA /* PersistentInferenceJob.swift */,
+				AA21223344556677889905AA /* InferenceScheduler.swift */,
 			);
 			path = Inference;
 			sourceTree = "<group>";
@@ -628,6 +646,12 @@
 				BB11223344556677889902BB /* OllamaProvider.swift in Sources */,
 				BB11223344556677889903BB /* CloudInferenceProviders.swift in Sources */,
 				BB11223344556677889904BB /* InferenceWorker.swift in Sources */,
+				BB21223344556677889900BB /* InferencePriority.swift in Sources */,
+				BB21223344556677889901BB /* InferenceSystemSnapshot.swift in Sources */,
+				BB21223344556677889902BB /* InferenceConcurrencyController.swift in Sources */,
+				BB21223344556677889903BB /* InferenceResourceMonitor.swift in Sources */,
+				BB21223344556677889904BB /* PersistentInferenceJob.swift in Sources */,
+				BB21223344556677889905BB /* InferenceScheduler.swift in Sources */,
 				97D69830053A3DD56AA30A05 /* AccessibilityProvider.swift in Sources */,
 				F2B857000B80615D1614BDF7 /* AllTasksView.swift in Sources */,
 				9B1484778A294010459993C6 /* AssistantService.swift in Sources */,

@@ -190,6 +190,7 @@ actor InferenceWorker: Service {
         var fallbackUsed = false
         var retryCount = 0
         var timeoutCount = 0
+        let systemSnapshot = InferenceSystemSnapshot.capture()
 
         for provider in providers {
             try Task.checkCancellation()
@@ -221,19 +222,22 @@ actor InferenceWorker: Service {
 
                 let completedAt = CFAbsoluteTimeGetCurrent()
                 let telemetry = InferenceTelemetryRecord(
-                    requestID:         job.request.id,
-                    meetingID:         job.request.meetingID,
-                    providerName:      provider.name,
-                    modelName:         provider.modelName,
-                    queuedAtAbsTime:   job.enqueuedAt,
-                    dequeuedAtAbsTime: dequeuedAt,
-                    completedAtAbsTime: completedAt,
-                    promptCharCount:   job.request.prompt.count,
-                    responseCharCount: text.count,
-                    retryCount:        retryCount,
-                    timeoutCount:      timeoutCount,
-                    wasCancelled:      false,
-                    completionReason:  fallbackUsed ? .fallback : .success
+                    requestID:              job.request.id,
+                    meetingID:              job.request.meetingID,
+                    providerName:           provider.name,
+                    modelName:              provider.modelName,
+                    queuedAtAbsTime:        job.enqueuedAt,
+                    dequeuedAtAbsTime:      dequeuedAt,
+                    completedAtAbsTime:     completedAt,
+                    promptCharCount:        job.request.prompt.count,
+                    responseCharCount:      text.count,
+                    retryCount:             retryCount,
+                    timeoutCount:           timeoutCount,
+                    wasCancelled:           false,
+                    completionReason:       fallbackUsed ? .fallback : .success,
+                    priority:               job.request.priority,
+                    queueDepthAtSubmission: job.request.schedulerQueueDepth,
+                    systemSnapshot:         systemSnapshot
                 )
                 telemetryLog.append(telemetry)
 
@@ -257,19 +261,22 @@ actor InferenceWorker: Service {
             } catch is CancellationError {
                 let completedAt = CFAbsoluteTimeGetCurrent()
                 let telemetry = InferenceTelemetryRecord(
-                    requestID:         job.request.id,
-                    meetingID:         job.request.meetingID,
-                    providerName:      provider.name,
-                    modelName:         provider.modelName,
-                    queuedAtAbsTime:   job.enqueuedAt,
-                    dequeuedAtAbsTime: dequeuedAt,
-                    completedAtAbsTime: completedAt,
-                    promptCharCount:   job.request.prompt.count,
-                    responseCharCount: 0,
-                    retryCount:        retryCount,
-                    timeoutCount:      timeoutCount,
-                    wasCancelled:      true,
-                    completionReason:  .cancelled
+                    requestID:              job.request.id,
+                    meetingID:              job.request.meetingID,
+                    providerName:           provider.name,
+                    modelName:              provider.modelName,
+                    queuedAtAbsTime:        job.enqueuedAt,
+                    dequeuedAtAbsTime:      dequeuedAt,
+                    completedAtAbsTime:     completedAt,
+                    promptCharCount:        job.request.prompt.count,
+                    responseCharCount:      0,
+                    retryCount:             retryCount,
+                    timeoutCount:           timeoutCount,
+                    wasCancelled:           true,
+                    completionReason:       .cancelled,
+                    priority:               job.request.priority,
+                    queueDepthAtSubmission: job.request.schedulerQueueDepth,
+                    systemSnapshot:         systemSnapshot
                 )
                 telemetryLog.append(telemetry)
                 throw CancellationError()
@@ -298,23 +305,27 @@ actor InferenceWorker: Service {
         // All providers exhausted
         let completedAt = CFAbsoluteTimeGetCurrent()
         let telemetry = InferenceTelemetryRecord(
-            requestID:         job.request.id,
-            meetingID:         job.request.meetingID,
-            providerName:      "none",
-            modelName:         "none",
-            queuedAtAbsTime:   job.enqueuedAt,
-            dequeuedAtAbsTime: dequeuedAt,
-            completedAtAbsTime: completedAt,
-            promptCharCount:   job.request.prompt.count,
-            responseCharCount: 0,
-            retryCount:        retryCount,
-            timeoutCount:      timeoutCount,
-            wasCancelled:      false,
-            completionReason:  .allFailed
+            requestID:              job.request.id,
+            meetingID:              job.request.meetingID,
+            providerName:           "none",
+            modelName:              "none",
+            queuedAtAbsTime:        job.enqueuedAt,
+            dequeuedAtAbsTime:      dequeuedAt,
+            completedAtAbsTime:     completedAt,
+            promptCharCount:        job.request.prompt.count,
+            responseCharCount:      0,
+            retryCount:             retryCount,
+            timeoutCount:           timeoutCount,
+            wasCancelled:           false,
+            completionReason:       .allFailed,
+            priority:               job.request.priority,
+            queueDepthAtSubmission: job.request.schedulerQueueDepth,
+            systemSnapshot:         systemSnapshot
         )
         telemetryLog.append(telemetry)
         AnalysisPerfLogger.event("InferenceWorker ALL providers failed — analysis will use keyword fallback")
         log.error("All providers failed for request \(job.request.id)")
+        _ = lastError
         throw InferenceError.allProvidersFailed
     }
 }

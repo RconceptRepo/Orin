@@ -38,7 +38,8 @@ struct OrinApp: App {
             FocusPatternItem.self,
             TranscriptChunk.self,
             TranscriptSegment.self,
-            FolderSummaryItem.self
+            FolderSummaryItem.self,
+            PersistentInferenceJob.self
         ])
 
         // Build a container with automatic migration-failure recovery.
@@ -57,18 +58,22 @@ struct OrinApp: App {
         let aiService = AIService(config: AIConfiguration(primaryProvider: .ollama))
         services.register(aiService, for: AIService.self)
 
-        // Build the inference subsystem: providers in cascade order, then the worker.
+        // Build the inference subsystem: providers in cascade order, scheduler wraps the worker.
         // Cloud providers read their API keys from keychain at call time — no rebuild
         // required when the user adds keys in Settings.
+        // InferenceScheduler is the public entry point; InferenceWorker is internal to it.
         let inferenceProviders: [any InferenceProvider] = [
             OllamaProvider(),
             OpenAIProvider(),
             AnthropicProvider(),
             GeminiProvider()
         ]
-        let inferenceWorker = InferenceWorker(providers: inferenceProviders)
-        services.register(inferenceWorker, for: InferenceWorker.self)
-        services.register(MeetingIntelligenceService(worker: inferenceWorker), for: MeetingIntelligenceService.self)
+        let inferenceScheduler = InferenceScheduler(
+            providers: inferenceProviders,
+            container: modelContainer
+        )
+        services.register(inferenceScheduler, for: InferenceScheduler.self)
+        services.register(MeetingIntelligenceService(scheduler: inferenceScheduler), for: MeetingIntelligenceService.self)
         services.register(ReflowEngine(), for: ReflowEngine.self)
         services.register(DailyBriefService(), for: DailyBriefService.self)
         services.register(VoiceCommandService(), for: VoiceCommandService.self)
@@ -183,6 +188,14 @@ struct OrinApp: App {
                     rolloverEngine.verifyAndExecuteRollover()
                     ServiceContainer.shared.resolve(AssistantService.self).processPendingIntents()
                     bringWindowToFront()
+
+                    // Mark inference jobs that were in-flight when the previous session
+                    // crashed or was force-quit. Affected meeting IDs are logged so
+                    // the meeting intelligence layer can re-trigger analysis if needed.
+                    Task {
+                        await ServiceContainer.shared.resolve(InferenceScheduler.self)
+                            .recoverInterruptedJobs()
+                    }
 
                     // Orphan recovery: if the previous session crashed or was force-quit,
                     // restore the most-recent checkpoint text to the meeting model.

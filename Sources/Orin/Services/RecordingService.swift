@@ -447,6 +447,11 @@ final class RecordingService: Service {
         }
 
         phase = .recording
+        NotificationCenter.default.post(
+            name: .recordingActiveChanged,
+            object: nil,
+            userInfo: ["active": true]
+        )
         elapsedSeconds = 0
         transcript = ""
 
@@ -552,6 +557,11 @@ final class RecordingService: Service {
         }
 
         phase = .idle
+        NotificationCenter.default.post(
+            name: .recordingActiveChanged,
+            object: nil,
+            userInfo: ["active": false]
+        )
         let finalChars = transcript.count
         logger.info("stopped url=\(self.recordingURL?.lastPathComponent ?? "nil", privacy: .public) chars=\(finalChars)")
         SessionLogger.shared.log("[Mic] stopped url=\(self.recordingURL?.lastPathComponent ?? "nil") chars=\(finalChars)")

@@ -260,7 +260,7 @@ final class ActionItemFilterTests: XCTestCase {
     // MARK: - Summary prompt: anti-verbatim instructions present
 
     func test_comprehensivePrompt_containsAntiVerbatimInstruction() {
-        let service = MeetingIntelligenceService(worker: InferenceWorker(providers: []))
+        let service = MeetingIntelligenceService(scheduler: InferenceScheduler(providers: []))
         let prompt = service.buildComprehensivePrompt(
             title: "Product Meeting",
             transcript: "Me: Okay. Makes sense.",

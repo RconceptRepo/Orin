@@ -174,13 +174,13 @@ enum TranscriptChunker {
         index: Int,
         totalChunks: Int,
         meetingType: String,
-        worker: InferenceWorker
+        scheduler: InferenceScheduler
     ) async -> ChunkAnalysis {
         let prompt = buildExtractionPrompt(chunk: chunk, index: index, total: totalChunks, meetingType: meetingType)
         let responseText: String
         let wasFallback: Bool
         do {
-            let response = try await worker.infer(InferenceRequest(prompt: prompt, maxTokens: 500))
+            let response = try await scheduler.infer(InferenceRequest(prompt: prompt, maxTokens: 500))
             responseText = response.text
             wasFallback = response.fallbackUsed
         } catch {
@@ -212,7 +212,7 @@ enum TranscriptChunker {
         chunks: [ChunkAnalysis],
         title: String,
         meetingType: String,
-        worker: InferenceWorker
+        scheduler: InferenceScheduler
     ) async -> String {
         let allDecisions = deduplicateStrings(chunks.flatMap(\.decisions))
         let allActions   = deduplicateActionItems(chunks.flatMap(\.structuredActionItems))
@@ -230,7 +230,7 @@ enum TranscriptChunker {
 
         let synthesisText: String
         do {
-            let response = try await worker.infer(InferenceRequest(prompt: prompt, maxTokens: 350))
+            let response = try await scheduler.infer(InferenceRequest(prompt: prompt, maxTokens: 350))
             synthesisText = response.text
         } catch {
             synthesisText = ""

@@ -12,17 +12,26 @@ struct InferenceRequest: Sendable {
     let meetingID: UUID?
     let prompt: String
     let maxTokens: Int
+    /// Scheduling priority — used by `InferenceScheduler` to order the queue.
+    let priority: InferencePriority
+    /// Queue depth at the time `InferenceScheduler.infer()` was called.
+    /// Set by the scheduler; zero when the worker is used directly (e.g. tests).
+    let schedulerQueueDepth: Int
 
     init(
         id: UUID = UUID(),
         meetingID: UUID? = nil,
         prompt: String,
-        maxTokens: Int = 1500
+        maxTokens: Int = 1500,
+        priority: InferencePriority = .background,
+        schedulerQueueDepth: Int = 0
     ) {
-        self.id = id
-        self.meetingID = meetingID
-        self.prompt = prompt
-        self.maxTokens = maxTokens
+        self.id                   = id
+        self.meetingID            = meetingID
+        self.prompt               = prompt
+        self.maxTokens            = maxTokens
+        self.priority             = priority
+        self.schedulerQueueDepth  = schedulerQueueDepth
     }
 }
 
@@ -78,6 +87,8 @@ struct InferenceTelemetryRecord: Sendable {
     let providerName: String
     let modelName: String
 
+    // MARK: Timing
+
     /// `CFAbsoluteTimeGetCurrent()` at enqueue time.
     let queuedAtAbsTime: Double
     /// `CFAbsoluteTimeGetCurrent()` when the job started executing.
@@ -85,12 +96,25 @@ struct InferenceTelemetryRecord: Sendable {
     /// `CFAbsoluteTimeGetCurrent()` when the job completed.
     let completedAtAbsTime: Double
 
+    // MARK: Job metrics
+
     let promptCharCount: Int
     let responseCharCount: Int
     let retryCount: Int
     let timeoutCount: Int
     let wasCancelled: Bool
     let completionReason: CompletionReason
+
+    // MARK: Scheduler metadata (EPIC-02.5)
+
+    /// Scheduling priority of this job.
+    let priority: InferencePriority
+    /// Number of jobs ahead in the scheduler queue at submission time.
+    let queueDepthAtSubmission: Int
+    /// System state snapshot captured at the moment the provider cascade began.
+    let systemSnapshot: InferenceSystemSnapshot?
+
+    // MARK: Derived
 
     var queueWaitSeconds: Double { dequeuedAtAbsTime - queuedAtAbsTime }
     var inferenceSeconds: Double { completedAtAbsTime - dequeuedAtAbsTime }
